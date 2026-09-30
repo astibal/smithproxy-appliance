@@ -1,0 +1,25 @@
+{% extends 'base.html' %}{% block content %}
+<div class="headline"><div><div class="eyebrow">APPLIANCE SETTINGS</div><h1>Nastavení</h1><p>Adresní pooly a základní routing mezi SAS a izolovanými Smithproxy instancemi.</p></div></div>
+{% if error %}<div class="flash error">{{ error }}</div>{% endif %}
+
+<section class="panel settings-networking">
+  <div class="section-head"><div><h2>Networking</h2><p class="hint">Každá nová instance dostane první volný /30 subnet. Existující lease zůstávají při změně poolu beze změny.</p></div><span class="badge ok">{{ networking.allocated|default(0) }} / {{ networking.capacity|default(0) }}</span></div>
+  <form method="post" action="{{ url_for('update_networking_settings') }}" class="stack">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="settings-grid">
+      <label>Namespace CIDR<input name="namespace_cidr" value="{{ networking.namespace_cidr|default('10.200.0.0/16') }}" placeholder="10.200.0.0/16" required><small>Rozsah se dělí na /30: host je první použitelná, proxy druhá.</small></label>
+      <label>Allocation prefix<input value="/30" disabled><small>Pevné čtyři adresy na instanci.</small></label>
+      <label>Egress režim<select name="egress_mode"><option value="masquerade" {{ 'selected' if networking.egress_mode|default('masquerade') == 'masquerade' else '' }}>Masquerade (SNAT na appliance)</option><option value="routed" {{ 'selected' if networking.egress_mode == 'routed' else '' }}>Routed (zachovat IP proxy)</option></select><small>Routed vyžaduje návratovou route na SAS.</small></label>
+      <label>SAS interface<input name="sas_interface" value="{{ networking.sas_interface|default('') }}" placeholder="např. eth1"><small>Volitelné omezení SNAT na konkrétní interface.</small></label>
+      <label>SAS route via<input name="sas_route_via" value="{{ networking.sas_route_via|default('') }}" placeholder="IP appliance viditelná ze SAS"><small>Použije se pro vygenerování návratové route.</small></label>
+      <label>Route table start<input type="number" name="route_table_start" value="{{ networking.route_table_start|default(60000) }}" min="1000" required></label>
+      <label>Packet mark start<input name="mark_start" value="0x{{ '%x'|format(networking.mark_start|default(268435456)) }}" required><small>Pro každou /30 se přičte index subnetu.</small></label>
+    </div>
+    <label>Autorizované source IP<textarea name="authorized_source_ips" class="settings-sources" spellcheck="false">{{ networking.authorized_source_ips|default([])|join('\n') }}</textarea><small>Jedna IPv4 adresa na řádek. Spawn formulář používá tento pool.</small></label>
+    <div class="routing-summary"><div><span>Kapacita</span><b>{{ networking.capacity|default(0) }} instancí</b></div><div><span>Volno</span><b>{{ networking.available|default(0) }} × /30</b></div><div><span>Návratová route na SAS</span><code>{{ networking.sas_route_command or 'Vyplň SAS route via' }}</code></div></div>
+    <div class="actions"><button>Uložit přes task queue</button></div>
+  </form>
+</section>
+
+<section class="panel"><h2>Aktivní network leases</h2><div class="lease-table"><div class="lease-row lease-head"><span>Instance</span><span>Subnet</span><span>Host → proxy</span><span>Table / mark</span><span>Egress</span></div>{% for instance_id,lease in networking.allocations|default({})|dictsort %}<div class="lease-row"><code>{{ instance_id[:12] }}</code><code>{{ lease.subnet }}</code><code>{{ lease.host_ip }} → {{ lease.guest_ip }}</code><code>{{ lease.route_table }} / {{ '0x%x'|format(lease.mark) }}</code><span>{{ lease.egress_mode }}{% if lease.sas_interface %} · {{ lease.sas_interface }}{% endif %}</span></div>{% else %}<p class="empty">Žádné přidělené /30 lease.</p>{% endfor %}</div></section>
+{% endblock %}

@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="cs">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Smithproxy Appliance</title>
+  <link rel="stylesheet" href="{{ url_for('static',filename='vendor/xterm/xterm.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static',filename='app.css',v='22') }}">
+  <script src="{{ url_for('static',filename='vendor/xterm/xterm.js') }}" defer></script>
+  <script src="{{ url_for('static',filename='vendor/xterm/addon-fit.js') }}" defer></script>
+  <script src="{{ url_for('static',filename='app.js',v='21') }}" defer></script>
+</head>
+<body class="page-{{ request.endpoint|default('unknown') }}">
+<header>
+  <a class="brand" href="{{ url_for('console') }}"><i></i>Smithproxy Appliance</a>
+  {% if g.admin %}
+  <nav>
+    <a class="{{ 'active' if request.endpoint == 'console' else '' }}" href="{{ url_for('console') }}">Runtime</a>
+    <a class="{{ 'active' if request.endpoint == 'binaries' else '' }}" href="{{ url_for('binaries') }}">Binárky</a>
+    <a class="{{ 'active' if request.endpoint in ('configs','edit_config','upload_config','delete_config') else '' }}" href="{{ url_for('configs') }}">Konfigurace</a>
+    <a class="{{ 'active' if request.endpoint == 'config_observer' else '' }}" href="{{ url_for('config_observer') }}">Observer</a>
+    <a class="{{ 'active' if request.endpoint in ('runtime_profiles','create_runtime_profile','edit_runtime_profile','delete_runtime_profile') else '' }}" href="{{ url_for('runtime_profiles') }}">Profily</a>
+    <a class="{{ 'active' if 'cert_bundle' in request.endpoint|default('') or 'bundle_certificate' in request.endpoint|default('') else '' }}" href="{{ url_for('cert_bundles') }}">Certifikáty</a>
+    <a class="{{ 'active' if request.endpoint in ('settings','update_networking_settings') else '' }}" href="{{ url_for('settings') }}">Nastavení</a>
+  </nav>
+  <span class="admin-email">{{ g.admin.email }}</span>
+  <form method="post" action="{{ url_for('logout') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button class="link">Odhlásit</button>
+  </form>
+  {% endif %}
+</header>
+<main>
+  {% for category,message in get_flashed_messages(with_categories=true) %}<div class="flash {{ category }}">{{ message }}</div>{% endfor %}
+  {% block content %}{% endblock %}
+</main>
+{% if g.admin %}<aside class="task-dock" id="task-dock"><button type="button" class="task-dock-toggle" id="task-dock-toggle"><span>Úlohy</span><b id="task-active-count">0</b><small id="task-dock-summary">nic neběží</small><i>⌃</i></button><div class="task-drawer" id="task-drawer" hidden><div class="task-drawer-head"><b>Fronta úloh</b><span>pending a běžící nahoře; dokončené zůstávají v historii</span></div><div class="task-list" id="task-list"><p class="empty">Načítám…</p></div></div></aside>{% endif %}
+{% block scripts %}{% endblock %}
+</body>
+</html>

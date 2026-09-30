@@ -1,0 +1,18 @@
+{% extends 'base.html' %}{% block content %}
+<div class="headline"><div><div class="eyebrow">RUNTIME PROFILE</div><h1>{{ profile.name }}</h1><p>Změna zachová stejné ID profilu. Běžící instance používají svůj existující runtime snapshot.</p></div><a class="secondary compact button-link" href="{{ url_for('runtime_profiles') }}">Zpět na profily</a></div>
+{% if error %}<div class="flash error">{{ error }}</div>{% endif %}
+<form method="post" class="panel profile-edit-form">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <div class="config-editor-meta">
+    <label>Název<input name="name" maxlength="128" value="{{ profile.name }}" required></label>
+    <label>Archivovaná binárka<select name="build_id" required>{% for artifact in status.build.artifacts|default([]) %}{% set id = artifact.build_id|default(artifact.commit_id) %}<option value="{{ id }}" {{ 'selected' if id == profile.build_id }}>{{ artifact.ref or 'detached' }} · {{ artifact.build_type|default('Release') }} · {{ artifact.commit_id[:12] }}</option>{% endfor %}</select></label>
+    <label>Konfigurace<select name="config_id" required>{% for config in status.build.configs|default([]) %}<option value="{{ config.config_id }}" {{ 'selected' if config.config_id == profile.config_id }} {{ 'disabled' if not config.native else '' }}>{{ config.name }} · {{ config.profile|default('custom') }} · {{ config.sha256[:12] }}{% if not config.native %} · legacy{% endif %}</option>{% endfor %}</select></label>
+    <label>CA / Cert bundle<select name="cert_bundle_id"><option value="">Bez vlastního bundle — certifikáty z configu</option>{% for bundle in bundles %}<option value="{{ bundle.bundle_id }}" {{ 'selected' if bundle.bundle_id == profile.cert_bundle_id }}>{{ bundle.name }} · {{ bundle.ca_common_name }}</option>{% endfor %}</select></label>
+    <label class="check"><input type="checkbox" name="auto_restart" {{ 'checked' if profile.auto_restart }}><span>Auto-restart při pádu <small>Stejný unit, namespace a parametry; max. 5 pokusů.</small></span></label>
+  </div>
+  {% if profile.newer_build_available %}<div class="flash warning">Pro profil existuje novější build stejné větve a typu: <code>{{ profile.newer_commit_id[:12] }}</code>. Výběr zůstává na tobě.</div>{% endif %}
+  {% set instances = profile.usage.instances|default([]) %}
+  <div class="config-usage"><b>Použití profilu</b>{% if instances %}<p>Změna se použije pro další spuštění; tyto existující instance se automaticky nepřepnou:</p><small>{% for item in instances %}<code>{{ item.id[:12] }}</code> ({{ item.state }}, {{ item.source_ip }}, {{ item.user_id }}){% if not loop.last %}, {% endif %}{% endfor %}</small>{% else %}<p>Profil teď nepoužívá žádná zachovaná instance.</p>{% endif %}</div>
+  <div class="dialog-actions"><a class="secondary button-link" href="{{ url_for('runtime_profiles') }}">Zrušit</a><button>Uložit změny</button></div>
+</form>
+{% endblock %}

@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+node_modules/
+console/.venv/
+console/node_modules/
+console/instance/
+console/__pycache__/
+.env
+.env.*
+*.log
+.coverage
+.pytest_cache/
+.mypy_cache/
+dist/
+build/

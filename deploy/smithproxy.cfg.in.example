@@ -1,0 +1,33 @@
+// This is deliberately only a template fragment, not a complete production
+// Smithproxy configuration. Start with the known-good smithproxy.cfg for the
+// installed Smithproxy version and replace only allowlisted values with these
+// placeholders.
+//
+// Available placeholders:
+//   {{SOCKS_PORT}} {{PLAINTEXT_PORT}} {{TLS_PORT}} {{CLI_PORT}}
+//   {{WORKERS}} {{PCAP_QUOTA_MB}} {{RUNTIME_DIR}}
+
+settings = {
+    accept_tproxy = TRUE;
+    accept_redirect = FALSE;
+    accept_socks = TRUE;
+    socks_workers = {{WORKERS}};
+    plaintext_port = "{{PLAINTEXT_PORT}}";
+    ssl_port = "{{TLS_PORT}}";
+    write_payload_dir = "{{RUNTIME_DIR}}";
+    write_pcap_single_quota = {{PCAP_QUOTA_MB}};
+    cli = { port = {{CLI_PORT}}; enable_password = ""; };
+};
+
+captures = {
+    local = {
+        enabled = TRUE;
+        dir = "{{RUNTIME_DIR}}";
+        file_prefix = "capture";
+        file_suffix = "";
+        pcap_quota = {{PCAP_QUOTA_MB}};
+        format = "pcap_single";
+    };
+};
+
+// Add the installation's address objects, profiles and policy below.
