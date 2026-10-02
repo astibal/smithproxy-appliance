@@ -7,13 +7,13 @@ SAS appliance serveru.
 Capture Zone Portal
         │  privátní API; pro vzdálený provoz mTLS
         ▼
-Smithproxy Appliance Runner (root)
+sas-runner.service (root, headless control plane)
         ├── task queue, build/config/cert store
         ├── systemd transient units
         ├── network namespaces, veth a policy routing
         └── Smithproxy instance
 
-Smithproxy Appliance Console (unprivileged admin UI)
+sas-console.service (unprivileged, optional admin UI)
         └── používá stejné Runner API
 ```
 
@@ -22,6 +22,8 @@ Smithproxy Appliance Console (unprivileged admin UI)
 ```text
 runner/       privilegovaný appliance agent a API
 console/      neprivilegovaná Flask admin konzole
+sas_client/   znovupoužitelný Python klient runner API
+sasctl        headless CLI pro operátory a automatizaci
 config/       výchozí konfigurace source IP
 deploy/       systemd, sysctl a environment příklady
 docs/         API a provozní dokumentace
@@ -30,7 +32,14 @@ tests/        rootless unit/integration testy runneru
 
 Runtime stav, buildy, konfigurace a certifikáty nejsou součástí repozitáře.
 Lokální launcher je ukládá pod `/tmp/capture-zone-runtime`; produkční systemd
-nasazení používá `/var/lib/capture-zone-runner` a `/run/capture-zone-runner`.
+nasazení používá `/var/lib/smithproxy-appliance` a `/run/smithproxy-appliance`.
+Instance mají jeden plochý canonical store a typové symlink indexy:
+
+```text
+instances/<uuid>/
+instances/managed/<uuid>    -> ../<uuid>/
+instances/test-drive/<uuid> -> ../<uuid>/
+```
 
 ## Lokální spuštění
 
@@ -58,4 +67,5 @@ node --check console/static/app.js
 ```
 
 Podrobnosti jsou v [Runner dokumentaci](docs/RUNNER.md),
-[Console dokumentaci](docs/CONSOLE.md) a [API přehledu](docs/API.md).
+[Console dokumentaci](docs/CONSOLE.md), [systemd deploymentu](docs/SYSTEMD.md)
+[CLI dokumentaci](docs/SASCTL.md) a [API přehledu](docs/API.md).

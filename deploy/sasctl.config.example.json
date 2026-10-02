@@ -1,0 +1,20 @@
+{
+  "current": "local",
+  "contexts": {
+    "local": {
+      "url": "http://127.0.0.1:9080",
+      "ws_url": "ws://127.0.0.1:9081",
+      "token_file": "/etc/smithproxy-appliance/runner-client.env",
+      "timeout": 30
+    },
+    "appliance-lab": {
+      "url": "https://sas-lab.private.example:9443",
+      "ws_url": "wss://sas-lab.private.example:9444",
+      "token_file": "~/.config/sasctl/sas-lab.token",
+      "ca_file": "~/.config/sasctl/private-ca.pem",
+      "cert_file": "~/.config/sasctl/operator.pem",
+      "key_file": "~/.config/sasctl/operator-key.pem",
+      "timeout": 60
+    }
+  }
+}

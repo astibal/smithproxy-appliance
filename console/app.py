@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import base64
 import os
 import secrets
 import threading
+from io import BytesIO
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
@@ -12,10 +14,27 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 import click
-from flask import Flask, Response, abort, flash, g, jsonify, redirect, render_template, request, session, url_for
+from flask import Flask, Response, abort, flash, g, jsonify, redirect, render_template, request, send_file, session, url_for
 from flask_sock import Sock
 from websockets.sync.client import connect as websocket_connect
 from werkzeug.security import check_password_hash, generate_password_hash
+
+
+def partition_branches(branches, *, now=None, attic_days=365):
+    """Keep old remote refs available without crowding the active catalogue."""
+    current = now or datetime.now(timezone.utc)
+    active, attic = [], []
+    for source in branches:
+        item = dict(source)
+        try:
+            committed = datetime.fromisoformat(str(item.get("commit_at", "")).replace("Z", "+00:00"))
+            if committed.tzinfo is None:
+                committed = committed.replace(tzinfo=timezone.utc)
+            item["age_days"] = max(0, int((current - committed).total_seconds() // 86400))
+        except (TypeError, ValueError):
+            item["age_days"] = None
+        (attic if item["age_days"] is not None and item["age_days"] > attic_days else active).append(item)
+    return active, attic
 
 
 def create_app(test_config=None):
@@ -34,7 +53,7 @@ def create_app(test_config=None):
         RUNNER_TIMEOUT=float(os.getenv("CAPTURE_RUNNER_TIMEOUT", "5")),
         SEND_FILE_MAX_AGE_DEFAULT=0,
         SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Strict",
-        MAX_CONTENT_LENGTH=2 * 1024 * 1024,
+        MAX_CONTENT_LENGTH=24 * 1024 * 1024,
     )
     if test_config:
         app.config.update(test_config)
@@ -238,12 +257,198 @@ def create_app(test_config=None):
             status["build"]["artifacts"] = artifact_library_view(
                 status["build"].get("artifacts", [])
             )
+            refs = status["build"].setdefault("refs", {})
+            active, attic = partition_branches(refs.get("branches", []))
+            refs["active_branches"] = active
+            refs["attic_branches"] = attic
             return render_template("binaries.html", status=status, error=None)
         except RuntimeError as exc:
             return render_template(
                 "binaries.html", status={"build": {"state": "unavailable", "artifacts": []}},
                 error=str(exc),
             )
+
+    @app.get("/test-drives")
+    @login_required
+    def test_drive_list():
+        try:
+            drives = api("GET", "/v1/test-drives")["test_drives"]
+            return render_template("test_drives.html", drives=drives, drive=None,
+                                   files=[], logs="", artifacts=[], error=None)
+        except RuntimeError as exc:
+            return render_template("test_drives.html", drives=[], drive=None,
+                                   files=[], logs="", artifacts=[], error=str(exc))
+
+    @app.get("/test-drives/<drive_id>")
+    @login_required
+    def test_drive_detail(drive_id):
+        try:
+            encoded = quote(drive_id, safe="")
+            drive = api("GET", f"/v1/test-drives/{encoded}")
+            drives = api("GET", "/v1/test-drives")["test_drives"]
+            files = api("GET", f"/v1/test-drives/{encoded}/files")["files"]
+            logs = api("GET", f"/v1/test-drives/{encoded}/logs").get("output", "")
+            status = api("GET", "/v1/status")
+            artifacts = status.get("build", {}).get("artifacts", [])
+            return render_template("test_drives.html", drives=drives, drive=drive,
+                                   files=files, logs=logs, artifacts=artifacts, error=None)
+        except RuntimeError as exc:
+            flash(str(exc), "error")
+            return redirect(url_for("test_drive_list"))
+
+    @app.post("/test-drives")
+    @login_required
+    def start_test_drive():
+        try:
+            build_id = request.form.get("build_id", "")
+            ttl = int(request.form.get("ttl_seconds", "1800"))
+            result = enqueue("POST", "/v1/test-drives", {
+                "build_id": build_id, "ttl_seconds": ttl,
+                "config_mode": "rw" if request.form.get("config_rw") == "yes" else "ro",
+            }, f"Spustit Test Drive {build_id[:12]}", "test-drive-spawn")
+            audit("test-drive.start", f"{build_id}:{result.get('task_id', '')}")
+            flash_queued(result, "Test Drive zařazen")
+        except (RuntimeError, ValueError) as exc:
+            flash(str(exc), "error")
+        return redirect(url_for("binaries"))
+
+    @app.post("/test-drives/<drive_id>/destroy")
+    @login_required
+    def destroy_test_drive(drive_id):
+        try:
+            result = enqueue(
+                "DELETE", f"/v1/test-drives/{quote(drive_id, safe='')}", None,
+                f"Zničit Test Drive {drive_id[:12]}", "test-drive-destroy",
+            )
+            audit("test-drive.destroy", drive_id)
+            flash_queued(result)
+        except RuntimeError as exc:
+            flash(str(exc), "error")
+        return redirect(url_for("test_drive_list"))
+
+    @app.post("/test-drives/<drive_id>/upgrade")
+    @login_required
+    def upgrade_test_drive(drive_id):
+        build_id = request.form.get("build_id", "")
+        try:
+            result = enqueue(
+                "POST", f"/v1/test-drives/{quote(drive_id, safe='')}/upgrade",
+                {"build_id": build_id},
+                f"Dirty upgrade Test Drive {drive_id[:12]} → {build_id[:12]}",
+                "test-drive-upgrade",
+            )
+            audit("test-drive.upgrade", f"{drive_id}:{build_id}")
+            flash_queued(result, "Dirty upgrade zařazen")
+        except RuntimeError as exc:
+            flash(str(exc), "error")
+        return redirect(url_for("test_drive_detail", drive_id=drive_id))
+
+    @app.post("/test-drives/<drive_id>/extend")
+    @login_required
+    def extend_test_drive(drive_id):
+        try:
+            seconds = int(request.form.get("additional_seconds", "1800"))
+            result = enqueue(
+                "POST", f"/v1/test-drives/{quote(drive_id, safe='')}/extend",
+                {"additional_seconds": seconds},
+                f"Prodloužit Test Drive {drive_id[:12]} o {seconds} s",
+                "test-drive-extend",
+            )
+            audit("test-drive.extend", f"{drive_id}:{seconds}")
+            flash_queued(result, "Prodloužení Test Drive zařazeno")
+        except (RuntimeError, ValueError) as exc:
+            flash(str(exc), "error")
+        return redirect(url_for("test_drive_detail", drive_id=drive_id))
+
+    @app.post("/test-drives/<drive_id>/restart")
+    @login_required
+    def restart_test_drive(drive_id):
+        try:
+            result = enqueue(
+                "POST", f"/v1/test-drives/{quote(drive_id, safe='')}/restart", {},
+                f"Znovu spustit Test Drive {drive_id[:12]}", "test-drive-restart",
+            )
+            audit("test-drive.restart", drive_id)
+            flash_queued(result, "Restart Test Drive zařazen")
+        except RuntimeError as exc:
+            flash(str(exc), "error")
+        return redirect(url_for("test_drive_detail", drive_id=drive_id))
+
+    @app.post("/test-drives/<drive_id>/config-mode")
+    @login_required
+    def set_test_drive_config_mode(drive_id):
+        mode = request.form.get("config_mode", "ro")
+        try:
+            result = enqueue(
+                "POST", f"/v1/test-drives/{quote(drive_id, safe='')}/config-mode",
+                {"config_mode": mode},
+                f"Test Drive {drive_id[:12]} config {mode.upper()}",
+                "test-drive-config-mode",
+            )
+            audit("test-drive.config-mode", f"{drive_id}:{mode}")
+            flash_queued(result, "Změna config režimu zařazena")
+        except RuntimeError as exc:
+            flash(str(exc), "error")
+        return redirect(url_for("test_drive_detail", drive_id=drive_id))
+
+    @app.post("/test-drives/<drive_id>/config-preview")
+    @login_required
+    def save_test_drive_config(drive_id):
+        try:
+            result = enqueue(
+                "POST", f"/v1/test-drives/{quote(drive_id, safe='')}/config/preview",
+                {
+                    "name": request.form.get("name", "").strip(),
+                    "description": request.form.get("description", ""),
+                },
+                f"Extrahovat config Test Drive {drive_id[:12]}",
+                "test-drive-config-preview",
+            )
+            audit("test-drive.config-preview", drive_id)
+            flash_queued(result, "Extrakce configu zařazena")
+        except RuntimeError as exc:
+            flash(str(exc), "error")
+        return redirect(url_for("test_drive_detail", drive_id=drive_id))
+
+    @app.post("/test-drives/<drive_id>/files")
+    @login_required
+    def upload_test_drive_file(drive_id):
+        uploaded = request.files.get("file")
+        if not uploaded or not uploaded.filename:
+            flash("Vyber soubor.", "error")
+            return redirect(url_for("test_drive_detail", drive_id=drive_id))
+        path = request.form.get("path", "").strip() or Path(uploaded.filename).name
+        try:
+            api("POST", f"/v1/test-drives/{quote(drive_id, safe='')}/files", {
+                "path": path,
+                "content_base64": base64.b64encode(uploaded.read()).decode("ascii"),
+            })
+            audit("test-drive.upload", f"{drive_id}:{path}")
+            flash(f"Nahráno do /work/{path}.", "success")
+        except RuntimeError as exc:
+            flash(str(exc), "error")
+        return redirect(url_for("test_drive_detail", drive_id=drive_id))
+
+    @app.get("/test-drives/<drive_id>/files/download")
+    @login_required
+    def download_test_drive_file(drive_id):
+        path = request.args.get("path", "")
+        try:
+            result = api(
+                "GET", f"/v1/test-drives/{quote(drive_id, safe='')}/files"
+                f"?path={quote(path, safe='')}",
+            )
+            content = base64.b64decode(result["content_base64"], validate=True)
+            # Python repr() uses apostrophes, but Content-Disposition doesn't:
+            # browsers treated those delimiters as part of the downloaded name.
+            return send_file(
+                BytesIO(content), mimetype="application/octet-stream",
+                as_attachment=True, download_name=Path(result["name"]).name,
+                max_age=0,
+            )
+        except (RuntimeError, ValueError, KeyError) as exc:
+            flash(str(exc), "error")
+            return redirect(url_for("test_drive_detail", drive_id=drive_id))
 
     @app.get("/runtime-profiles")
     @login_required
@@ -296,16 +501,21 @@ def create_app(test_config=None):
     @login_required
     def create_runtime_profile():
         try:
+            ttl_seconds = (
+                None if request.form.get("ttl_unlimited") == "on"
+                else int(request.form.get("ttl_seconds", "1800"))
+            )
             result = enqueue("POST", "/v1/runtime-profiles", {
                 "name": request.form.get("name", ""),
                 "build_id": request.form.get("build_id", ""),
                 "config_id": request.form.get("config_id", ""),
                 "cert_bundle_id": request.form.get("cert_bundle_id", ""),
                 "auto_restart": request.form.get("auto_restart") == "on",
+                "ttl_seconds": ttl_seconds,
             }, "Vytvořit runtime profil", "profile-create")
             audit("runtime-profile.create", result.get("task_id", ""))
             flash_queued(result)
-        except RuntimeError as exc:
+        except (RuntimeError, ValueError) as exc:
             flash(str(exc), "error")
         return redirect(url_for("runtime_profiles"))
 
@@ -324,20 +534,25 @@ def create_app(test_config=None):
                 "runtime_profile_editor.html", profile=profile, status=status,
                 bundles=bundles, error=None,
             )
-        values = {
-            "name": request.form.get("name", ""),
-            "build_id": request.form.get("build_id", ""),
-            "config_id": request.form.get("config_id", ""),
-            "cert_bundle_id": request.form.get("cert_bundle_id", ""),
-            "auto_restart": request.form.get("auto_restart") == "on",
-        }
+        values = {}
         try:
+            values = {
+                "name": request.form.get("name", ""),
+                "build_id": request.form.get("build_id", ""),
+                "config_id": request.form.get("config_id", ""),
+                "cert_bundle_id": request.form.get("cert_bundle_id", ""),
+                "auto_restart": request.form.get("auto_restart") == "on",
+                "ttl_seconds": (
+                    None if request.form.get("ttl_unlimited") == "on"
+                    else int(request.form.get("ttl_seconds", "1800"))
+                ),
+            }
             result = enqueue("PUT", f"/v1/runtime-profiles/{quote(profile_id, safe='')}", values,
                              f"Upravit runtime profil {profile_id[:12]}", "profile-update")
             audit("runtime-profile.edit", profile_id)
             flash_queued(result)
             return redirect(url_for("runtime_profiles"))
-        except RuntimeError as exc:
+        except (RuntimeError, ValueError) as exc:
             return render_template(
                 "runtime_profile_editor.html", profile={**profile, **values}, status=status,
                 bundles=bundles, error=str(exc),
@@ -457,9 +672,11 @@ def create_app(test_config=None):
         except RuntimeError as exc:
             status, items, instances, error = {"build": {"artifacts": []}}, [], [], str(exc)
         builtin_configs = [item for item in items if item.get("source_kind") in {"active", "preset"}]
-        build_configs = [item for item in items if item.get("source_kind") == "build"]
+        build_kinds = {"build", "native-build-default"}
+        build_configs = [item for item in items if item.get("source_kind") in build_kinds]
         custom_configs = [
-            item for item in items if item.get("source_kind") not in {"active", "preset", "build"}
+            item for item in items
+            if item.get("source_kind") not in {"active", "preset", *build_kinds}
         ]
         return render_template(
             "configs.html", status=status, configs=items, instances=instances, error=error,
@@ -526,9 +743,9 @@ def create_app(test_config=None):
     @login_required
     def refresh_branches():
         try:
-            api("POST", "/v1/refs/refresh", {})
-            audit("refs.refresh")
-            flash("Obnova vzdálených branchí běží na pozadí.", "success")
+            result = api("POST", "/v1/refs/refresh", {})
+            audit("refs.refresh", result.get("task_id", ""))
+            flash_queued(result, "Git fetch zařazen")
         except RuntimeError as exc:
             flash(str(exc), "error")
         return redirect(url_for("binaries"))
@@ -576,6 +793,7 @@ def create_app(test_config=None):
                     if key.startswith("placeholder__")
                 },
                 "config_mode": request.form.get("config_mode", "ro"),
+                "persistent": request.form.get("persistent") == "on",
                 "runtime_seconds": int(request.form.get("runtime_seconds", "3600")),
                 "parameters": {"socks_port": 1080, "plaintext_port": 50080, "tls_port": 50443,
                                "http_port": 3128, "cli_port": 50000,
@@ -638,6 +856,20 @@ def create_app(test_config=None):
         except RuntimeError as exc: flash(str(exc), "error")
         return redirect(url_for("console"))
 
+    @app.post("/instances/cleanup")
+    @login_required
+    def cleanup_instances():
+        try:
+            result = enqueue(
+                "POST", "/v1/instances/cleanup", {},
+                "Cleanup stopped non-persistent instances", "instance-cleanup",
+            )
+            audit("instance.cleanup", result.get("task_id", ""))
+            flash_queued(result, "Cleanup zařazen")
+        except RuntimeError as exc:
+            flash(str(exc), "error")
+        return redirect(url_for("console"))
+
     @app.post("/configs/<config_id>/delete")
     @login_required
     def delete_config(config_id):
@@ -651,6 +883,7 @@ def create_app(test_config=None):
     @app.route("/configs/<config_id>/edit", methods=["GET", "POST"])
     @login_required
     def edit_config(config_id):
+        task_fetch = request.headers.get("X-Requested-With") == "task-fetch"
         try:
             original = api("GET", f"/v1/configs/{quote(config_id, safe='')}")
             status = api("GET", "/v1/status")
@@ -664,24 +897,51 @@ def create_app(test_config=None):
             )
         content = request.form.get("content", "")
         form_values = {
-            "name": request.form.get("name", "").strip() or original["name"],
-            "description": request.form.get("description", ""),
+            "metadata_name": request.form.get("metadata_name", "").strip() or original["name"],
+            "metadata_description": request.form.get(
+                "metadata_description", original.get("description", "")
+            ),
+            "copy_name": request.form.get("copy_name", "").strip(),
             "profile": request.form.get("profile", original.get("profile", "custom")),
-            "build_id": request.form.get("build_id", "active"),
+            "build_id": request.form.get("build_id", ""),
         }
         try:
             save_mode = request.form.get("save_mode", "replace")
+            if save_mode == "metadata":
+                result = enqueue(
+                    "PUT", f"/v1/configs/{quote(config_id, safe='')}/metadata",
+                    {
+                        "name": form_values["metadata_name"],
+                        "description": form_values["metadata_description"],
+                    },
+                    f"Upravit metadata configu {config_id[:12]}", "config-metadata",
+                )
+                flash_queued(result, "Přejmenování configu zařazeno")
+                return redirect(url_for("configs"))
+            if save_mode == "copy" and not form_values["copy_name"]:
+                raise RuntimeError("Pro kopii zadej nový název.")
+            if not form_values["build_id"]:
+                raise RuntimeError("Vyber validující build.")
             payload = {
-                **form_values,
+                "name": (
+                    form_values["copy_name"] if save_mode == "copy" else original["name"]
+                ),
+                "description": original.get("description", ""),
+                "profile": form_values["profile"],
+                "build_id": form_values["build_id"],
                 "content": content,
                 "action": "create" if save_mode == "copy" else "update",
                 "config_id": "" if save_mode == "copy" else config_id,
             }
             result = enqueue("POST", "/v1/configs/preview", payload,
                              f"Připravit změnu configu {config_id[:12]}", "config-preview")
+            if task_fetch:
+                return jsonify({**result, "message": "Validace configu zařazena"}), 202
             flash_queued(result, "Příprava diffu zařazena")
             return redirect(url_for("configs"))
         except RuntimeError as exc:
+            if task_fetch:
+                return jsonify(error=str(exc)), 400
             return render_template(
                 "config_editor.html", original=original, status=status,
                 content=content, error=str(exc), form_values=form_values,
@@ -707,6 +967,7 @@ def create_app(test_config=None):
                 "description": request.form.get("description", ""),
                 "content": content,
                 "profile": request.form.get("profile", "custom"),
+                "build_id": request.form.get("build_id", ""),
             }, "Importovat a normalizovat konfiguraci", "config-preview")
             flash_queued(result, "Import configu zařazen")
             return redirect(url_for("configs"))
@@ -842,6 +1103,7 @@ def create_app(test_config=None):
             result = api("GET", f"/v1/tasks/{quote(task_id, safe='')}/result")
             if task.get("kind") in {
                 "config-preview", "build-config-preview", "instance-config-preview",
+                "test-drive-config-preview",
             }:
                 cancel = "binaries" if task.get("kind") == "build-config-preview" else "configs"
                 return render_template(
@@ -859,6 +1121,11 @@ def create_app(test_config=None):
                     error=None, selected_build=result.get("build_id", ""),
                     selected_config=result.get("config_id", ""),
                 )
+            if task.get("kind") in {
+                "test-drive-spawn", "test-drive-upgrade",
+                "test-drive-extend", "test-drive-restart", "test-drive-config-mode",
+            } and result.get("id"):
+                return redirect(url_for("test_drive_detail", drive_id=result["id"]))
             return jsonify(result)
         except RuntimeError as exc:
             flash(str(exc), "error")
@@ -949,6 +1216,72 @@ def create_app(test_config=None):
                 pass
             try: ws.close()
             except Exception: pass
+
+    @sock.route("/ws/test-drives/<drive_id>/<terminal_kind>")
+    def test_drive_websocket(ws, drive_id, terminal_kind):
+        if terminal_kind not in {"cli", "shell"}:
+            ws.close()
+            return
+        if not g.admin or not secrets.compare_digest(
+            request.args.get("csrf", ""), session.get("csrf_token", "")
+        ):
+            ws.close()
+            return
+        upstream_url = (
+            app.config["RUNNER_WS_URL"].rstrip("/")
+            + f"/v1/test-drives/{quote(drive_id, safe='')}/{terminal_kind}"
+        )
+        try:
+            with websocket_connect(
+                upstream_url,
+                additional_headers={"Authorization": f"Bearer {app.config['RUNNER_TOKEN']}"},
+                compression=None, max_size=64 * 1024, proxy=None,
+            ) as upstream:
+                finished = threading.Event()
+
+                def copy_output():
+                    try:
+                        for message in upstream:
+                            if finished.is_set():
+                                break
+                            ws.send(message)
+                    except Exception as exc:
+                        app.logger.warning("test drive %s %s closed: %s", drive_id, terminal_kind, exc)
+                    finally:
+                        finished.set()
+                        try:
+                            ws.close()
+                        except Exception:
+                            pass
+
+                reader = threading.Thread(
+                    target=copy_output, daemon=True,
+                    name=f"test-drive-{terminal_kind}-output",
+                )
+                reader.start()
+                try:
+                    while not finished.is_set():
+                        message = ws.receive()
+                        if message is None:
+                            break
+                        upstream.send(message)
+                finally:
+                    finished.set()
+                    try:
+                        upstream.close()
+                    except Exception:
+                        pass
+                    reader.join(timeout=2)
+        except Exception as exc:
+            app.logger.warning("test drive bridge %s failed: %s", drive_id, exc)
+            try:
+                ws.send(f"\r\n\x1b[31m{terminal_kind.upper()} connection failed: {exc}\x1b[0m\r\n")
+            except Exception:
+                pass
+            try:
+                ws.close()
+            except Exception:
+                pass
 
     @app.cli.command("create-admin")
     @click.option("--email", required=True)

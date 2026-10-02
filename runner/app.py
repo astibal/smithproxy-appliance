@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hmac
+import base64
+import gzip
 import ipaddress
 import difflib
 import hashlib
@@ -18,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlsplit
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -34,6 +36,8 @@ from .cert_library import CertBundleLibrary
 from .config_previews import ConfigPreviewLibrary
 from .task_queue import TaskQueue
 from .network_settings import NetworkSettings
+from .test_drive import TestDriveManager
+from .instance_layout import ensure_type_link, prepare_layout, remove_type_link
 
 
 @dataclass
@@ -70,6 +74,8 @@ class Instance:
     crash_pid: int = 0
     crash_at: str = ""
     crash_trace: str = ""
+    stopped_at: str = ""
+    persistent: bool = False
 
 
 @dataclass
@@ -83,7 +89,9 @@ class CliSession:
 class Manager:
     def __init__(self, state_dir: Path, runtime_root: Path, template: Path, backend: Any,
                  min_runtime: int = 5, max_runtime: int = 3600, max_instances: int = 32,
-                 sources_path: Path | None = None, max_total_runtime: int = 86400) -> None:
+                 sources_path: Path | None = None, max_total_runtime: int = 86400,
+                 stopped_retention_seconds: int = 3 * 3600,
+                 config_archive_dir: Path | None = None) -> None:
         self.state_dir = state_dir
         self.runtime_root = runtime_root
         self.template = template
@@ -93,11 +101,20 @@ class Manager:
         self.max_instances = max_instances
         self.max_total_runtime = max_total_runtime
         self.sources_path = sources_path
+        if stopped_retention_seconds < 0:
+            raise ValueError("stopped instance retention must not be negative")
+        self.stopped_retention_seconds = stopped_retention_seconds
+        self.config_archive_dir = config_archive_dir or state_dir.parent / "instance-config-archive"
         self.lock = threading.RLock()
         self.cli_sessions: dict[str, CliSession] = {}
         self.gdb_sessions: dict[str, Any] = {}
         state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        runtime_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.runtime_index = prepare_layout(runtime_root, "managed")
+        self.config_archive_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+    def _remove_runtime(self, instance_id: str) -> None:
+        shutil.rmtree(self.runtime_root / instance_id, ignore_errors=True)
+        remove_type_link(self.runtime_root, "managed", instance_id)
 
     def _state_path(self, instance_id: str) -> Path:
         return self.state_dir / f"{instance_id}.json"
@@ -154,8 +171,9 @@ class Manager:
             self.backend.stop(instance.unit)
             self._clear_debug(instance)
             self._snapshot_runtime_config(instance.id)
-            shutil.rmtree(self.runtime_root / instance.id, ignore_errors=True)
+            self._remove_runtime(instance.id)
             instance.state = "expired"
+            instance.stopped_at = datetime.now(timezone.utc).isoformat()
             instance.pid = 0
             instance.rss_bytes = 0
             instance.result = "ttl-expired"
@@ -164,6 +182,7 @@ class Manager:
             return instance
         if status.active_state in {"active", "activating", "reloading"}:
             instance.state = "orphaned" if instance.state == "orphaned" else "running"
+            instance.stopped_at = ""
             instance.pid = status.main_pid
             instance.rss_bytes = self.backend.rss_bytes(status.main_pid) if status.main_pid else 0
             instance.resources_cleaned = False
@@ -199,6 +218,8 @@ class Manager:
                 instance.state = "expired" if deadline and datetime.now(timezone.utc) >= deadline else (
                     "stopped" if status.result in {"success", ""} else "failed"
                 )
+            if instance.state in {"stopped", "failed", "expired"} and not instance.stopped_at:
+                instance.stopped_at = datetime.now(timezone.utc).isoformat()
             instance.result = status.result
             if not instance.resources_cleaned:
                 try:
@@ -207,7 +228,7 @@ class Manager:
                     pass
                 self._clear_debug(instance)
                 self._snapshot_runtime_config(instance.id)
-                shutil.rmtree(self.runtime_root / instance.id, ignore_errors=True)
+                self._remove_runtime(instance.id)
                 instance.resources_cleaned = True
         self._save(instance)
         return instance
@@ -220,6 +241,24 @@ class Manager:
                 if item:
                     result.append(self._reconcile(item))
             return result
+
+    def snapshot(self) -> list[Instance]:
+        """Return the last reconciled read model without touching systemd.
+
+        The reaper refreshes these atomic JSON records every two seconds.  HTTP
+        polling must not wait behind a slow spawn/native-save operation which
+        holds the manager lock, nor trigger an O(instances) systemd scan itself.
+        """
+        result = []
+        for path in sorted(self.state_dir.glob("*.json")):
+            item = self._load(path.stem)
+            if item:
+                result.append(item)
+        return result
+
+    def peek(self, instance_id: str) -> Instance | None:
+        """Read one last-reconciled instance without serializing on mutations."""
+        return self._load(instance_id)
 
     def reconcile_orphans(self) -> list[str]:
         """Adopt unrecorded portal-owned units as visible orphaned instances."""
@@ -242,6 +281,7 @@ class Manager:
                     namespace=getattr(allocation, "namespace", ""), pid=status.main_pid,
                     rss_bytes=self.backend.rss_bytes(status.main_pid) if status.main_pid else 0,
                     resources_cleaned=False, build_id="unknown", config_id="unknown",
+                    persistent=True,
                 )
                 print(f"orphan instance discovered; tracking without stopping {unit}")
                 self._save(instance)
@@ -283,20 +323,24 @@ class Manager:
             "runtime_profile_id",
             "cert_bundle_id",
             "auto_restart",
+            "persistent",
         }
         unknown = set(payload) - allowed
         if unknown:
             raise ConfigError(f"unsupported fields: {', '.join(sorted(unknown))}")
+        runtime_profile_id = str(payload.get("runtime_profile_id", ""))
         runtime = payload.get("runtime_seconds")
         if isinstance(runtime, bool) or not isinstance(runtime, int):
             raise ConfigError("runtime_seconds must be an integer")
-        if not self.min_runtime <= runtime <= self.max_runtime:
-            raise ConfigError(f"runtime_seconds must be between {self.min_runtime} and {self.max_runtime}")
+        runtime_max = self.max_total_runtime if runtime_profile_id else self.max_runtime
+        if runtime == 0 and not runtime_profile_id:
+            raise ConfigError("unlimited runtime requires a runtime profile")
+        if runtime != 0 and not self.min_runtime <= runtime <= runtime_max:
+            raise ConfigError(f"runtime_seconds must be between {self.min_runtime} and {runtime_max}")
         parameters = validate_parameters(payload.get("parameters", {}))
         source_ip = str(payload.get("source_ip", "")).strip()
         build_id = str(payload.get("build_id", "active"))
         config_id = str(payload.get("config_id", "active"))
-        runtime_profile_id = str(payload.get("runtime_profile_id", ""))
         if runtime_profile_id and not uuid_is_valid(runtime_profile_id):
             raise ConfigError("runtime_profile_id must be a UUID")
         cert_bundle_id = str(payload.get("cert_bundle_id", ""))
@@ -305,6 +349,9 @@ class Manager:
         auto_restart = payload.get("auto_restart", False)
         if not isinstance(auto_restart, bool):
             raise ConfigError("auto_restart must be a boolean")
+        persistent = payload.get("persistent", False)
+        if not isinstance(persistent, bool):
+            raise ConfigError("persistent must be a boolean")
         user_id = str(payload.get("user_id", "")).strip()
         if not re.fullmatch(r"[A-Za-z0-9@._:+-]{1,128}", user_id):
             raise ConfigError("user_id must contain 1 to 128 safe identifier characters")
@@ -371,15 +418,21 @@ class Manager:
             instance_id = str(uuid.uuid4())
             runtime_dir = self.runtime_root / instance_id
             runtime_dir.mkdir(mode=0o700)
+            ensure_type_link(self.runtime_root, "managed", instance_id, runtime_dir)
             config_path = runtime_dir / "smithproxy.cfg"
             try:
-                effective_assets = assets_dir
+                # Build/config assets are immutable library inputs. Smithproxy
+                # creates per-runtime certificate caches below certs/default,
+                # so every instance needs its own writable copy. Never let one
+                # process write into an archived build or another instance.
+                effective_assets = None
+                if assets_dir:
+                    effective_assets = runtime_dir / "smithproxy.assets"
+                    shutil.copytree(assets_dir, effective_assets)
                 ca_key_password = None
                 if cert_bundle_dir:
-                    effective_assets = runtime_dir / "smithproxy.assets"
-                    if assets_dir:
-                        shutil.copytree(assets_dir, effective_assets)
-                    else:
+                    if effective_assets is None:
+                        effective_assets = runtime_dir / "smithproxy.assets"
                         effective_assets.mkdir(mode=0o700)
                     cert_target = effective_assets / "certs" / "default"
                     cert_target.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -387,6 +440,13 @@ class Manager:
                     for key_path in cert_target.glob("*-key.pem"):
                         os.chmod(key_path, 0o600)
                     ca_key_password = ""
+                if effective_assets:
+                    cert_cache = effective_assets / "certs" / "default"
+                    cert_cache.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    for cache_name in ("sni", "ip", "cc-sni", "cc-ip"):
+                        cache_dir = cert_cache / cache_name
+                        cache_dir.mkdir(mode=0o700, exist_ok=True)
+                        os.chmod(cache_dir, 0o700)
                 rendered_config = render_template(
                     template_path or self.template, parameters, runtime_dir,
                     assets_dir=effective_assets, ca_key_password=ca_key_password,
@@ -395,24 +455,35 @@ class Manager:
                     },
                 )
                 config_path.write_text(rendered_config, encoding="utf-8")
-                os.chmod(config_path, 0o600 if config_mode == "rw" else 0o400)
-                snapshot_path = self._config_path(instance_id)
-                snapshot_path.write_text(rendered_config, encoding="utf-8")
-                os.chmod(snapshot_path, 0o600)
+                # Keep it writable while canonical native-save is applied;
+                # read-only mode is enforced only after the final content is
+                # installed and again by the transient systemd mount policy.
+                os.chmod(config_path, 0o600)
                 if binary_path and hasattr(self.backend, "native_save"):
                     # Validate the exact post-overlay runtime config before
                     # allocating the persistent namespace/routing. Validate a
                     # copy because Smithproxy's `save config` mutates its file.
+                    # Its output is the canonical runtime config: discarding it
+                    # would make a read-only instance start from a source config
+                    # without Smithproxy's *_internal_* version/schema section,
+                    # then fail its automatic startup save with FileIOException.
                     preflight_path = runtime_dir / ".preflight.cfg"
                     preflight_path.write_text(rendered_config, encoding="utf-8")
                     os.chmod(preflight_path, 0o600)
                     try:
-                        self.backend.native_save(
+                        rendered_config = self.backend.native_save(
                             binary_path, preflight_path,
                             parameters.get("cli_port", 50000),
                         )
                     finally:
                         preflight_path.unlink(missing_ok=True)
+                    if not rendered_config or "\0" in rendered_config:
+                        raise BackendError("native-save returned an invalid runtime configuration")
+                    config_path.write_text(rendered_config, encoding="utf-8")
+                os.chmod(config_path, 0o600 if config_mode == "rw" else 0o400)
+                snapshot_path = self._config_path(instance_id)
+                snapshot_path.write_text(rendered_config, encoding="utf-8")
+                os.chmod(snapshot_path, 0o600)
                 now = datetime.now(timezone.utc)
                 unit = self.backend.start(
                     instance_id, config_path, runtime, source_ip=source_ip,
@@ -426,16 +497,17 @@ class Manager:
                     config_mode=config_mode,
                     assets_path=str(effective_assets) if effective_assets else "",
                     auto_restart=auto_restart,
-                    hard_runtime_seconds=self.max_total_runtime,
+                    hard_runtime_seconds=0 if runtime == 0 else self.max_total_runtime,
                 )
             except Exception:
                 shutil.rmtree(runtime_dir, ignore_errors=True)
+                remove_type_link(self.runtime_root, "managed", instance_id)
                 self._config_path(instance_id).unlink(missing_ok=True)
                 raise
             allocation = getattr(self.backend, "allocation", lambda _id: None)(instance_id)
             instance = Instance(
                 instance_id, unit, "starting", now.isoformat(),
-                (now + timedelta(seconds=runtime)).isoformat(), runtime,
+                (now + timedelta(seconds=runtime)).isoformat() if runtime else "", runtime,
                 source_ip=source_ip,
                 namespace=getattr(allocation, "namespace", ""),
                 cli_port=parameters.get("cli_port", 50000),
@@ -450,6 +522,7 @@ class Manager:
                 runtime_profile_id=runtime_profile_id,
                 cert_bundle_id=cert_bundle_id,
                 auto_restart=auto_restart,
+                persistent=persistent,
             )
             self._save(instance)
             return instance
@@ -655,11 +728,12 @@ class Manager:
                 self._clear_debug(instance)
                 self._snapshot_runtime_config(instance.id)
                 instance.state = "stopped"
+                instance.stopped_at = datetime.now(timezone.utc).isoformat()
                 instance.pid = 0
                 instance.rss_bytes = 0
                 instance.resources_cleaned = True
                 self._save(instance)
-                shutil.rmtree(self.runtime_root / instance.id, ignore_errors=True)
+                self._remove_runtime(instance.id)
             return instance
 
     def restart(self, instance_id: str) -> Instance | None:
@@ -686,7 +760,10 @@ class Manager:
             self.backend.restart(instance.unit)
             now = datetime.now(timezone.utc)
             instance.state = "starting"
-            instance.deadline = (now + timedelta(seconds=instance.runtime_seconds)).isoformat()
+            instance.deadline = (
+                (now + timedelta(seconds=instance.runtime_seconds)).isoformat()
+                if instance.runtime_seconds else ""
+            )
             instance.pid = 0
             instance.rss_bytes = 0
             instance.result = "restarted"
@@ -708,6 +785,8 @@ class Manager:
             instance = self._reconcile(instance)
             if instance.state not in {"starting", "running", "orphaned"}:
                 raise ConfigError("only an active instance can be extended")
+            if not instance.deadline:
+                raise ConfigError("an unlimited instance does not need a TTL extension")
             now = datetime.now(timezone.utc)
             created = datetime.fromisoformat(instance.created_at)
             current = datetime.fromisoformat(instance.deadline) if instance.deadline else now
@@ -771,13 +850,115 @@ class Manager:
             gdb = self.gdb_sessions.pop(instance_id, None)
             if gdb:
                 gdb.close()
-            shutil.rmtree(self.runtime_root / instance.id, ignore_errors=True)
+            self._remove_runtime(instance.id)
             try:
                 self._state_path(instance.id).unlink()
             except FileNotFoundError:
                 return None
             self._config_path(instance.id).unlink(missing_ok=True)
             return instance
+
+    def _archive_stopped_config(self, instance: Instance) -> Path:
+        snapshot = self._config_path(instance.id)
+        try:
+            content = snapshot.read_bytes()
+        except OSError as exc:
+            raise BackendError(f"cannot archive stopped instance configuration: {exc}") from exc
+        if not content or len(content) > 1024 * 1024 or b"\0" in content:
+            raise BackendError("stopped instance configuration cannot be archived safely")
+        try:
+            stopped = datetime.fromisoformat(instance.stopped_at.replace("Z", "+00:00"))
+        except (TypeError, ValueError) as exc:
+            raise BackendError("stopped instance timestamp is invalid") from exc
+        if stopped.tzinfo is None:
+            stopped = stopped.replace(tzinfo=timezone.utc)
+        stamp = stopped.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        target = self.config_archive_dir / f"{stamp}_{instance.id}.cfg.gz"
+        if target.is_file():
+            return target
+        temporary = target.with_suffix(".gz.tmp")
+        try:
+            with temporary.open("wb") as output:
+                with gzip.GzipFile(filename="", mode="wb", fileobj=output, mtime=0) as compressed:
+                    compressed.write(content)
+            os.chmod(temporary, 0o600)
+            temporary.replace(target)
+        except Exception as exc:
+            temporary.unlink(missing_ok=True)
+            raise BackendError(f"cannot archive stopped instance configuration: {exc}") from exc
+        return target
+
+    def cleanup_stopped(self, now: datetime | None = None) -> list[dict[str, str]]:
+        """Archive and remove fully stopped records after the retention period."""
+        current = now or datetime.now(timezone.utc)
+        cleaned = []
+        with self.lock:
+            for path in sorted(self.state_dir.glob("*.json")):
+                instance = self._load(path.stem)
+                if (not instance or instance.persistent
+                        or instance.state not in {"stopped", "failed", "expired"}):
+                    continue
+                if not instance.stopped_at:
+                    instance.stopped_at = current.isoformat()
+                    self._save(instance)
+                    continue
+                try:
+                    stopped = datetime.fromisoformat(instance.stopped_at.replace("Z", "+00:00"))
+                    if stopped.tzinfo is None:
+                        stopped = stopped.replace(tzinfo=timezone.utc)
+                except (TypeError, ValueError):
+                    instance.stopped_at = current.isoformat()
+                    self._save(instance)
+                    continue
+                if (current - stopped).total_seconds() < self.stopped_retention_seconds:
+                    continue
+                if instance.pid or not instance.resources_cleaned:
+                    continue
+                try:
+                    archive = self._archive_stopped_config(instance)
+                except BackendError as exc:
+                    print(f"stopped instance cleanup deferred for {instance.id}: {exc}")
+                    continue
+                self._remove_runtime(instance.id)
+                self._state_path(instance.id).unlink(missing_ok=True)
+                self._config_path(instance.id).unlink(missing_ok=True)
+                cleaned.append({"instance_id": instance.id, "config_archive": str(archive)})
+        return cleaned
+
+    def cleanup_nonpersistent(self) -> dict[str, Any]:
+        """Immediately archive and delete every eligible non-persistent record."""
+        cleaned: list[dict[str, str]] = []
+        skipped_persistent: list[str] = []
+        with self.lock:
+            for path in sorted(self.state_dir.glob("*.json")):
+                instance = self._load(path.stem)
+                if not instance:
+                    continue
+                instance = self._reconcile(instance)
+                # Unknown adopted units are retained even when reading an old
+                # record created before the explicit persistent flag existed.
+                if instance.persistent or instance.build_id == "unknown":
+                    if instance.state not in {"starting", "running", "orphaned"}:
+                        skipped_persistent.append(instance.id)
+                    continue
+                if (instance.state not in {"stopped", "failed", "expired"}
+                        or instance.pid or not instance.resources_cleaned):
+                    continue
+                archive = ""
+                if self._config_path(instance.id).is_file():
+                    archive = str(self._archive_stopped_config(instance))
+                deleted = self.delete(instance.id)
+                if deleted:
+                    cleaned.append({
+                        "instance_id": instance.id,
+                        "config_archive": archive,
+                    })
+        return {
+            "cleaned": cleaned,
+            "cleaned_count": len(cleaned),
+            "skipped_persistent": skipped_persistent,
+            "skipped_persistent_count": len(skipped_persistent),
+        }
 
     def shutdown(self, stop_instances: bool = False) -> None:
         """Close runner-owned transports; preserve systemd instances by default."""
@@ -820,6 +1001,24 @@ def openapi_document() -> dict[str, Any]:
             "/v1/refs/refresh": {
                 "post": {"summary": "Start an asynchronous remote branch fetch"},
             },
+            "/v1/instances/cleanup": {
+                "post": {"summary": "Archive configs and delete stopped non-persistent instances"},
+            },
+            "/v1/test-drives/{id}/upgrade": {
+                "post": {"summary": "Replace a Test Drive binary without changing its config or network"},
+            },
+            "/v1/test-drives/{id}/extend": {
+                "post": {"summary": "Extend a Test Drive deadline"},
+            },
+            "/v1/test-drives/{id}/restart": {
+                "post": {"summary": "Restart the same Test Drive binary and preserved config"},
+            },
+            "/v1/test-drives/{id}/config-mode": {
+                "post": {"summary": "Switch Test Drive config between RO and RW"},
+            },
+            "/v1/test-drives/{id}/config/preview": {
+                "post": {"summary": "Native-save Test Drive config into an approval preview"},
+            },
             "/v1/builds/{id}": {
                 "delete": {"summary": "Delete an unused archived binary"},
             },
@@ -841,6 +1040,9 @@ def openapi_document() -> dict[str, Any]:
             "/v1/configs/{id}": {
                 "get": {"summary": "Read configuration metadata and content"},
                 "delete": {"summary": "Delete an unused configuration snapshot"},
+            },
+            "/v1/configs/{id}/metadata": {
+                "put": {"summary": "Rename or describe a configuration without changing its content"},
             },
             "/v1/runtime-profiles": {
                 "get": {"summary": "List binary and configuration bindings"},
@@ -920,6 +1122,59 @@ def openapi_document() -> dict[str, Any]:
     }
 
 
+def store_build_default_config(
+    builder: SmithproxyBuilder,
+    config_library: ConfigLibrary,
+    normalize: Callable[[str, str, Path], tuple[str, str, bool]],
+    build_id: str,
+) -> dict:
+    """Persist one canonical native default for a newly completed build.
+
+    Build defaults establish a new comparison baseline, so unlike imports and
+    edits they don't require an administrator approval preview.  The logical
+    identity includes ref as well as commit/build type and makes retries cheap.
+    """
+    artifact = builder.artifact(build_id)
+    ref = str(artifact.get("ref", "detached"))
+    for item in config_library.list():
+        if (
+            item.get("source_kind") == "native-build-default"
+            and item.get("normalized_build_id") == build_id
+            and item.get("source_ref") == ref
+            and item.get("native") is True
+        ):
+            try:
+                config_library.resolve(str(item["config_id"]))
+                return {**item, "auto_imported": False}
+            except BackendError:
+                break
+
+    binary = builder.resolve_binary(build_id)
+    source = binary.parent / "smithproxy.cfg"
+    assets = binary.parent / "smithproxy.assets"
+    if not source.is_file() or not assets.is_dir():
+        raise BackendError("archived build default config bundle is unavailable")
+    content = source.read_text(encoding="utf-8")
+    native, source_sha, _cache_hit = normalize(content, build_id, assets)
+    commit_id = str(artifact.get("commit_id", ""))
+    build_type = str(artifact.get("build_type", "Release"))
+    item = config_library.import_text(
+        f"{ref} @ {commit_id[:12]} ({build_type}) — default",
+        native,
+        assets,
+        description="Default config automatically extracted from a completed build.",
+        source_kind="native-build-default",
+        source_commit=commit_id,
+        source_ref=ref,
+        profile="default",
+        native=True,
+        normalized_build_id=build_id,
+        source_sha256=source_sha,
+        approved_by="",
+    )
+    return {**item, "auto_imported": True}
+
+
 def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     max_config_body: int = 2 * 1024 * 1024,
                     builder: SmithproxyBuilder | None = None,
@@ -928,8 +1183,23 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     cert_library: CertBundleLibrary | None = None,
                     config_previews: ConfigPreviewLibrary | None = None,
                     tasks: TaskQueue | None = None,
-                    network_settings: NetworkSettings | None = None):
-    def profile_view(item: dict) -> dict:
+                    network_settings: NetworkSettings | None = None,
+                    test_drives: TestDriveManager | None = None):
+    def runtime_profile_ttl(payload: dict, default: int | None = 1800) -> int | None:
+        ttl = payload.get("ttl_seconds", default)
+        if ttl is None:
+            return None
+        if isinstance(ttl, bool) or not isinstance(ttl, int):
+            raise ConfigError("ttl_seconds must be an integer or null for unlimited")
+        if not manager.min_runtime <= ttl <= manager.max_total_runtime:
+            raise ConfigError(
+                f"ttl_seconds must be between {manager.min_runtime} and "
+                f"{manager.max_total_runtime}, or null for unlimited"
+            )
+        return ttl
+
+    def profile_view(item: dict, *, artifacts: list[dict] | None = None,
+                     instances: list[Instance] | None = None) -> dict:
         result = dict(item)
         result["available"] = True
         result["newer_build_available"] = False
@@ -950,7 +1220,7 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     "available": False,
                 })
         if builder:
-            artifacts = builder.status().get("artifacts", [])
+            artifacts = artifacts if artifacts is not None else builder.status().get("artifacts", [])
             artifact = next(
                 (candidate for candidate in artifacts
                  if candidate.get("build_id", candidate.get("commit_id")) == item["build_id"]), None,
@@ -1007,7 +1277,8 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                 "id": instance.id, "state": instance.state,
                 "user_id": instance.user_id, "source_ip": instance.source_ip,
             }
-            for instance in manager.list() if instance.runtime_profile_id == item.get("profile_id")
+            for instance in (instances if instances is not None else manager.snapshot())
+            if instance.runtime_profile_id == item.get("profile_id")
         ]}
         return result
 
@@ -1023,7 +1294,7 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                 "id": item.id, "state": item.state, "user_id": item.user_id,
                 "source_ip": item.source_ip,
             }
-            for item in manager.list() if item.config_id == config_id
+            for item in manager.snapshot() if item.config_id == config_id
         ]
         return {"runtime_profiles": profiles, "instances": instances}
 
@@ -1039,16 +1310,57 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                 "id": item.id, "state": item.state, "user_id": item.user_id,
                 "source_ip": item.source_ip,
             }
-            for item in manager.list() if item.build_id == build_id
+            for item in manager.snapshot()
+            if item.build_id == build_id
+            and item.state in {"starting", "running", "orphaned"}
         ]
-        return {"runtime_profiles": profiles, "instances": instances}
+        drives = [
+            {"id": item.id, "state": item.state}
+            for item in (test_drives.snapshot() if test_drives else [])
+            if item.build_id == build_id
+        ]
+        return {"runtime_profiles": profiles, "instances": instances, "test_drives": drives}
 
     def build_status_view() -> dict | None:
         if not builder:
             return None
         status = builder.status()
+        instance_snapshot = manager.snapshot()
+        drive_snapshot = test_drives.snapshot() if test_drives else []
+        profile_snapshot = runtime_profiles.list() if runtime_profiles else []
+        instance_usage: dict[str, list[dict]] = {}
+        for item in instance_snapshot:
+            if item.state not in {"starting", "running", "orphaned"}:
+                continue
+            instance_usage.setdefault(item.build_id, []).append({
+                "id": item.id, "state": item.state, "user_id": item.user_id,
+                "source_ip": item.source_ip,
+            })
+        drive_usage: dict[str, list[dict]] = {}
+        for item in drive_snapshot:
+            drive_usage.setdefault(item.build_id, []).append({
+                "id": item.id, "state": item.state,
+            })
+        profile_usage: dict[str, list[dict]] = {}
+        for item in profile_snapshot:
+            profile_usage.setdefault(str(item.get("build_id", "")), []).append({
+                "profile_id": item.get("profile_id", ""), "name": item.get("name", ""),
+            })
         status["artifacts"] = [
-            {**item, "usage": build_usage(item.get("build_id", item.get("commit_id", "")))}
+            {
+                **item,
+                "usage": {
+                    "runtime_profiles": profile_usage.get(
+                        str(item.get("build_id", item.get("commit_id", ""))), []
+                    ),
+                    "instances": instance_usage.get(
+                        str(item.get("build_id", item.get("commit_id", ""))), []
+                    ),
+                    "test_drives": drive_usage.get(
+                        str(item.get("build_id", item.get("commit_id", ""))), []
+                    ),
+                },
+            }
             for item in status.get("artifacts", [])
         ]
         return status
@@ -1170,8 +1482,11 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
         if action == "update":
             config_library.get(target_id)
             current_content = config_library.read_content(target_id)
-        master = latest_master_build()
-        build_id = str(master.get("build_id", master.get("commit_id", "")))
+        requested_build_id = str(payload.get("build_id", "")).strip()
+        if not requested_build_id:
+            raise ConfigError("build_id is required for native config validation")
+        normalizer = builder.artifact(requested_build_id)
+        build_id = str(normalizer.get("build_id", normalizer.get("commit_id", "")))
         binary = builder.resolve_binary(build_id)
         assets = binary.parent / "smithproxy.assets"
         native, source_sha, cache_hit = normalize_native(content, build_id, assets)
@@ -1211,8 +1526,10 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
             "baseline_cache_hit": baseline_cache_hit, "comparison": comparison,
             "baseline_sha256": baseline_sha,
             "normalizer": {
-                "commit_id": master.get("commit_id", ""), "ref": master.get("ref", ""),
-                "build_type": master.get("build_type", "Release"),
+                "build_id": build_id,
+                "commit_id": normalizer.get("commit_id", ""),
+                "ref": normalizer.get("ref", ""),
+                "build_type": normalizer.get("build_type", "Release"),
             },
         }
 
@@ -1282,14 +1599,18 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                 )
             else:
                 source_kind = "native-upload"
-                if preview.get("source_instance"):
+                if preview.get("source_test_drive"):
+                    source_kind = "native-test-drive"
+                elif preview.get("source_instance"):
                     source_kind = "native-instance"
                 elif preview.get("source_build_default"):
                     source_kind = "native-build-default"
                 item = config_library.import_text(
                     str(preview["name"]), str(preview["native_content"]), assets,
                     source_kind=source_kind,
-                    source_instance=str(preview.get("source_instance", "")), **common,
+                    source_instance=str(
+                        preview.get("source_test_drive", preview.get("source_instance", ""))
+                    ), **common,
                     source_commit=str(preview.get("source_commit", "")),
                     source_ref=str(preview.get("source_ref", "")),
                 )
@@ -1339,9 +1660,14 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
             r"/v1/cert-bundles",
             r"/v1/cert-bundles/[0-9a-f-]+/certificates",
             r"/v1/runtime-profiles",
+            r"/v1/test-drives",
+            r"/v1/test-drives/[0-9a-f-]+/upgrade",
+            r"/v1/test-drives/[0-9a-f-]+/(?:extend|restart|config-mode|config/preview)",
+            r"/v1/instances/cleanup",
         ),
         "PUT": (
             r"/v1/runtime-profiles/[0-9a-f-]+",
+            r"/v1/configs/[0-9a-f-]+/metadata",
             r"/v1/settings/networking",
         ),
         "DELETE": (
@@ -1353,10 +1679,18 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
             r"/v1/configs/[0-9a-f-]+",
             r"/v1/instances/[0-9a-f-]+/record",
             r"/v1/instances/[0-9a-f-]+",
+            r"/v1/test-drives/[0-9a-f-]+",
         ),
     }
 
     def action_resource(path: str) -> str:
+        if path == "/v1/instances/cleanup":
+            return "instances:cleanup"
+        match = re.fullmatch(r"/v1/test-drives/([0-9a-f-]+)(?:/.*)?", path)
+        if match:
+            return f"test-drive:{match.group(1)}"
+        if path == "/v1/test-drives":
+            return "test-drives"
         match = re.fullmatch(r"/v1/instances/([0-9a-f-]+)(?:/.*)?", path)
         if match:
             return f"instance:{match.group(1)}"
@@ -1404,7 +1738,7 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
             if parts == ["v1", "openapi.json"]:
                 self._json(HTTPStatus.OK, openapi_document())
             elif parts == ["v1", "status"]:
-                instances = manager.list()
+                instances = manager.snapshot()
                 task_items = tasks.list() if tasks else []
                 self._json(HTTPStatus.OK, {
                     "status": "ok", "api_version": "v1",
@@ -1439,9 +1773,48 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     except (OSError, ValueError, json.JSONDecodeError) as exc:
                         self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
             elif parts == ["v1", "instances"]:
-                self._json(HTTPStatus.OK, {"instances": [asdict(i) for i in manager.list()]})
+                self._json(HTTPStatus.OK, {
+                    "instances": [asdict(i) for i in manager.snapshot()],
+                    "reconciliation": "background",
+                })
+            elif parts == ["v1", "test-drives"] and test_drives:
+                self._json(HTTPStatus.OK, {
+                    "test_drives": [asdict(item) for item in test_drives.snapshot()],
+                    "reconciliation": "background",
+                })
+            elif len(parts) == 3 and parts[:2] == ["v1", "test-drives"] and test_drives:
+                item = test_drives.peek(parts[2])
+                self._json(HTTPStatus.OK, asdict(item)) if item else self._json(
+                    HTTPStatus.NOT_FOUND, {"error": "test drive not found"}
+                )
+            elif (len(parts) == 4 and parts[:2] == ["v1", "test-drives"]
+                  and parts[3] == "logs" and test_drives):
+                try:
+                    self._json(HTTPStatus.OK, {"output": test_drives.logs(parts[2])})
+                except (ConfigError, BackendError) as exc:
+                    self._json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+            elif (len(parts) == 4 and parts[:2] == ["v1", "test-drives"]
+                  and parts[3] == "files" and test_drives):
+                try:
+                    query = __import__("urllib.parse", fromlist=["parse_qs"]).parse_qs(
+                        urlsplit(self.path).query
+                    )
+                    requested = str(query.get("path", [""])[0])
+                    if requested:
+                        name, content = test_drives.read_file(parts[2], requested)
+                        self._json(HTTPStatus.OK, {
+                            "name": name, "path": requested,
+                            "content_base64": base64.b64encode(content).decode("ascii"),
+                        })
+                    else:
+                        self._json(HTTPStatus.OK, {"files": test_drives.files(parts[2])})
+                except (ConfigError, BackendError, OSError) as exc:
+                    self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             elif parts == ["v1", "sources"]:
-                active = {item.source_ip for item in manager.list() if item.state in {"starting", "running", "orphaned"}}
+                active = {
+                    item.source_ip for item in manager.snapshot()
+                    if item.state in {"starting", "running", "orphaned"}
+                }
                 self._json(HTTPStatus.OK, {"sources": [
                     {"ip": item, "available": item not in active} for item in manager.sources()
                 ]})
@@ -1456,11 +1829,20 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
             elif parts == ["v1", "build"] and builder:
                 self._json(HTTPStatus.OK, build_status_view())
             elif parts == ["v1", "configs"] and config_library:
-                self._json(HTTPStatus.OK, {"configs": config_library.list()})
+                self._json(HTTPStatus.OK, {
+                    "configs": builder.configs() if builder else config_library.list()
+                })
             elif parts == ["v1", "runtime-profiles"] and runtime_profiles:
                 try:
+                    build_artifacts = builder.status().get("artifacts", []) if builder else []
+                    instance_snapshot = manager.snapshot()
                     self._json(HTTPStatus.OK, {
-                        "profiles": [profile_view(item) for item in runtime_profiles.list()]
+                        "profiles": [
+                            profile_view(
+                                item, artifacts=build_artifacts, instances=instance_snapshot,
+                            )
+                            for item in runtime_profiles.list()
+                        ]
                     })
                 except BackendError as exc:
                     self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
@@ -1495,10 +1877,10 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                 except BackendError as exc:
                     self._json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
             elif len(parts) == 3 and parts[:2] == ["v1", "instances"]:
-                item = manager.get(parts[2])
+                item = manager.peek(parts[2])
                 self._json(HTTPStatus.OK, asdict(item)) if item else self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
             elif len(parts) == 4 and parts[:2] == ["v1", "instances"] and parts[3] == "diagnostics":
-                item = manager.get(parts[2])
+                item = manager.peek(parts[2])
                 if not item:
                     self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
                 else:
@@ -1628,6 +2010,10 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     auto_restart = payload.get("auto_restart", False)
                     if not isinstance(auto_restart, bool):
                         raise ConfigError("auto_restart must be a boolean")
+                    current_profile = runtime_profiles.get(parts[2])
+                    ttl_seconds = runtime_profile_ttl(
+                        payload, current_profile.get("ttl_seconds", 1800)
+                    )
                     if build_id == "active":
                         raise ConfigError("runtime profiles must use an archived build")
                     builder.resolve_binary(build_id)
@@ -1641,10 +2027,28 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     item = runtime_profiles.update(
                         parts[2], str(payload.get("name", "")), build_id,
                         config_id, cert_bundle_id,
-                        auto_restart,
+                        auto_restart, ttl_seconds,
                     )
                     self._json(HTTPStatus.OK, profile_view(item))
                 except (ConfigError, BackendError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                    self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            if (len(parts) == 4 and parts[:2] == ["v1", "configs"]
+                    and parts[3] == "metadata" and config_library):
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if length <= 0 or length > max_body:
+                        raise ConfigError("invalid configuration metadata size")
+                    payload = json.loads(self.rfile.read(length))
+                    if not isinstance(payload, dict):
+                        raise ConfigError("request body must be an object")
+                    item = config_library.update_metadata(
+                        parts[2], str(payload.get("name", "")),
+                        str(payload.get("description", "")),
+                    )
+                    self._json(HTTPStatus.OK, item)
+                except (ConfigError, BackendError, OSError, ValueError,
+                        TypeError, json.JSONDecodeError) as exc:
                     self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
             if (len(parts) != 3 or parts[:2] != ["v1", "configs"]
@@ -1661,6 +2065,165 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                 self._json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
                 return
             parts = self._path()
+            if parts == ["v1", "instances", "cleanup"]:
+                try:
+                    self._json(HTTPStatus.OK, manager.cleanup_nonpersistent())
+                except (BackendError, ConfigError, OSError) as exc:
+                    self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                return
+            if (len(parts) == 4 and parts[:2] == ["v1", "test-drives"]
+                    and parts[3] == "upgrade" and test_drives and builder):
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if length <= 0 or length > max_body:
+                        raise ConfigError("invalid test drive upgrade request size")
+                    payload = json.loads(self.rfile.read(length))
+                    if not isinstance(payload, dict):
+                        raise ConfigError("test drive upgrade request must be an object")
+                    build_id = str(payload.get("build_id", ""))
+                    binary = builder.resolve_binary(build_id)
+                    item = test_drives.upgrade(parts[2], build_id, binary)
+                    self._json(HTTPStatus.OK, asdict(item))
+                except (ConfigError, BackendError, OSError, ValueError,
+                        TypeError, json.JSONDecodeError) as exc:
+                    self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                return
+            if (len(parts) == 4 and parts[:2] == ["v1", "test-drives"]
+                    and parts[3] == "extend" and test_drives):
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if length <= 0 or length > max_body:
+                        raise ConfigError("invalid test drive extension request size")
+                    payload = json.loads(self.rfile.read(length))
+                    if not isinstance(payload, dict):
+                        raise ConfigError("test drive extension request must be an object")
+                    item = test_drives.extend(parts[2], payload.get("additional_seconds"))
+                    self._json(HTTPStatus.OK, asdict(item))
+                except (ConfigError, BackendError, OSError, ValueError,
+                        TypeError, json.JSONDecodeError) as exc:
+                    self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                return
+            if (len(parts) == 4 and parts[:2] == ["v1", "test-drives"]
+                    and parts[3] == "restart" and test_drives):
+                try:
+                    item = test_drives.restart(parts[2])
+                    self._json(HTTPStatus.OK, asdict(item))
+                except (ConfigError, BackendError, OSError) as exc:
+                    self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                return
+            if (len(parts) == 4 and parts[:2] == ["v1", "test-drives"]
+                    and parts[3] == "config-mode" and test_drives):
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if length <= 0 or length > max_body:
+                        raise ConfigError("invalid Test Drive config mode request size")
+                    payload = json.loads(self.rfile.read(length))
+                    if not isinstance(payload, dict):
+                        raise ConfigError("Test Drive config mode request must be an object")
+                    item = test_drives.set_config_mode(
+                        parts[2], str(payload.get("config_mode", ""))
+                    )
+                    self._json(HTTPStatus.OK, asdict(item))
+                except (ConfigError, BackendError, OSError, ValueError,
+                        TypeError, json.JSONDecodeError) as exc:
+                    self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                return
+            if (len(parts) == 5 and parts[:2] == ["v1", "test-drives"]
+                    and parts[3:] == ["config", "preview"] and test_drives
+                    and builder and config_previews):
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if length <= 0 or length > max_body:
+                        raise ConfigError("invalid Test Drive config preview request size")
+                    payload = json.loads(self.rfile.read(length))
+                    if not isinstance(payload, dict):
+                        raise ConfigError("Test Drive config preview request must be an object")
+                    drive, source, config_path = test_drives.config_content(parts[2])
+                    assets = config_path.parent.parent / "assets"
+                    if drive.state == "running" and drive.config_mode == "rw":
+                        drive, before, native, config_path = test_drives.save_live_config(parts[2])
+                        source = before
+                        source_sha = hashlib.sha256(source.encode()).hexdigest()
+                        cache_hit = False
+                        comparison = "test-drive-live-save-to-native"
+                    else:
+                        native, source_sha, cache_hit = normalize_native(
+                            source, drive.build_id, assets
+                        )
+                        comparison = "test-drive-file-to-native"
+                    diff = "".join(difflib.unified_diff(
+                        source.splitlines(keepends=True), native.splitlines(keepends=True),
+                        fromfile="test-drive.cfg", tofile="test-drive-native.cfg",
+                    ))
+                    artifact = builder.artifact(drive.build_id)
+                    document = config_previews.create({
+                        "action": "create", "config_id": "",
+                        "name": str(payload.get("name", "")).strip()[:128]
+                        or f"Test Drive {drive.id[:12]}",
+                        "description": str(payload.get("description", ""))[:1000],
+                        "profile": "custom", "requested_content": source,
+                        "native_content": native, "source_sha256": source_sha,
+                        "native_sha256": hashlib.sha256(native.encode()).hexdigest(),
+                        "baseline_sha256": "", "normalized_build_id": drive.build_id,
+                        "source_test_drive": drive.id,
+                    }, assets=assets)
+                    self._json(HTTPStatus.OK, {
+                        **{key: document[key] for key in (
+                            "preview_id", "expires_at", "action", "config_id", "name",
+                            "description", "profile", "source_sha256", "native_sha256",
+                            "normalized_build_id", "source_test_drive",
+                        )},
+                        "diff": diff, "changed": source != native,
+                        "cache_hit": cache_hit, "baseline_cache_hit": False,
+                        "comparison": comparison, "baseline_sha256": "",
+                        "normalizer": {
+                            "build_id": drive.build_id,
+                            "commit_id": artifact.get("commit_id", ""),
+                            "ref": artifact.get("ref", ""),
+                            "build_type": artifact.get("build_type", "Release"),
+                        },
+                    })
+                except (ConfigError, BackendError, OSError, ValueError,
+                        TypeError, json.JSONDecodeError) as exc:
+                    self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                return
+            if parts == ["v1", "test-drives"] and test_drives and builder:
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    payload = json.loads(self.rfile.read(length)) if length else {}
+                    if not isinstance(payload, dict):
+                        raise ConfigError("test drive request must be an object")
+                    build_id = str(payload.get("build_id", ""))
+                    artifact = builder.artifact(build_id)
+                    binary = builder.resolve_binary(build_id)
+                    root = binary.parent
+                    item = test_drives.create(
+                        build_id, binary, root / "smithproxy.cfg",
+                        root / "smithproxy.assets", payload.get("ttl_seconds"),
+                        str(payload.get("config_mode", "ro")),
+                    )
+                    self._json(HTTPStatus.CREATED, asdict(item))
+                except (ConfigError, BackendError, OSError, ValueError,
+                        TypeError, json.JSONDecodeError) as exc:
+                    self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            if (len(parts) == 4 and parts[:2] == ["v1", "test-drives"]
+                    and parts[3] == "files" and test_drives):
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if length <= 0 or length > 24 * 1024 * 1024:
+                        raise ConfigError("invalid test drive upload size")
+                    payload = json.loads(self.rfile.read(length))
+                    if not isinstance(payload, dict):
+                        raise ConfigError("test drive upload must be an object")
+                    self._json(HTTPStatus.CREATED, test_drives.write_file(
+                        parts[2], str(payload.get("path", "")),
+                        str(payload.get("content_base64", "")),
+                    ))
+                except (ConfigError, BackendError, OSError, ValueError,
+                        TypeError, json.JSONDecodeError) as exc:
+                    self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
             if parts == ["v1", "task-actions"]:
                 try:
                     length = int(self.headers.get("Content-Length", "0"))
@@ -2037,13 +2600,14 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     auto_restart = payload.get("auto_restart", False)
                     if not isinstance(auto_restart, bool):
                         raise ConfigError("auto_restart must be a boolean")
+                    ttl_seconds = runtime_profile_ttl(payload)
                     if cert_bundle_id:
                         if not cert_library:
                             raise ConfigError("certificate bundles are unavailable")
                         cert_library.get(cert_bundle_id)
                     item = runtime_profiles.create(
                         str(payload.get("name", "")), build_id, config_id, cert_bundle_id,
-                        auto_restart,
+                        auto_restart, ttl_seconds,
                     )
                     self._json(HTTPStatus.CREATED, profile_view(item))
                 except (ConfigError, BackendError, json.JSONDecodeError) as exc:
@@ -2063,7 +2627,23 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
 
                     def build_task() -> dict:
                         builder.start(ref, build_type)
-                        return wait_for_build()
+                        state = wait_for_build()
+                        revision = str(state.get("revision", ""))
+                        artifact = next((
+                            item for item in builder.artifacts()
+                            if item.get("commit_id") == revision
+                            and item.get("ref") == ref
+                            and item.get("build_type", "Release") == build_type
+                        ), None)
+                        if not artifact:
+                            raise BackendError(
+                                "completed build artifact is unavailable for default config import"
+                            )
+                        default_config = store_build_default_config(
+                            builder, config_library, normalize_native,
+                            str(artifact.get("build_id", artifact.get("commit_id", ""))),
+                        )
+                        return {**state, "default_config": default_config}
 
                     self._json(HTTPStatus.ACCEPTED, submit_task(
                         "build", f"Build {ref} ({build_type})",
@@ -2142,6 +2722,10 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                             effective_payload["config_id"] = binding["config_id"]
                             effective_payload["cert_bundle_id"] = binding.get("cert_bundle_id", "")
                             effective_payload["auto_restart"] = bool(binding.get("auto_restart", False))
+                            profile_ttl = binding.get("ttl_seconds", 1800)
+                            effective_payload["runtime_seconds"] = (
+                                0 if profile_ttl is None else profile_ttl
+                            )
                         requested_build = str(effective_payload.get("build_id", "active"))
                         requested_config = str(effective_payload.get("config_id", "active"))
                         binary = builder.resolve_binary(requested_build)
@@ -2190,12 +2774,21 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                 self._json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
                 return
             parts = self._path()
+            if len(parts) == 3 and parts[:2] == ["v1", "test-drives"] and test_drives:
+                try:
+                    item = test_drives.destroy(parts[2])
+                    self._json(HTTPStatus.OK, asdict(item)) if item else self._json(
+                        HTTPStatus.NOT_FOUND, {"error": "test drive not found"}
+                    )
+                except BackendError as exc:
+                    self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
+                return
             if len(parts) == 3 and parts[:2] == ["v1", "builds"] and builder:
                 build_id = parts[2]
                 usage = build_usage(build_id)
-                if usage["instances"] or usage["runtime_profiles"]:
+                if usage["instances"] or usage["runtime_profiles"] or usage["test_drives"]:
                     self._json(HTTPStatus.CONFLICT, {
-                        "error": "archived binary is referenced by an instance or runtime profile",
+                        "error": "archived binary is referenced by an active instance, test drive, or runtime profile",
                         "usage": usage,
                     })
                     return
@@ -2305,32 +2898,47 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
     return Handler
 
 
-def reaper(manager: Manager, interval_seconds: float = 2.0) -> None:
+def reaper(manager: Manager, test_drives: TestDriveManager | None = None,
+           interval_seconds: float = 2.0) -> None:
     while True:
         try:
             manager.expire_cli_sessions()
             manager.reconcile_orphans()
             manager.list()
+            manager.cleanup_stopped()
+            if test_drives:
+                test_drives.list()
         except Exception as exc:
             print(f"instance reconciliation failed: {exc}")
         time.sleep(interval_seconds)
 
 
 def websocket_handler_factory(manager: Manager, token: str,
-                              builder: SmithproxyBuilder | None = None):
+                              builder: SmithproxyBuilder | None = None,
+                              test_drives: TestDriveManager | None = None):
     def handler(connection: ServerConnection) -> None:
         supplied = connection.request.headers.get("Authorization", "")
         if not token or not hmac.compare_digest(supplied, f"Bearer {token}"):
             connection.close(1008, "unauthorized")
             return
         parts = [part for part in urlsplit(connection.request.path).path.split("/") if part]
-        if (len(parts) != 4 or parts[:2] != ["v1", "instances"]
-                or parts[3] not in {"cli", "gdb"} or not uuid_is_valid(parts[2])):
+        drive_terminal = len(parts) == 4 and parts[:2] == ["v1", "test-drives"]
+        instance_terminal = len(parts) == 4 and parts[:2] == ["v1", "instances"]
+        allowed = {"cli", "shell"} if drive_terminal else {"cli", "gdb"}
+        if (not (drive_terminal or instance_terminal)
+                or parts[3] not in allowed or not uuid_is_valid(parts[2])):
             connection.close(1008, "invalid terminal path")
             return
         terminal_kind = parts[3]
         try:
-            if terminal_kind == "gdb":
+            if drive_terminal:
+                if not test_drives:
+                    raise BackendError("test drives are unavailable")
+                transport = (
+                    test_drives.open_shell(parts[2])
+                    if terminal_kind == "shell" else test_drives.open_cli(parts[2])
+                )
+            elif terminal_kind == "gdb":
                 if not builder:
                     raise BackendError("builder is unavailable")
                 instance = manager.get(parts[2])
@@ -2398,7 +3006,9 @@ def websocket_handler_factory(manager: Manager, token: str,
                 print(f"{terminal_kind} input failed for instance {parts[2]}: {exc}")
         finally:
             finished.set()
-            if terminal_kind == "gdb":
+            if drive_terminal and terminal_kind == "shell" and test_drives:
+                test_drives.close_shell(parts[2], transport)
+            elif terminal_kind == "gdb":
                 manager.close_gdb_transport(parts[2], transport)
             else:
                 transport.close()
@@ -2419,18 +3029,26 @@ def main() -> None:
             "CZ_RUNNER_NETWORK_ALLOCATIONS", "/var/lib/capture-zone-runner/network-allocations.json"
         )),
     )
+    namespace_backend = NamespaceBackend(
+        os.environ.get("CZ_RUNNER_SMITHPROXY", "/usr/local/lib/capture-zone/smithproxy"),
+        network_settings,
+    )
     manager = Manager(
         Path(os.environ.get("CZ_RUNNER_STATE_DIR", "/var/lib/capture-zone-runner")),
-        Path(os.environ.get("CZ_RUNNER_RUNTIME_DIR", "/run/capture-zone-runner")),
+        Path(os.environ.get(
+            "CZ_RUNNER_RUNTIME_DIR", "/run/capture-zone-runner/instances",
+        )),
         Path(os.environ.get("CZ_RUNNER_TEMPLATE", "/etc/capture-zone-runner/smithproxy.cfg.in")),
-        NamespaceBackend(
-            os.environ.get("CZ_RUNNER_SMITHPROXY", "/usr/local/lib/capture-zone/smithproxy"),
-            network_settings,
-        ),
+        namespace_backend,
         max_runtime=int(os.environ.get("CZ_RUNNER_MAX_RUNTIME", "3600")),
         max_total_runtime=int(os.environ.get("CZ_RUNNER_MAX_TOTAL_RUNTIME", "86400")),
         max_instances=int(os.environ.get("CZ_RUNNER_MAX_INSTANCES", "32")),
         sources_path=Path(os.environ.get("CZ_RUNNER_SOURCES", "/etc/capture-zone-runner/source-ips.json")),
+        stopped_retention_seconds=int(os.environ.get("CZ_RUNNER_STOPPED_RETENTION", "10800")),
+        config_archive_dir=Path(os.environ.get(
+            "CZ_RUNNER_INSTANCE_CONFIG_ARCHIVE",
+            "/var/lib/capture-zone-runner/instance-config-archive",
+        )),
     )
     config_library = ConfigLibrary(Path(os.environ.get(
         "CZ_RUNNER_CONFIG_LIBRARY", "/var/lib/capture-zone-runner/config-library"
@@ -2461,14 +3079,31 @@ def main() -> None:
         )),
         workers=int(os.environ.get("CZ_RUNNER_TASK_WORKERS", "4")),
     )
+    test_drives = TestDriveManager(
+        Path(os.environ.get(
+            "CZ_RUNNER_TEST_DRIVE_STATE", "/var/lib/capture-zone-runner/test-drives"
+        )),
+        Path(os.environ.get(
+            "CZ_RUNNER_TEST_DRIVE_RUNTIME", "/run/capture-zone-runner/instances"
+        )),
+        namespace_backend,
+        default_ttl=int(os.environ.get("CZ_RUNNER_TEST_DRIVE_TTL", "1800")),
+        max_ttl=int(os.environ.get("CZ_RUNNER_TEST_DRIVE_MAX_TTL", "7200")),
+        expired_retention_seconds=int(os.environ.get(
+            "CZ_RUNNER_TEST_DRIVE_RETENTION", "10800"
+        )),
+    )
     # Make portal-owned processes visible even when their state record was lost.
     # Discovery is intentionally non-destructive; an administrator decides
     # whether an orphaned unit should be stopped.
     manager.reconcile_orphans()
+    test_drives.cleanup_orphans()
     host = os.environ.get("CZ_RUNNER_HOST", "127.0.0.1")
     port = int(os.environ.get("CZ_RUNNER_PORT", "9080"))
     ws_port = int(os.environ.get("CZ_RUNNER_WS_PORT", "9081"))
-    threading.Thread(target=reaper, args=(manager,), daemon=True, name="instance-reaper").start()
+    threading.Thread(
+        target=reaper, args=(manager, test_drives), daemon=True, name="instance-reaper"
+    ).start()
     server = ThreadingHTTPServer((host, port), handler_factory(
         manager, token, builder=builder, config_library=config_library,
         runtime_profiles=runtime_profiles,
@@ -2476,9 +3111,10 @@ def main() -> None:
         config_previews=config_previews,
         tasks=tasks,
         network_settings=network_settings,
+        test_drives=test_drives,
     ))
     ws_server = serve(
-        websocket_handler_factory(manager, token, builder), host, ws_port,
+        websocket_handler_factory(manager, token, builder, test_drives), host, ws_port,
         compression=None, max_size=64 * 1024, server_header="CaptureZoneRunner/0.1",
     )
     threading.Thread(target=ws_server.serve_forever, daemon=True, name="runner-websocket").start()

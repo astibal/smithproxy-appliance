@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import math
 import os
 import pty
 import re
@@ -11,7 +12,7 @@ import subprocess
 import time
 import uuid
 import threading
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from .systemd import BackendError, UnitStatus
@@ -20,6 +21,23 @@ from .network_settings import NetworkSettings
 
 SAFE_ID = re.compile(r"^[0-9a-f-]{36}$")
 UNIT_RE = re.compile(r"^capture-zone-smithproxy-([0-9a-f-]{36})\.service$")
+TEST_DRIVE_UNIT_RE = re.compile(r"^capture-zone-testdrive-([0-9a-f-]{36})\.service$")
+TEST_DRIVE_INGRESS_NAMESPACE = uuid.UUID("7fa9bc87-6a15-44d2-90cf-f20188b07c42")
+
+
+def systemd_timespan_microseconds(value: str) -> int:
+    """Convert systemctl's human RuntimeMaxUSec rendering back to microseconds."""
+    raw = value.strip()
+    if raw.isdigit():
+        return int(raw)
+    completed = subprocess.run(
+        ["systemd-analyze", "timespan", raw], capture_output=True, text=True,
+        timeout=5, check=False, env={**os.environ, "LC_ALL": "C"},
+    )
+    match = re.search(r"^\s*(?:μs|us):\s*([0-9]+)\s*$", completed.stdout, re.MULTILINE)
+    if completed.returncode or not match:
+        raise BackendError("cannot parse systemd Test Drive runtime limit")
+    return int(match.group(1))
 
 
 class NamespaceCliTransport:
@@ -144,6 +162,42 @@ class NamespaceBackend:
         return f"capture-zone-smithproxy-{instance_id}.service"
 
     @staticmethod
+    def _instance_storage_properties(config_path: Path, private_run: Path,
+                                     binary_path: Path) -> list[str]:
+        """Build one unit's writable filesystem and minimal capability set."""
+        workspace = config_path.parent
+        owner = workspace.stat()
+        capture_dir = workspace / "captures"
+        temp_dir = workspace / "tmp"
+        for directory, mode in (
+            (private_run, 0o700), (capture_dir, 0o770), (temp_dir, 0o770),
+        ):
+            directory.mkdir(mode=mode, exist_ok=True)
+            os.chown(directory, owner.st_uid, owner.st_gid)
+            os.chmod(directory, mode)
+        capabilities = "CAP_NET_RAW CAP_DAC_OVERRIDE CAP_FOWNER"
+        return [
+            "--property=ProtectSystem=strict",
+            "--property=ProtectHome=yes",
+            "--property=PrivateDevices=yes",
+            "--property=PrivateTmp=yes",
+            "--property=NoNewPrivileges=yes",
+            f"--property=CapabilityBoundingSet={capabilities}",
+            f"--property=AmbientCapabilities={capabilities}",
+            f"--property=BindPaths={private_run}:/run",
+            f"--property=BindPaths={capture_dir}:/var/smithproxy/data",
+            # PrivateTmp hides the development runtime below host /tmp. Expose
+            # only this unit's workspace and selected immutable build subtree.
+            f"--property=BindPaths={workspace}:{workspace}",
+            # Stable in-appliance alias shared with the Test Drive shell. This
+            # keeps paths such as SSH MITM host keys portable across labs.
+            f"--property=BindPaths={workspace}:/work",
+            f"--property=BindReadOnlyPaths={binary_path.parent}:{binary_path.parent}",
+            f"--property=ReadWritePaths={workspace} /work",
+            f"--setenv=TMPDIR={temp_dir}",
+        ]
+
+    @staticmethod
     def _legacy_allocation(instance_id: str) -> NetworkAllocation:
         if not SAFE_ID.fullmatch(instance_id):
             raise BackendError("invalid instance id")
@@ -177,7 +231,7 @@ class NamespaceBackend:
     def _live_subnets(self) -> set[str]:
         result = set()
         for interface in self._ip_json(["ip", "-j", "addr", "show"]):
-            if not str(interface.get("ifname", "")).startswith("czh"):
+            if not str(interface.get("ifname", "")).startswith(("czh", "czi")):
                 continue
             for address in interface.get("addr_info", []):
                 if address.get("family") == "inet" and address.get("prefixlen") == 30:
@@ -372,18 +426,19 @@ class NamespaceBackend:
             # symlink to it on modern distributions.  A network namespace
             # alone does not isolate PID files.
             private_run = config_path.parent / "run"
-            private_run.mkdir(mode=0o700, exist_ok=True)
+            effective_binary = Path(smithproxy_binary or self.smithproxy_binary).resolve()
             command = [
                 "systemd-run", "--quiet", f"--unit={unit}",
                 "--property=Type=simple", "--property=KillMode=control-group",
                 "--property=TimeoutStopSec=10s",
-                f"--property=RuntimeMaxSec={hard_runtime_seconds}s",
                 "--property=MemoryMax=1G", "--property=TasksMax=256",
-                "--property=ProtectSystem=strict",
                 f"--property=NetworkNamespacePath=/run/netns/{allocation.namespace}",
-                f"--property=BindPaths={private_run}:/run",
-                f"--property=ReadWritePaths={config_path.parent}",
+                *self._instance_storage_properties(
+                    config_path, private_run, effective_binary,
+                ),
             ]
+            if hard_runtime_seconds:
+                command.insert(5, f"--property=RuntimeMaxSec={hard_runtime_seconds}s")
             if auto_restart:
                 # The runner performs bounded restarts so TTL remains
                 # authoritative. Keep the failed transient unit loaded long
@@ -400,9 +455,13 @@ class NamespaceBackend:
                 asset_root = Path(assets_path).resolve()
                 if not asset_root.is_dir():
                     raise BackendError("configuration assets are unavailable")
-                command.append(f"--property=ReadOnlyPaths={asset_root}")
+                # Normal instances receive a private copy below their runtime
+                # workspace. The workspace bind above already exposes it and
+                # ReadWritePaths permits Smithproxy's generated cert caches.
+                if not asset_root.is_relative_to(config_path.parent.resolve()):
+                    raise BackendError("instance assets must be private to its runtime workspace")
             command.extend([
-                "--", smithproxy_binary or self.smithproxy_binary, "--config-file", str(config_path),
+                "--", str(effective_binary), "--config-file", str(config_path),
             ])
             self._run(command)
             return unit
@@ -422,6 +481,311 @@ class NamespaceBackend:
         self._cleanup_network(self.allocation(instance_id))
         if self.network_settings:
             self.network_settings.release(instance_id)
+
+    @staticmethod
+    def test_drive_unit_name(drive_id: str) -> str:
+        if not SAFE_ID.fullmatch(drive_id):
+            raise BackendError("invalid test drive id")
+        return f"capture-zone-testdrive-{drive_id}.service"
+
+    @staticmethod
+    def test_drive_ingress_id(drive_id: str) -> str:
+        if not SAFE_ID.fullmatch(drive_id):
+            raise BackendError("invalid test drive id")
+        return str(uuid.uuid5(TEST_DRIVE_INGRESS_NAMESPACE, drive_id))
+
+    def start_test_drive(self, drive_id: str, binary: Path, config_path: Path,
+                         private_run: Path, resolver_path: Path, ttl_seconds: int,
+                         config_mode: str = "ro"):
+        allocation = replace(self._allocate(drive_id), guest_if="do0")
+        ingress_id = self.test_drive_ingress_id(drive_id)
+        try:
+            ingress_raw = self._allocate(ingress_id)
+        except Exception:
+            if self.network_settings:
+                self.network_settings.release(drive_id)
+            raise
+        ingress = replace(
+            ingress_raw, namespace=allocation.namespace,
+            host_if=f"czi{drive_id.replace('-', '')[:8]}", guest_if="di0",
+        )
+        self._cleanup_network(allocation)
+        # The allocator gives the ingress lease its own synthetic namespace
+        # identity. Test Drive joins both veths into the proxy namespace.
+        self._cleanup_network(ingress_raw)
+        try:
+            self._run(["ip", "netns", "add", allocation.namespace])
+            self._run(["ip", "link", "add", allocation.host_if, "type", "veth",
+                       "peer", "name", allocation.guest_if])
+            self._run(["ip", "link", "set", allocation.guest_if, "netns", allocation.namespace])
+            self._run(["ip", "addr", "add", f"{allocation.host_ip}/30", "dev", allocation.host_if])
+            self._run(["ip", "link", "set", allocation.host_if, "up"])
+            self._run(["ip", "-n", allocation.namespace, "addr", "add",
+                       f"{allocation.guest_ip}/30", "dev", allocation.guest_if])
+            self._run(["ip", "-n", allocation.namespace, "link", "set", "lo", "up"])
+            self._run(["ip", "-n", allocation.namespace, "link", "set",
+                       allocation.guest_if, "up"])
+            self._run(["ip", "-n", allocation.namespace, "route", "add", "default",
+                       "via", allocation.host_ip])
+            self._run(["ip", "link", "add", ingress.host_if, "type", "veth",
+                       "peer", "name", ingress.guest_if])
+            self._run(["ip", "link", "set", ingress.guest_if, "netns", allocation.namespace])
+            self._run(["ip", "addr", "add", f"{ingress.host_ip}/30", "dev", ingress.host_if])
+            self._run(["ip", "link", "set", ingress.host_if, "up"])
+            self._run(["ip", "-n", allocation.namespace, "addr", "add",
+                       f"{ingress.guest_ip}/30", "dev", ingress.guest_if])
+            self._run(["ip", "-n", allocation.namespace, "link", "set",
+                       ingress.guest_if, "up"])
+            # Accepted connections must return through di0 while independent
+            # proxy egress continues to use the default route on do0.
+            self._run(["ip", "-n", allocation.namespace, "route", "add", "default",
+                       "via", ingress.host_ip, "dev", ingress.guest_if,
+                       "table", "101"])
+            self._run(["ip", "-n", allocation.namespace, "rule", "add", "from",
+                       f"{ingress.guest_ip}/32", "table", "101", "priority", "101"])
+            interface_match = (
+                f'oifname "{allocation.sas_interface}" ' if allocation.sas_interface else ""
+            )
+            rules = (
+                f"table ip {allocation.table} {{\n"
+                " chain postrouting { type nat hook postrouting priority srcnat; policy accept;\n"
+                f"  {interface_match}ip saddr {allocation.guest_ip} masquerade\n"
+                " }\n}"
+            )
+            completed = subprocess.run(
+                ["nft", "-f", "/dev/stdin"], input=rules, capture_output=True,
+                text=True, timeout=10, check=False,
+            )
+            if completed.returncode:
+                raise BackendError(completed.stderr.strip() or "test drive nft failed")
+            unit = self.test_drive_unit_name(drive_id)
+            self._start_test_drive_service(
+                unit, allocation.namespace, binary, config_path,
+                private_run, resolver_path, ttl_seconds, config_mode,
+            )
+            return unit, allocation, ingress, ingress_id
+        except Exception:
+            self._run(["ip", "link", "delete", ingress.host_if], tolerate_missing=True)
+            self._cleanup_network(allocation)
+            if self.network_settings:
+                self.network_settings.release(drive_id)
+                self.network_settings.release(ingress_id)
+            raise
+
+    def _start_test_drive_service(self, unit: str, namespace: str, binary: Path,
+                                  config_path: Path, private_run: Path,
+                                  resolver_path: Path, ttl_seconds: int,
+                                  config_mode: str = "ro") -> None:
+        if config_mode not in {"ro", "rw"}:
+            raise BackendError("invalid Test Drive config mode")
+        self._clear_test_drive_runtime_override(unit)
+        command = [
+                "systemd-run", "--quiet", "--collect", f"--unit={unit}",
+                "--property=Type=simple", "--property=KillMode=control-group",
+                "--property=TimeoutStopSec=10s", f"--property=RuntimeMaxSec={ttl_seconds}s",
+                "--property=MemoryMax=1G", "--property=TasksMax=256",
+                f"--property=NetworkNamespacePath=/run/netns/{namespace}",
+                *self._instance_storage_properties(config_path, private_run, binary.resolve()),
+                f"--property=BindReadOnlyPaths={resolver_path}:/run/systemd/resolve/stub-resolv.conf",
+        ]
+        asset_root = config_path.parent.parent / "assets"
+        if asset_root.is_dir():
+            # Test Drive also owns this copied asset tree. Smithproxy writes
+            # generated SNI/IP certificate caches here; the build bundle stays
+            # immutable and is mounted separately by storage properties.
+            command.extend([
+                f"--property=BindPaths={asset_root}:{asset_root}",
+                f"--property=ReadWritePaths={asset_root}",
+            ])
+        if config_mode == "ro":
+            command.append(f"--property=ReadOnlyPaths={config_path}")
+        command.extend(["--", str(binary), "--config-file", str(config_path)])
+        self._run(command)
+
+    def upgrade_test_drive(self, unit: str, namespace: str, binary: Path,
+                           config_path: Path, private_run: Path,
+                           resolver_path: Path, ttl_seconds: int,
+                           config_mode: str = "rw") -> None:
+        """Replace only the Test Drive process; preserve netns and workspace."""
+        self._run(["systemctl", "stop", unit], timeout=20, tolerate_missing=True)
+        self._clear_test_drive_runtime_override(unit)
+        self._run(["systemctl", "reset-failed", unit], tolerate_missing=True)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            completed = subprocess.run(
+                ["systemctl", "show", unit, "--property=LoadState", "--value"],
+                capture_output=True, text=True, timeout=3, check=False,
+            )
+            if completed.returncode or completed.stdout.strip() in {"", "not-found"}:
+                break
+            time.sleep(0.1)
+        else:
+            raise BackendError("old Test Drive unit did not unload")
+        # A killed Smithproxy may leave its fixed private PID file behind.
+        (private_run / "smithproxy.default.pid").unlink(missing_ok=True)
+        self._start_test_drive_service(
+            unit, namespace, binary, config_path,
+            private_run, resolver_path, ttl_seconds, config_mode,
+        )
+
+    def stop_test_drive_process(self, unit: str) -> None:
+        """Stop Smithproxy without removing the Test Drive network or files."""
+        self._run(["systemctl", "stop", unit], timeout=20, tolerate_missing=True)
+        self._clear_test_drive_runtime_override(unit)
+
+    @staticmethod
+    def _test_drive_runtime_override(unit: str) -> Path:
+        if not TEST_DRIVE_UNIT_RE.fullmatch(unit):
+            raise BackendError("invalid Test Drive unit")
+        return Path("/run/systemd/system") / f"{unit}.d" / "50-capture-zone-runtime-max.conf"
+
+    def _clear_test_drive_runtime_override(self, unit: str) -> None:
+        override = self._test_drive_runtime_override(unit)
+        changed = False
+        try:
+            override.unlink(missing_ok=True)
+            changed = True
+            override.parent.rmdir()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            # Another administrator-owned drop-in may share this directory.
+            # Never remove anything except our exact file.
+            pass
+        if changed:
+            self._run(["systemctl", "daemon-reload"], timeout=20)
+
+    def extend_test_drive(self, unit: str, remaining_seconds: int) -> None:
+        if remaining_seconds < 1:
+            raise BackendError("test drive extension must remain positive")
+        completed = subprocess.run(
+            ["systemctl", "show", unit, "--property=ActiveEnterTimestampMonotonic", "--value"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        try:
+            entered_us = int(completed.stdout.strip())
+            uptime_us = int(float(Path("/proc/uptime").read_text().split()[0]) * 1_000_000)
+        except (OSError, ValueError, IndexError) as exc:
+            raise BackendError("cannot determine Test Drive unit runtime") from exc
+        elapsed_seconds = max(0, math.ceil((uptime_us - entered_us) / 1_000_000))
+        total_seconds = elapsed_seconds + remaining_seconds
+        override = self._test_drive_runtime_override(unit)
+        override.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        temporary = override.with_suffix(".tmp")
+        temporary.write_text(
+            f"[Service]\nRuntimeMaxSec={total_seconds}s\n", encoding="utf-8"
+        )
+        os.chmod(temporary, 0o644)
+        temporary.replace(override)
+        try:
+            self._run(["systemctl", "daemon-reload"], timeout=20)
+            completed = subprocess.run(
+                ["systemctl", "show", unit, "--property=RuntimeMaxUSec", "--value"],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            actual_us = systemd_timespan_microseconds(completed.stdout)
+            if completed.returncode or abs(actual_us - total_seconds * 1_000_000) > 1_000_000:
+                raise BackendError("systemd did not apply the extended Test Drive runtime")
+        except Exception:
+            override.unlink(missing_ok=True)
+            try:
+                override.parent.rmdir()
+            except OSError:
+                pass
+            self._run(["systemctl", "daemon-reload"], timeout=20)
+            raise
+
+    def stop_test_drive(self, drive_id: str, unit: str, ingress_id: str = "",
+                        ingress_host_interface: str = "") -> None:
+        ingress_id = ingress_id or self.test_drive_ingress_id(drive_id)
+        ingress_host_interface = (
+            ingress_host_interface or f"czi{drive_id.replace('-', '')[:8]}"
+        )
+        self._run(["systemctl", "stop", unit], timeout=20, tolerate_missing=True)
+        self._clear_test_drive_runtime_override(unit)
+        self._run(["ip", "link", "delete", ingress_host_interface], tolerate_missing=True)
+        self._cleanup_network(self.allocation(drive_id))
+        if self.network_settings:
+            self.network_settings.release(drive_id)
+            self.network_settings.release(ingress_id)
+
+    def discover_test_drives(self) -> list[tuple[str, str]]:
+        completed = subprocess.run(
+            ["systemctl", "list-units", "--all", "--full", "--plain", "--no-legend",
+             "--no-pager", "capture-zone-testdrive-*.service"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        if completed.returncode:
+            raise BackendError(completed.stderr.strip() or "cannot discover test drives")
+        result = []
+        for line in completed.stdout.splitlines():
+            unit = line.split(maxsplit=1)[0] if line.strip() else ""
+            match = TEST_DRIVE_UNIT_RE.fullmatch(unit)
+            if match:
+                result.append((match.group(1), unit))
+        return result
+
+    @staticmethod
+    def open_test_drive_cli(namespace: str, cli_port: int) -> NamespaceCliTransport:
+        process = subprocess.Popen(
+            ["ip", "netns", "exec", namespace, "socat", "-",
+             f"TCP:127.0.0.1:{cli_port},connect-timeout=2"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        return NamespaceCliTransport(process)
+
+    @staticmethod
+    def open_test_drive_shell(drive_id: str, namespace: str,
+                              workspace: Path, resolver_path: Path) -> GdbPtyTransport:
+        unit = f"capture-zone-testdrive-shell-{drive_id}-{uuid.uuid4().hex[:6]}.service"
+        master_fd, slave_fd = pty.openpty()
+        environment = {**os.environ, "TERM": "xterm-256color", "HOME": str(workspace)}
+        command = [
+            "systemd-run", "--quiet", "--wait", "--collect", "--pty", f"--unit={unit}",
+            "--property=KillMode=control-group", "--property=TimeoutStopSec=2s",
+            "--property=User=nobody", "--property=Group=nogroup",
+            "--property=ProtectSystem=strict", "--property=ProtectHome=yes",
+            "--property=PrivateDevices=yes", "--property=NoNewPrivileges=yes",
+            "--property=CapabilityBoundingSet=", "--property=RestrictSUIDSGID=yes",
+            f"--property=NetworkNamespacePath=/run/netns/{namespace}",
+            f"--property=BindPaths={workspace}:/work",
+            f"--property=BindReadOnlyPaths={resolver_path}:/run/systemd/resolve/stub-resolv.conf",
+            "--property=ReadWritePaths=/work",
+            "--property=WorkingDirectory=/work",
+            "--setenv=TERM=xterm-256color", "--setenv=HOME=/work",
+            "--", "/bin/bash", "--noprofile", "--norc", "-i",
+        ]
+        try:
+            process = subprocess.Popen(
+                command, env=environment, stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+                start_new_session=True, close_fds=True,
+            )
+        except Exception:
+            os.close(master_fd)
+            raise
+        finally:
+            os.close(slave_fd)
+        from .test_drive import TestDriveShellTransport
+        return TestDriveShellTransport(process, master_fd, unit)
+
+    def cleanup_test_drive_shells(self) -> None:
+        completed = subprocess.run(
+            ["systemctl", "list-units", "--all", "--full", "--plain", "--no-legend",
+             "--no-pager", "capture-zone-testdrive-shell-*.service"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        for line in completed.stdout.splitlines():
+            unit = line.split(maxsplit=1)[0] if line.strip() else ""
+            if not unit.startswith("capture-zone-testdrive-shell-"):
+                continue
+            subprocess.run(
+                ["systemctl", "kill", "--kill-whom=all", "--signal=KILL", unit],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            subprocess.run(
+                ["systemctl", "reset-failed", unit], capture_output=True, text=True,
+                timeout=5, check=False,
+            )
 
     @staticmethod
     def debug_unit_name(instance_id: str) -> str:

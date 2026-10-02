@@ -53,9 +53,17 @@ class ConfigLibrary:
         checksum = self._digest(config, assets)
         with self.lock:
             for item in self.list():
-                same_build = source_kind == "build" and source_commit and (
-                    item.get("source_kind") == "build"
-                    and item.get("source_commit") == source_commit
+                build_kinds = {"build", "native-build-default"}
+                same_build = source_kind in build_kinds and item.get("source_kind") in build_kinds and (
+                    (
+                        normalized_build_id
+                        and item.get("normalized_build_id") == normalized_build_id
+                        and item.get("source_ref") == source_ref
+                    )
+                    or (
+                        not normalized_build_id and source_commit
+                        and item.get("source_commit") == source_commit
+                    )
                 )
                 same_active = source_kind == "active" and item.get("source_kind") == "active"
                 same_preset = source_kind == "preset" and item.get("profile") == profile
@@ -243,6 +251,28 @@ class ConfigLibrary:
     def read_content(self, config_id: str) -> str:
         return self.resolve(config_id).read_text(encoding="utf-8")
 
+    def update_metadata(self, config_id: str, name: str, description: str = "") -> dict:
+        """Update presentation metadata without touching the native config bundle."""
+        clean_name = name.strip()[:128]
+        if not clean_name or any(ord(char) < 32 for char in clean_name):
+            raise BackendError("configuration name is invalid")
+        with self.lock:
+            current = self.get(config_id)
+            updated = {
+                **current,
+                "name": clean_name,
+                "description": description.strip()[:1000],
+                "metadata_updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            metadata_path = self.root / config_id / "metadata.json"
+            temporary = metadata_path.with_suffix(".tmp")
+            temporary.write_text(
+                json.dumps(updated, separators=(",", ":")), encoding="utf-8"
+            )
+            os.chmod(temporary, 0o600)
+            temporary.replace(metadata_path)
+            return updated
+
     def delete(self, config_id: str) -> dict | None:
         with self.lock:
             try:
@@ -256,3 +286,24 @@ class ConfigLibrary:
                 return None
             shutil.rmtree(target)
             return metadata
+
+    def prune_missing_build_defaults(self, build_ids: set[str]) -> list[dict]:
+        """Remove generated build defaults whose owning build disappeared.
+
+        Only configs carrying the explicit build-default provenance and an
+        exact build identity are eligible.  Uploaded, instance-saved and
+        otherwise hand-managed configs are never inferred to be disposable.
+        """
+        removed: list[dict] = []
+        with self.lock:
+            for item in self.list():
+                if (
+                    item.get("source_kind") not in {"build", "native-build-default"}
+                    or not item.get("normalized_build_id")
+                    or item.get("normalized_build_id") in build_ids
+                ):
+                    continue
+                target = self.root / str(item["config_id"])
+                shutil.rmtree(target)
+                removed.append(item)
+        return removed

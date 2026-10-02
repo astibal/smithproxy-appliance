@@ -5,10 +5,10 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Smithproxy Appliance</title>
   <link rel="stylesheet" href="{{ url_for('static',filename='vendor/xterm/xterm.css') }}">
-  <link rel="stylesheet" href="{{ url_for('static',filename='app.css',v='22') }}">
+  <link rel="stylesheet" href="{{ url_for('static',filename='app.css',v='25') }}">
   <script src="{{ url_for('static',filename='vendor/xterm/xterm.js') }}" defer></script>
   <script src="{{ url_for('static',filename='vendor/xterm/addon-fit.js') }}" defer></script>
-  <script src="{{ url_for('static',filename='app.js',v='21') }}" defer></script>
+  <script src="{{ url_for('static',filename='app.js',v='23') }}" defer></script>
 </head>
 <body class="page-{{ request.endpoint|default('unknown') }}">
 <header>
@@ -17,6 +17,7 @@
   <nav>
     <a class="{{ 'active' if request.endpoint == 'console' else '' }}" href="{{ url_for('console') }}">Runtime</a>
     <a class="{{ 'active' if request.endpoint == 'binaries' else '' }}" href="{{ url_for('binaries') }}">Binárky</a>
+    <a class="{{ 'active' if request.endpoint in ('test_drive_list','test_drive_detail') else '' }}" href="{{ url_for('test_drive_list') }}">Test Drives</a>
     <a class="{{ 'active' if request.endpoint in ('configs','edit_config','upload_config','delete_config') else '' }}" href="{{ url_for('configs') }}">Konfigurace</a>
     <a class="{{ 'active' if request.endpoint == 'config_observer' else '' }}" href="{{ url_for('config_observer') }}">Observer</a>
     <a class="{{ 'active' if request.endpoint in ('runtime_profiles','create_runtime_profile','edit_runtime_profile','delete_runtime_profile') else '' }}" href="{{ url_for('runtime_profiles') }}">Profily</a>

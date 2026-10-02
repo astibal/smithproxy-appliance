@@ -91,6 +91,19 @@
     });
   }
 
+  function setupProfileBuildUpgrade() {
+    document.querySelectorAll('[data-use-profile-build]').forEach(button => {
+      button.addEventListener('click', () => {
+        const select = q('#profile-build-id');
+        if (!select) return;
+        select.value = button.dataset.useProfileBuild;
+        select.dispatchEvent(new Event('change', {bubbles: true}));
+        button.textContent = 'Vybráno';
+        button.disabled = true;
+      });
+    });
+  }
+
   function setupBuildPolling() {
     const build = q('#build');
     if (!build || build.dataset.state !== 'running') return;
@@ -107,6 +120,19 @@
       } catch (_error) { setTimeout(poll, 3000); }
     };
     setTimeout(poll, 1000);
+  }
+
+  function setupProfileTtlControls() {
+    document.querySelectorAll('input[name="ttl_unlimited"]').forEach(toggle => {
+      const field = toggle.form?.querySelector('input[name="ttl_seconds"]');
+      if (!field) return;
+      const update = () => {
+        field.disabled = toggle.checked;
+        field.setAttribute('aria-disabled', String(toggle.checked));
+      };
+      toggle.addEventListener('change', update);
+      update();
+    });
   }
 
   function setupBuildForm() {
@@ -284,7 +310,7 @@
       const identity = document.createElement('code'); identity.className = 'instance-cell instance-cell-id'; identity.textContent = short(item.id);
       const owner = document.createElement('span'); owner.className = 'instance-cell instance-card-owner';
       const user = document.createElement('strong'); user.textContent = item.user_id || 'unknown';
-      const profile = document.createElement('small'); profile.textContent = item.profile || 'custom';
+      const profile = document.createElement('small'); profile.textContent = `${item.profile || 'custom'}${item.persistent ? ' · persistent' : ''}`;
       owner.append(user, profile);
       const pid = document.createElement('code'); pid.className = 'instance-cell'; pid.textContent = item.pid || '—';
       const rss = document.createElement('span'); rss.className = 'instance-cell'; rss.textContent = formatBytes(item.rss_bytes || 0);
@@ -335,7 +361,7 @@
       text('#detail-source', item.source_ip || '—'); text('#detail-user', item.user_id || 'unknown user');
       text('#detail-namespace', item.namespace || '—'); text('#detail-profile', `${item.profile || 'custom'} · ${item.unit || 'unit unknown'}`);
       text('#detail-ttl', ttl(item.deadline)); text('#detail-deadline', item.deadline ? new Date(item.deadline).toLocaleString() : 'bez deadline');
-      text('#detail-build', short(item.build_id)); text('#detail-runtime-profile', item.runtime_profile_id ? `profil ${short(item.runtime_profile_id)}` : 'ruční výběr');
+      text('#detail-build', short(item.build_id)); text('#detail-runtime-profile', `${item.runtime_profile_id ? `profil ${short(item.runtime_profile_id)}` : 'ruční výběr'}${item.persistent ? ' · persistent' : ''}`);
       text('#detail-config-id', short(item.config_id)); text('#detail-config-mode', `${String(item.config_mode || 'ro').toUpperCase()} · cert ${short(item.cert_bundle_id)}`);
       if (focusMode) document.title = `Smithproxy ${short(item.id)} · ${item.source_ip || 'instance'}`;
       const result = q('#detail-result'); result.hidden = !item.result; result.textContent = item.result || '';
@@ -713,6 +739,8 @@
   q('#gdb-font-increase')?.addEventListener('click', () => setGdbTerminalFont(gdbFontSize + 1));
 
   setupSpawnForm();
+  setupProfileBuildUpgrade();
+  setupProfileTtlControls();
   setupBuildForm();
   setupBuildPolling();
   setupTaskDock();

@@ -55,9 +55,24 @@ SOCKS a HTTP CONNECT provoz je na hostu omezen na autorizovanou source IP
 instance. `user_id` zůstává identitou control plane pro audit a budoucí capture
 ownership; Smithproxy jej z klientského provozu nezískává.
 
+Každá process unit má vlastní zapisovatelný `tmp/`, `captures/` a `/run`
+uvnitř svého runtime adresáře. Systemd `PrivateTmp` izoluje i explicitní cesty
+pod `/tmp`, `TMPDIR` ukazuje na privátní `tmp/` a privátní `captures/` je v
+mount namespace unity bindnutý na `/var/smithproxy/data`.
+Ostatní instance zůstávají díky `ProtectSystem=strict` nezapisovatelné.
+Smithproxy má bounding/ambient capability pouze `CAP_NET_RAW` pro GRE a packet
+sockety plus `CAP_DAC_OVERRIDE` a `CAP_FOWNER` pro vlastní config/capture
+soubory; `CAP_SYS_ADMIN` ani `CAP_NET_ADMIN` nedostává.
+
+Fyzická data všech typů jsou v jediném store `instances/<uuid>/`. Adresáře
+`instances/managed/` a `instances/test-drive/` obsahují pouze relativní
+symlinky na odpovídající UUID adresáře; nejsou druhou kopií dat.
+
 Alternativně spawn přijme `runtime_profile_id`. Runtime profil je atomický JSON
 záznam, který váže celý commit archivované binárky na UUID konfigurace a
-volitelný `cert_bundle_id`. Runner
+volitelný `cert_bundle_id`. Součástí profilu je také `ttl_seconds`; hodnota
+`null` znamená unlimited runtime bez aplikačního deadline i bez systemd
+`RuntimeMaxSec`. Staré profily bez tohoto pole se načtou s TTL 1800 sekund. Runner
 vazbu rozbalí serverově a ignoruje klientské `build_id`/`config_id`. Profily
 záměrně nepovolují pohyblivou binárku `active`; tím zůstává jejich chování
 reprodukovatelné. Cestu JSON souboru určuje `CZ_RUNNER_RUNTIME_PROFILES`.
@@ -67,6 +82,7 @@ GET    /v1/instances
 GET    /v1/instances/<uuid>
 DELETE /v1/instances/<uuid>
 DELETE /v1/instances/<uuid>/record
+POST   /v1/instances/cleanup
 GET    /v1/sources
 GET    /v1/build
 POST   /v1/build
@@ -77,6 +93,12 @@ GET    /v1/cert-bundles
 POST   /v1/cert-bundles
 POST   /v1/cert-bundles/<uuid>/certificates
 DELETE /v1/cert-bundles/<uuid>
+GET    /v1/test-drives
+POST   /v1/test-drives
+POST   /v1/test-drives/<uuid>/upgrade
+POST   /v1/test-drives/<uuid>/extend
+POST   /v1/test-drives/<uuid>/restart
+DELETE /v1/test-drives/<uuid>
 POST   /v1/instances/<uuid>/cli
 GET    /healthz
 ```
@@ -93,19 +115,10 @@ nezobrazují a klient je nesmí přepisovat.
 
 ## Instalace
 
-```bash
-install -d -m 0700 /etc/capture-zone-runner /var/lib/capture-zone-runner /opt/smithproxy-appliance
-cp -a . /opt/smithproxy-appliance/
-install -m 0600 deploy/runner.env.example /etc/capture-zone-runner/runner.env
-install -m 0600 deploy/smithproxy.cfg.in.example /etc/capture-zone-runner/smithproxy.cfg.in
-install -m 0600 config/source-ips.json /etc/capture-zone-runner/source-ips.json
-install -m 0644 deploy/90-capture-zone-runner.conf /etc/sysctl.d/90-capture-zone-runner.conf
-install -d -m 0755 /usr/local/lib/capture-zone
-install -m 0644 deploy/capture-zone-runner.service /etc/systemd/system/
-sysctl --system
-systemctl daemon-reload
-systemctl enable --now capture-zone-runner
-```
+See `docs/SYSTEMD.md` for the separate `sas-runner.service` and optional
+`sas-console.service`, their service identities, environment files and install
+commands. The units are templates for an appliance deployment and are not
+installed by this repository.
 
 Před startem je nutné:
 

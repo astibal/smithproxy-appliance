@@ -1,4 +1,5 @@
 import json
+import gzip
 import hashlib
 import tempfile
 import unittest
@@ -6,6 +7,8 @@ import uuid
 import subprocess
 import threading
 import time
+from types import SimpleNamespace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from runner.app import Manager
@@ -13,12 +16,39 @@ from runner.builder import SmithproxyBuilder
 from runner.config import ConfigError, render_template, validate_parameters
 from runner.config_library import ConfigLibrary
 from runner.config_previews import ConfigPreviewLibrary
-from runner.namespace import NamespaceBackend, parse_unit_status
+from runner.namespace import NamespaceBackend, parse_unit_status, systemd_timespan_microseconds
 from runner.network_settings import NetworkSettings
 from runner.runtime_profiles import RuntimeProfileLibrary
 from runner.cert_library import CertBundleLibrary
 from runner.systemd import BackendError, UnitStatus
 from runner.task_queue import TaskQueue
+from runner.test_drive import TestDriveManager
+
+
+class FakeCliSocket:
+    def __init__(self, config_path):
+        self.config_path = Path(config_path)
+        self.responses = [b"smithproxy# ", b"Config saved successfully\r\n"]
+        self.sent = b""
+        self.closed = False
+
+    def settimeout(self, _timeout):
+        return None
+
+    def recv(self, _size):
+        if self.responses:
+            return self.responses.pop(0)
+        raise TimeoutError
+
+    def sendall(self, payload):
+        self.sent += payload
+        self.config_path.write_text(
+            self.config_path.read_text(encoding="utf-8") + "\n# native save\n",
+            encoding="utf-8",
+        )
+
+    def close(self):
+        self.closed = True
 
 
 class FakeBackend:
@@ -84,8 +114,97 @@ class FakeBackend:
     def capture_stacktrace(self, pid, _since=""):
         return f"trace for {pid}"
 
+    def start_test_drive(self, drive_id, _binary, _config, _private_run, _resolver, _ttl,
+                         _config_mode="ro"):
+        unit = f"capture-zone-testdrive-{drive_id}.service"
+        self.units[unit] = "active"
+        egress = SimpleNamespace(
+            namespace=f"cz-{drive_id[:8]}", guest_if="do0", guest_ip="10.0.0.2",
+            host_if=f"czh{drive_id[:8]}", host_ip="10.0.0.1", subnet="10.0.0.0/30",
+        )
+        ingress = SimpleNamespace(
+            namespace=f"cz-{drive_id[:8]}", guest_if="di0", guest_ip="10.0.0.6",
+            host_if=f"czi{drive_id[:8]}", host_ip="10.0.0.5", subnet="10.0.0.4/30",
+        )
+        return unit, egress, ingress, str(uuid.uuid4())
+
+    def stop_test_drive(self, _drive_id, unit, *_ingress):
+        self.units[unit] = "inactive"
+
+    def upgrade_test_drive(self, unit, namespace, binary, config, private_run,
+                           resolver, ttl_seconds, config_mode="rw"):
+        self.test_drive_upgrade = {
+            "unit": unit, "namespace": namespace, "binary": str(binary),
+            "config": str(config), "private_run": str(private_run),
+            "resolver": str(resolver), "ttl_seconds": ttl_seconds,
+            "config_mode": config_mode,
+        }
+        self.units[unit] = "active"
+
+    def stop_test_drive_process(self, unit):
+        self.units[unit] = "inactive"
+
+    def extend_test_drive(self, unit, remaining_seconds):
+        self.test_drive_extension = (unit, remaining_seconds)
+
+    def discover_test_drives(self):
+        return []
+
+    def cleanup_test_drive_shells(self):
+        return None
+
+    def open_test_drive_cli(self, _namespace, _cli_port):
+        return self.test_drive_cli
+
 
 class RunnerTests(unittest.TestCase):
+    def test_systemd_runtime_parser_accepts_raw_microseconds(self):
+        self.assertEqual(1_861_000_000, systemd_timespan_microseconds("1861000000\n"))
+        self.assertEqual(1_861_000_000, systemd_timespan_microseconds("31min 1s\n"))
+
+    def test_test_drive_service_keeps_temp_and_captures_inside_workspace(self):
+        root = Path(self.temp.name)
+        workspace = root / "work"
+        workspace.mkdir()
+        config = workspace / "smithproxy.cfg"
+        config.write_text("settings={};", encoding="utf-8")
+        private_run = root / "run"
+        private_run.mkdir(exist_ok=True)
+        resolver = root / "resolv.conf"
+        resolver.write_text("nameserver 1.1.1.1\n", encoding="utf-8")
+        binary = root / "smithproxy"
+        binary.write_bytes(b"binary")
+        commands = []
+        backend = object.__new__(NamespaceBackend)
+        backend._clear_test_drive_runtime_override = lambda _unit: None
+        backend._run = lambda command: commands.append(command)
+
+        backend._start_test_drive_service(
+            "capture-zone-testdrive-test.service", "cz-test", binary, config,
+            private_run, resolver, 300, "rw",
+        )
+
+        command = commands[0]
+        self.assertIn(f"--setenv=TMPDIR={workspace / 'tmp'}", command)
+        self.assertIn(
+            f"--property=BindPaths={workspace / 'captures'}:/var/smithproxy/data",
+            command,
+        )
+        self.assertIn(
+            "--property=CapabilityBoundingSet=CAP_NET_RAW CAP_DAC_OVERRIDE CAP_FOWNER",
+            command,
+        )
+        self.assertIn("--property=PrivateTmp=yes", command)
+        self.assertIn(f"--property=BindPaths={workspace}:{workspace}", command)
+        self.assertIn(f"--property=BindPaths={workspace}:/work", command)
+        self.assertIn(f"--property=ReadWritePaths={workspace} /work", command)
+        self.assertIn(
+            f"--property=BindReadOnlyPaths={binary.parent}:{binary.parent}", command,
+        )
+        self.assertIn("--property=NoNewPrivileges=yes", command)
+        self.assertTrue((workspace / "tmp").is_dir())
+        self.assertTrue((workspace / "captures").is_dir())
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name)
@@ -100,14 +219,190 @@ class RunnerTests(unittest.TestCase):
     def test_create_and_stop(self):
         item = self.manager.create({"runtime_seconds": 30, "source_ip": "198.51.100.10", "user_id": "test-user", "parameters": {"socks_port": 1080}})
         self.assertEqual("starting", item.state)
+        managed_link = Path(self.temp.name, "run", "managed", item.id)
+        self.assertTrue(managed_link.is_symlink())
+        self.assertEqual(Path(self.temp.name, "run", item.id), managed_link.resolve())
         self.assertEqual("running", self.manager.get(item.id).state)
         config = Path(self.temp.name, "run", item.id, "smithproxy.cfg").read_text()
         self.assertIn('socks_port="1080"', config)
         self.manager.stop(item.id)
         self.assertFalse(Path(self.temp.name, "run", item.id).exists())
+        self.assertFalse(managed_link.exists())
         stopped, snapshot = self.manager.config_content(item.id)
         self.assertEqual("stopped", stopped.state)
         self.assertIn('socks_port="1080"', snapshot)
+
+    def test_instance_snapshot_never_calls_lifecycle_backend(self):
+        item = self.manager.create({
+            "runtime_seconds": 30, "source_ip": "198.51.100.10",
+            "user_id": "snapshot-user", "parameters": {"socks_port": 1080},
+        })
+        self.backend.status = lambda _unit: (_ for _ in ()).throw(
+            AssertionError("snapshot must not query systemd")
+        )
+
+        snapshot = self.manager.snapshot()
+
+        self.assertEqual([item.id], [current.id for current in snapshot])
+        self.assertEqual("starting", self.manager.peek(item.id).state)
+
+    def test_test_drive_is_disposable_and_reports_lab_coordinates(self):
+        root = Path(self.temp.name)
+        binary = root / "smithproxy"
+        binary.write_bytes(b"binary")
+        binary.chmod(0o700)
+        assets = root / "assets"
+        (assets / "certs" / "default").mkdir(parents=True)
+        (assets / "msg" / "en").mkdir(parents=True)
+        manager = TestDriveManager(root / "td-state", root / "td-run", self.backend)
+        item = manager.create("a" * 40 + "-release", binary, self.template, assets, 300)
+        current = manager.get(item.id)
+        self.assertEqual("running", current.state)
+        drive_link = Path(self.temp.name, "td-run", "test-drive", item.id)
+        self.assertTrue(drive_link.is_symlink())
+        self.assertEqual(Path(self.temp.name, "td-run", item.id), drive_link.resolve())
+        self.assertEqual("ro", current.config_mode)
+        self.assertEqual("di0", current.ingress_interface)
+        self.assertEqual("10.0.0.6", current.ingress_ip)
+        self.assertEqual("10.0.0.4/30", current.ingress_subnet)
+        self.assertEqual("do0", current.egress_interface)
+        self.assertTrue(Path(current.workspace, "smithproxy.cfg").is_file())
+        manager.destroy(item.id)
+        self.assertFalse(Path(self.temp.name, "td-run", item.id).exists())
+        self.assertFalse(drive_link.exists())
+        self.assertFalse(Path(self.temp.name, "td-state", f"{item.id}.json").exists())
+
+    def test_test_drive_config_mode_can_be_changed_in_same_lab(self):
+        root = Path(self.temp.name)
+        binary = root / "smithproxy-mode"
+        binary.write_bytes(b"binary")
+        binary.chmod(0o700)
+        assets = root / "assets-mode"
+        (assets / "certs" / "default").mkdir(parents=True)
+        (assets / "msg" / "en").mkdir(parents=True)
+        manager = TestDriveManager(root / "td-mode-state", root / "td-mode-run", self.backend)
+        item = manager.create("mode-release", binary, self.template, assets, 300, "ro")
+
+        changed = manager.set_config_mode(item.id, "rw")
+
+        self.assertEqual("rw", changed.config_mode)
+        self.assertEqual(item.namespace, self.backend.test_drive_upgrade["namespace"])
+        self.assertEqual("rw", self.backend.test_drive_upgrade["config_mode"])
+        self.assertEqual(item.deadline, changed.deadline)
+
+    def test_test_drive_rw_config_can_be_saved_for_library_preview(self):
+        root = Path(self.temp.name)
+        binary = root / "smithproxy-save"
+        binary.write_bytes(b"binary")
+        binary.chmod(0o700)
+        assets = root / "assets-save"
+        (assets / "certs" / "default").mkdir(parents=True)
+        (assets / "msg" / "en").mkdir(parents=True)
+        manager = TestDriveManager(root / "td-save-state", root / "td-save-run", self.backend)
+        item = manager.create("save-release", binary, self.template, assets, 300, "rw")
+        self.backend.test_drive_cli = FakeCliSocket(item.config_path)
+
+        drive, before, after, path = manager.save_live_config(item.id)
+
+        self.assertEqual(item.id, drive.id)
+        self.assertEqual(Path(item.config_path), path)
+        self.assertNotIn("# native save", before)
+        self.assertIn("# native save", after)
+        self.assertEqual(b"enable\r\nsave config\r\n", self.backend.test_drive_cli.sent)
+        self.assertTrue(self.backend.test_drive_cli.closed)
+
+    def test_test_drive_dirty_upgrade_preserves_workspace_and_deadline(self):
+        root = Path(self.temp.name)
+        original = root / "smithproxy-old"
+        replacement = root / "smithproxy-new"
+        original.write_bytes(b"old")
+        replacement.write_bytes(b"new")
+        original.chmod(0o700)
+        replacement.chmod(0o700)
+        assets = root / "assets-upgrade"
+        (assets / "certs" / "default").mkdir(parents=True)
+        (assets / "msg" / "en").mkdir(parents=True)
+        manager = TestDriveManager(root / "td-up-state", root / "td-up-run", self.backend)
+        item = manager.create("old-release", original, self.template, assets, 300)
+        config = Path(item.config_path)
+        config.write_text(
+            config.read_text()
+            + '\ncaptures = { local = { dir = "/srv/operator-captures"; }; };'
+            + '\ncerts_path = "/tmp/capture-zone-runtime/test-drives/old-id/assets/certs/default/";'
+            + "\n# dirty local edit\n"
+        )
+        original_deadline = item.deadline
+
+        upgraded = manager.upgrade(item.id, "new-release", replacement)
+
+        self.assertEqual("new-release", upgraded.build_id)
+        self.assertEqual("old-release", upgraded.previous_build_id)
+        self.assertEqual(original_deadline, upgraded.deadline)
+        self.assertEqual(1, upgraded.upgrade_count)
+        self.assertIn("# dirty local edit", config.read_text())
+        self.assertIn(
+            f'{Path(item.workspace).parent / "assets"}/certs/default/',
+            config.read_text(),
+        )
+        self.assertNotIn("/tmp/capture-zone-runtime/test-drives/old-id", config.read_text())
+        self.assertIn('/srv/operator-captures', config.read_text())
+        self.assertEqual(item.namespace, self.backend.test_drive_upgrade["namespace"])
+        self.assertEqual(str(config), self.backend.test_drive_upgrade["config"])
+        self.assertGreaterEqual(self.backend.test_drive_upgrade["ttl_seconds"], 295)
+
+    def test_test_drive_expiry_retains_config_then_extend_and_restart(self):
+        root = Path(self.temp.name)
+        binary = root / "smithproxy-recovery"
+        binary.write_bytes(b"binary")
+        binary.chmod(0o700)
+        assets = root / "assets-recovery"
+        (assets / "certs" / "default").mkdir(parents=True)
+        (assets / "msg" / "en").mkdir(parents=True)
+        manager = TestDriveManager(
+            root / "td-recovery-state", root / "td-recovery-run", self.backend,
+            expired_retention_seconds=3 * 3600,
+        )
+        item = manager.create("recovery-release", binary, self.template, assets, 300)
+        config = Path(item.config_path)
+        config.write_text(config.read_text() + "\n# keep me\n")
+        stored = manager._load(item.id)
+        stored.deadline = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        manager._save(stored)
+
+        expired = manager.get(item.id)
+        self.assertEqual("expired", expired.state)
+        self.assertTrue(config.is_file())
+        self.assertIn("# keep me", config.read_text())
+        restarted = manager.restart(item.id)
+        self.assertEqual("starting", restarted.state)
+        self.assertGreater(datetime.fromisoformat(restarted.deadline), datetime.now(timezone.utc))
+        self.assertEqual(item.namespace, self.backend.test_drive_upgrade["namespace"])
+        self.assertIn("# keep me", config.read_text())
+        extended = manager.extend(item.id, 300)
+        self.assertEqual("running", extended.state)
+        self.assertEqual(item.unit, self.backend.test_drive_extension[0])
+        self.assertGreaterEqual(self.backend.test_drive_extension[1], 300)
+
+    def test_test_drive_expired_recovery_window_eventually_destroys_lab(self):
+        root = Path(self.temp.name)
+        binary = root / "smithproxy-expired"
+        binary.write_bytes(b"binary")
+        binary.chmod(0o700)
+        assets = root / "assets-expired"
+        (assets / "certs" / "default").mkdir(parents=True)
+        (assets / "msg" / "en").mkdir(parents=True)
+        manager = TestDriveManager(
+            root / "td-expired-state", root / "td-expired-run", self.backend,
+            expired_retention_seconds=60,
+        )
+        item = manager.create("expired-release", binary, self.template, assets, 300)
+        stored = manager._load(item.id)
+        stored.deadline = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
+        stored.expired_at = stored.deadline
+        manager._save(stored)
+
+        self.assertIsNone(manager.get(item.id))
+        self.assertFalse(Path(item.workspace).exists())
 
     def test_rejects_duplicate_active_source(self):
         payload = {"runtime_seconds": 30, "source_ip": "198.51.100.10", "user_id": "test-user", "parameters": {"socks_port": 1080}}
@@ -141,7 +436,32 @@ class RunnerTests(unittest.TestCase):
                 "user_id": "test-user", "parameters": {"socks_port": 1080},
             }, selected_binary, selected_template)
         self.assertEqual({}, self.backend.units)
-        self.assertEqual([], list(Path(self.temp.name, "run").glob("*")))
+        self.assertEqual([], list(Path(self.temp.name, "run", "managed").glob("*")))
+
+    def test_runtime_uses_canonical_native_save_output_before_ro_lock(self):
+        binary = Path(self.temp.name, "smithproxy-native")
+        binary.write_bytes(b"binary")
+        binary.chmod(0o700)
+
+        def native_save(_binary, config_path, _cli_port=50000):
+            source = config_path.read_text(encoding="utf-8")
+            return '*_internal_* = { version = "0.9.32"; schema = 1039; };\n' + source
+
+        self.backend.native_save = native_save
+        item = self.manager.create({
+            "runtime_seconds": 30, "source_ip": "198.51.100.10",
+            "user_id": "native-runtime", "parameters": {"socks_port": 1080},
+            "config_mode": "ro",
+        }, binary_path=binary)
+
+        runtime_path = Path(self.temp.name, "run", item.id, "smithproxy.cfg")
+        runtime_config = runtime_path.read_text(encoding="utf-8")
+        state_config = Path(
+            self.temp.name, "state", f"{item.id}.cfg",
+        ).read_text(encoding="utf-8")
+        self.assertTrue(runtime_config.startswith("*_internal_*"))
+        self.assertEqual(runtime_config, state_config)
+        self.assertEqual(0o400, runtime_path.stat().st_mode & 0o777)
 
     def test_shutdown_preserves_active_instances_by_default(self):
         item = self.manager.create({
@@ -218,7 +538,72 @@ class RunnerTests(unittest.TestCase):
         deleted = self.manager.delete(item.id)
         self.assertEqual(item.id, deleted.id)
         self.assertIsNone(self.manager.get(item.id))
+
+    def test_stopped_instance_cleanup_archives_gzip_after_three_hours(self):
+        item = self.manager.create({
+            "runtime_seconds": 30, "source_ip": "198.51.100.10",
+            "user_id": "retention-user", "parameters": {"socks_port": 1080},
+        })
+        self.manager.stop(item.id)
+        stopped = self.manager._load(item.id)
+        self.assertIsNotNone(stopped)
+        stopped.stopped_at = (datetime.now(timezone.utc) - timedelta(hours=3, seconds=1)).isoformat()
+        self.manager._save(stopped)
+        expected = self.manager._config_path(item.id).read_text(encoding="utf-8")
+
+        cleaned = self.manager.cleanup_stopped()
+        self.assertEqual(item.id, cleaned[0]["instance_id"])
+        archive = Path(cleaned[0]["config_archive"])
+        self.assertRegex(archive.name, rf"^\d{{8}}T\d{{6}}\.\d{{6}}Z_{item.id}\.cfg\.gz$")
+        with gzip.open(archive, "rt", encoding="utf-8") as stored:
+            self.assertEqual(expected, stored.read())
+        self.assertIsNone(self.manager._load(item.id))
+        self.assertFalse(self.manager._config_path(item.id).exists())
+
+    def test_stopped_cleanup_retains_recent_or_unarchivable_record(self):
+        item = self.manager.create({
+            "runtime_seconds": 30, "source_ip": "198.51.100.10",
+            "user_id": "recent-user", "parameters": {"socks_port": 1080},
+        })
+        self.manager.stop(item.id)
+        self.assertEqual([], self.manager.cleanup_stopped())
+        self.assertIsNotNone(self.manager._load(item.id))
+
+        stopped = self.manager._load(item.id)
+        stopped.stopped_at = (datetime.now(timezone.utc) - timedelta(hours=4)).isoformat()
+        self.manager._save(stopped)
+        self.manager._config_path(item.id).unlink()
+        self.assertEqual([], self.manager.cleanup_stopped())
+        self.assertIsNotNone(self.manager._load(item.id))
         self.assertFalse(Path(self.temp.name, "state", f"{item.id}.cfg").exists())
+
+    def test_manual_cleanup_deletes_stopped_nonpersistent_and_keeps_persistent(self):
+        disposable = self.manager.create({
+            "runtime_seconds": 30, "source_ip": "198.51.100.10",
+            "user_id": "cleanup-user", "parameters": {"socks_port": 1080},
+        })
+        self.manager.stop(disposable.id)
+        retained = self.manager.create({
+            "runtime_seconds": 30, "source_ip": "198.51.100.11",
+            "user_id": "persistent-user", "persistent": True,
+            "parameters": {"socks_port": 1080},
+        })
+        self.manager.stop(retained.id)
+
+        result = self.manager.cleanup_nonpersistent()
+
+        self.assertEqual(1, result["cleaned_count"])
+        self.assertEqual(disposable.id, result["cleaned"][0]["instance_id"])
+        self.assertTrue(Path(result["cleaned"][0]["config_archive"]).is_file())
+        self.assertIsNone(self.manager._load(disposable.id))
+        self.assertIsNotNone(self.manager._load(retained.id))
+        self.assertEqual([retained.id], result["skipped_persistent"])
+
+        old = self.manager._load(retained.id)
+        old.stopped_at = (datetime.now(timezone.utc) - timedelta(hours=4)).isoformat()
+        self.manager._save(old)
+        self.assertEqual([], self.manager.cleanup_stopped())
+        self.assertIsNotNone(self.manager._load(retained.id))
 
     def test_discovery_tracks_unrecorded_unit_without_stopping_it(self):
         orphan_id = str(uuid.uuid4())
@@ -271,7 +656,7 @@ starttls_signatures = {};
         self.assertIn('ssl_port = "50443"', config)
         self.assertIn("dtls_workers = -1", config)
         self.assertIn("udp_workers = -1", config)
-        self.assertIn('dir = "/tmp/lease"', config)
+        self.assertIn('dir = "/old-capture"', config)
         self.assertIn("starttls_signatures", config)
 
     def test_missing_dtls_workers_is_inserted(self):
@@ -577,6 +962,53 @@ starttls_signatures = (
         self.assertEqual("admin@example.test", item["approved_by"])
         self.assertEqual(hashlib.sha256(b'settings={};').hexdigest(), item["native_sha256"])
 
+    def test_missing_build_defaults_are_pruned_without_touching_manual_configs(self):
+        root = Path(self.temp.name)
+        assets = root / "prune.assets"
+        assets.mkdir()
+        library = ConfigLibrary(root / "config-library-prune")
+        present = library.import_text(
+            "present default", "settings={};", assets,
+            source_kind="native-build-default", native=True,
+            normalized_build_id="present-release",
+        )
+        missing = library.import_text(
+            "missing default", "settings={x=1;};", assets,
+            source_kind="native-build-default", native=True,
+            normalized_build_id="missing-release",
+        )
+        manual = library.import_text(
+            "manual", "settings={x=2;};", assets,
+            source_kind="native-upload", native=True,
+            normalized_build_id="missing-release",
+        )
+
+        removed = library.prune_missing_build_defaults({"present-release"})
+
+        self.assertEqual([missing["config_id"]], [item["config_id"] for item in removed])
+        self.assertEqual(
+            {present["config_id"], manual["config_id"]},
+            {item["config_id"] for item in library.list()},
+        )
+
+    def test_config_metadata_update_does_not_change_native_bundle(self):
+        root = Path(self.temp.name)
+        assets = root / "metadata.assets"
+        assets.mkdir()
+        library = ConfigLibrary(root / "config-library-metadata")
+        original = library.import_text(
+            "old title", "settings={};", assets,
+            source_kind="native-upload", native=True,
+            normalized_build_id="build-release",
+        )
+
+        updated = library.update_metadata(original["config_id"], "new title", "new description")
+
+        self.assertEqual("new title", updated["name"])
+        self.assertEqual("new description", updated["description"])
+        self.assertEqual(original["sha256"], updated["sha256"])
+        self.assertEqual("settings={};", library.read_content(original["config_id"]))
+
     def test_config_preview_is_file_backed_and_deletable(self):
         root = Path(self.temp.name, "config-previews")
         previews = ConfigPreviewLibrary(root, ttl_seconds=60)
@@ -641,6 +1073,25 @@ starttls_signatures = (
         self.assertGreaterEqual(extended.runtime_seconds, 329)
         self.assertEqual(item.unit, self.backend.extended_runtime[0])
         self.assertEqual(extended.runtime_seconds, self.backend.extended_runtime[1])
+
+    def test_unlimited_runtime_has_no_deadline_and_cannot_be_extended(self):
+        with self.assertRaises(ConfigError):
+            self.manager.create({
+                "runtime_seconds": 0, "source_ip": "198.51.100.10",
+                "user_id": "manual-unlimited", "parameters": {"socks_port": 1080},
+            })
+        item = self.manager.create({
+            "runtime_seconds": 0, "source_ip": "198.51.100.10",
+            "user_id": "unlimited-user", "parameters": {"socks_port": 1080},
+            "runtime_profile_id": str(uuid.uuid4()),
+        })
+        self.assertEqual("", item.deadline)
+        self.assertEqual(0, item.runtime_seconds)
+        self.assertEqual(0, self.backend.last_network["hard_runtime_seconds"])
+        restarted = self.manager.restart(item.id)
+        self.assertEqual("", restarted.deadline)
+        with self.assertRaises(ConfigError):
+            self.manager.extend(item.id, 300)
 
     def test_task_queue_deduplicates_only_active_work(self):
         queue = TaskQueue(Path(self.temp.name, "tasks.json"), workers=1)
@@ -736,15 +1187,18 @@ starttls_signatures = (
 
     def test_runtime_profiles_are_json_backed_bindings(self):
         library = RuntimeProfileLibrary(Path(self.temp.name, "runtime-profiles.json"))
-        item = library.create("Magic stable", "a" * 40, str(uuid.uuid4()))
+        item = library.create("Magic stable", "a" * 40, str(uuid.uuid4()), ttl_seconds=None)
         self.assertEqual("Magic stable", library.get(item["profile_id"])["name"])
         self.assertEqual("a" * 40, item["build_id"])
+        self.assertIsNone(item["ttl_seconds"])
         updated = library.update(
-            item["profile_id"], "Magic next", "b" * 40, str(uuid.uuid4()), "bundle-id"
+            item["profile_id"], "Magic next", "b" * 40, str(uuid.uuid4()), "bundle-id",
+            ttl_seconds=900,
         )
         self.assertEqual(item["profile_id"], updated["profile_id"])
         self.assertEqual("Magic next", updated["name"])
         self.assertEqual("b" * 40, updated["build_id"])
+        self.assertEqual(900, updated["ttl_seconds"])
         self.assertTrue(updated["updated_at"])
         document = json.loads(Path(self.temp.name, "runtime-profiles.json").read_text())
         self.assertEqual(item["profile_id"], document["profiles"][0]["profile_id"])
@@ -789,6 +1243,38 @@ starttls_signatures = (
         self.assertNotEqual("old", (
             runtime / "smithproxy.assets" / "certs" / "default" / "ca-cert.pem"
         ).read_text())
+        self.assertTrue((
+            runtime / "smithproxy.assets" / "certs" / "default" / "sni"
+        ).is_dir())
+
+    def test_instance_gets_private_writable_copy_of_build_assets(self):
+        assets = Path(self.temp.name, "private-base-assets")
+        (assets / "certs" / "default").mkdir(parents=True)
+        (assets / "certs" / "default" / "ca-cert.pem").write_text("shared")
+        (assets / "msg" / "en").mkdir(parents=True)
+        template = Path(self.temp.name, "private-assets-template.cfg")
+        template.write_text(
+            'settings={ socks_port="{{SOCKS_PORT}}"; certs_path="/old/"; '
+            'messages_dir="/old/msg/"; };'
+        )
+
+        item = self.manager.create({
+            "runtime_seconds": 30, "source_ip": "198.51.100.10",
+            "user_id": "private-assets", "parameters": {"socks_port": 1080},
+        }, template_path=template, assets_dir=assets)
+
+        private_assets = Path(
+            self.temp.name, "run", item.id, "smithproxy.assets",
+        )
+        self.assertIn(
+            str(private_assets / "certs" / "default"),
+            Path(self.temp.name, "run", item.id, "smithproxy.cfg").read_text(),
+        )
+        self.assertTrue((private_assets / "certs" / "default" / "cc-sni").is_dir())
+        (private_assets / "certs" / "default" / "ca-cert.pem").write_text("instance")
+        self.assertEqual(
+            "shared", (assets / "certs" / "default" / "ca-cert.pem").read_text(),
+        )
 
     def test_certificate_bundle_inserts_omitted_native_ca_settings(self):
         library = CertBundleLibrary(Path(self.temp.name, "cert-library-omitted"))

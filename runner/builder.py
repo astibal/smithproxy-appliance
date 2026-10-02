@@ -87,8 +87,9 @@ class SmithproxyBuilder:
             "size_bytes": self.output.stat().st_size if self.output.is_file() else 0,
         }
         artifacts = self.artifacts()
+        self._prune_default_configs(artifacts)
         result["artifacts"] = artifacts
-        result["configs"] = self.configs()
+        result["configs"] = self.configs(artifacts)
         result["jobs"] = self.jobs
         with self.refs_lock:
             refs = json.loads(json.dumps(self.refs_state))
@@ -250,9 +251,19 @@ class SmithproxyBuilder:
                 continue
         return sorted(result, key=lambda item: item["built_at"], reverse=True)[:50]
 
-    def configs(self) -> list[dict]:
+    def _prune_default_configs(self, artifacts: list[dict]) -> list[dict]:
+        if not self.config_library:
+            return []
+        build_ids = {
+            str(item.get("build_id", item.get("commit_id", "")))
+            for item in artifacts
+        }
+        return self.config_library.prune_missing_build_defaults(build_ids)
+
+    def configs(self, artifacts: list[dict] | None = None) -> list[dict]:
         """List exact Smithproxy configs retained with successful builds."""
         if self.config_library:
+            self._prune_default_configs(artifacts if artifacts is not None else self.artifacts())
             return self.config_library.list()
         return [{
             "config_id": item["build_id"],
@@ -302,6 +313,7 @@ class SmithproxyBuilder:
                 item.get("build_type", "Release"),
             )
             shutil.rmtree(self.native_cache_dir / cache_key, ignore_errors=True)
+            self._prune_default_configs(self.artifacts())
             return item
 
     def resolve_config(self, config_id: str) -> Path:

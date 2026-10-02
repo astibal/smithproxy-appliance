@@ -38,6 +38,9 @@ class RuntimeProfileLibrary:
                 except ValueError:
                     continue
                 item.setdefault("auto_restart", False)
+                # Profiles created before TTL became part of the binding keep
+                # the original intended 30 minute session lifetime.
+                item.setdefault("ttl_seconds", 1800)
                 valid.append(item)
             return sorted(valid, key=lambda item: item.get("created_at", ""), reverse=True)
 
@@ -51,7 +54,7 @@ class RuntimeProfileLibrary:
         temporary.replace(self.path)
 
     def create(self, name: str, build_id: str, config_id: str, cert_bundle_id: str = "",
-               auto_restart: bool = False) -> dict:
+               auto_restart: bool = False, ttl_seconds: int | None = 1800) -> dict:
         clean_name = name.strip()[:128]
         if not clean_name or any(ord(char) < 32 for char in clean_name):
             raise BackendError("runtime profile name is invalid")
@@ -64,6 +67,7 @@ class RuntimeProfileLibrary:
                 "config_id": config_id,
                 "cert_bundle_id": cert_bundle_id,
                 "auto_restart": auto_restart,
+                "ttl_seconds": ttl_seconds,
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
             items.append(item)
@@ -82,7 +86,8 @@ class RuntimeProfileLibrary:
         return item
 
     def update(self, profile_id: str, name: str, build_id: str, config_id: str,
-               cert_bundle_id: str = "", auto_restart: bool = False) -> dict:
+               cert_bundle_id: str = "", auto_restart: bool = False,
+               ttl_seconds: int | None = 1800) -> dict:
         clean_name = name.strip()[:128]
         if not clean_name or any(ord(char) < 32 for char in clean_name):
             raise BackendError("runtime profile name is invalid")
@@ -97,6 +102,7 @@ class RuntimeProfileLibrary:
                 "config_id": config_id,
                 "cert_bundle_id": cert_bundle_id,
                 "auto_restart": auto_restart,
+                "ttl_seconds": ttl_seconds,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             })
             self._save(items)

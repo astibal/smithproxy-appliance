@@ -1,0 +1,50 @@
+[Unit]
+Description=Smithproxy Appliance Service admin console
+Documentation=file:/opt/smithproxy-appliance/docs/SYSTEMD.md
+Wants=network-online.target
+After=network-online.target sas-runner.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=sas-console
+Group=sas-console
+WorkingDirectory=/opt/smithproxy-appliance/console
+EnvironmentFile=/etc/smithproxy-appliance/console.env
+EnvironmentFile=/etc/smithproxy-appliance/runner-client.env
+ExecStart=/opt/smithproxy-appliance/console/.venv/bin/gunicorn --workers 2 --threads 8 --worker-class gthread --bind ${SMITHPROXY_APPLIANCE_CONSOLE_BIND} --access-logfile - --error-logfile - --capture-output --timeout 120 --graceful-timeout 20 "app:create_app()"
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2s
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+KillMode=mixed
+UMask=0077
+
+StateDirectory=sas-console
+StateDirectoryMode=0700
+RuntimeDirectory=sas-console
+RuntimeDirectoryMode=0700
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectHostname=yes
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

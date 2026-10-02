@@ -56,6 +56,55 @@ def validate_parameters(value: object) -> dict[str, int]:
     return result
 
 
+def rebase_runtime_paths(text: str, runtime_dir: Path, assets_dir: Path) -> str:
+    """Replace only absolute paths which point into an old appliance runtime.
+
+    Saved Smithproxy configs contain absolute paths. A config copied from a
+    Test Drive or another instance must not keep references into that old
+    appliance. Arbitrary administrator paths and stable /work paths are left
+    untouched; this function is used for dirty restart/upgrade preservation.
+    """
+    replacements = {
+        "certs_path": f'"{assets_dir}/certs/default/"',
+        "messages_dir": f'"{assets_dir}/msg/en/"',
+        "write_payload_dir": f'"{runtime_dir}"',
+        "log_file": f'"{runtime_dir}/messages.%s.log"',
+        "sslkeylog_file": f'"{runtime_dir}/sslkeylog.%s.log"',
+    }
+    old_runtime = re.compile(
+        r"^/tmp/capture-zone-runtime/(?:instances|test-drives)/[^/]+(?:/|$)"
+    )
+    current_root = runtime_dir.resolve(strict=False)
+
+    def stale(value: str) -> bool:
+        if not old_runtime.match(value):
+            return False
+        candidate = Path(value).resolve(strict=False)
+        return candidate != current_root and current_root not in candidate.parents
+
+    for key, value in replacements.items():
+        pattern = re.compile(
+            rf'(\b{re.escape(key)}[ \t]*=[ \t]*)"([^"]*)"([ \t]*;?)'
+        )
+        text = pattern.sub(
+            lambda match: (
+                f"{match.group(1)}{value}{match.group(3)}"
+                if stale(match.group(2)) else match.group(0)
+            ),
+            text, count=1,
+        )
+    capture_pattern = re.compile(
+        r'(?ms)(\bcaptures\s*=\s*\{.*?\blocal\s*=\s*\{.*?\bdir\s*=\s*)"([^"]*)"'
+    )
+    return capture_pattern.sub(
+        lambda match: (
+            f'{match.group(1)}"{runtime_dir}"'
+            if stale(match.group(2)) else match.group(0)
+        ),
+        text, count=1,
+    )
+
+
 def render_template(template_path: Path, parameters: dict[str, int], runtime_dir: Path,
                     assets_dir: Path | None = None,
                     ca_key_password: str | None = None,
@@ -139,8 +188,4 @@ def render_template(template_path: Path, parameters: dict[str, int], runtime_dir
         r"(?ms)(\bcli\s*=\s*\{.*?\bport\s*=\s*)\d+(\s*;)",
         rf"\g<1>{cli_port}\2", rendered, count=1,
     )
-    rendered = re.sub(
-        r'(?ms)(\bcaptures\s*=\s*\{.*?\blocal\s*=\s*\{.*?\bdir\s*=\s*)"[^"]*"',
-        rf'\g<1>"{runtime_dir}"', rendered, count=1,
-    )
-    return rendered
+    return rebase_runtime_paths(rendered, runtime_dir, assets_dir)
