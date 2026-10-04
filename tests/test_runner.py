@@ -478,6 +478,23 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual("rootfs", item.filesystem_mode)
         self.assertEqual(str(rootfs), self.backend.last_network["rootfs_path"])
 
+    def test_create_records_network_bindings_and_passes_egress_policy(self):
+        ingress_id = str(uuid.uuid4())
+        egress_id = str(uuid.uuid4())
+        item = self.manager.create({
+            "runtime_seconds": 30, "source_ip": "198.51.100.10",
+            "user_id": "network-profile-user",
+            "ingress_network_profile_id": ingress_id,
+            "egress_network_profile_id": egress_id,
+            "network_egress_mode": "routed",
+            "network_sas_interface": "lab0",
+            "parameters": {"socks_port": 1080},
+        })
+        self.assertEqual(ingress_id, item.ingress_network_profile_id)
+        self.assertEqual(egress_id, item.egress_network_profile_id)
+        self.assertEqual("routed", self.backend.last_network["egress_mode"])
+        self.assertEqual("lab0", self.backend.last_network["sas_interface"])
+
     def test_build_default_config_profile_uses_transparent_dataplane(self):
         item = self.manager.create({
             "runtime_seconds": 30, "source_ip": "198.51.100.10",

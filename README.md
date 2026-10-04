@@ -68,4 +68,5 @@ node --check console/static/app.js
 
 Podrobnosti jsou v [Runner dokumentaci](docs/RUNNER.md),
 [Console dokumentaci](docs/CONSOLE.md), [systemd deploymentu](docs/SYSTEMD.md)
-[CLI dokumentaci](docs/SASCTL.md) a [API přehledu](docs/API.md).
+[CLI dokumentaci](docs/SASCTL.md), [API přehledu](docs/API.md) a
+[návrhu KVM/blackbox řetězení](docs/BLACKBOX_CHAINING.md).

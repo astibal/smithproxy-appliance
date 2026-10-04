@@ -216,6 +216,15 @@ build directory       -> původní absolutní read-only cesta
 
 Rootfs se vytvoří při uložení rootfs runtime profilu nebo líně uvnitř
 background spawn tasku. Běžící host-sandbox instance tím nejsou ovlivněné.
+Lze jej také připravit předem jako deduplikovanou asynchronní úlohu:
+
+```http
+POST /v1/task-actions
+{"method":"POST","path":"/v1/builds/<build-id>/rootfs","payload":{},"kind":"build-rootfs","label":"Prepare rootfs"}
+```
+
+Přímý `POST /v1/builds/{id}/rootfs` je idempotentní runner operace. Konzole jej
+vždy volá přes frontu, takže balení ELF closure neblokuje API thread.
 
 ## Instance
 

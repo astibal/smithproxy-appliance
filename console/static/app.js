@@ -793,6 +793,11 @@
         appendDiagRow(grid, 'Root filesystem', `${execution.rootfs || ''} · ${execution.rootfs_mode || ''}`);
         appendDiagRow(grid, 'Network namespace', `${execution.network_namespace || ''} · ${execution.network_namespace_path || ''}`);
         const network = execution.network || {};
+        const networkProfiles = execution.network_profiles || {};
+        const ingressProfile = networkProfiles.ingress || {};
+        const egressProfile = networkProfiles.egress || {};
+        appendDiagRow(grid, 'Ingress profil', `${ingressProfile.name || 'global/default'} · ${ingressProfile.driver || 'split-veth'} · ${ingressProfile.selector || 'source'}`);
+        appendDiagRow(grid, 'Egress profil', `${egressProfile.name || 'global/default'} · ${egressProfile.driver || 'split-veth'} · ${egressProfile.mode || 'global route'}`);
         const ingress = network.ingress || {};
         const egress = network.egress || {};
         appendDiagRow(grid, 'Ingress pool / subnet', ingress.subnet);

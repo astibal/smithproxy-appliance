@@ -1141,6 +1141,20 @@ def create_app(test_config=None):
             flash(str(exc), "error")
             return redirect(url_for("binaries"))
 
+    @app.post("/binaries/<build_id>/prepare-rootfs")
+    @login_required
+    def prepare_binary_rootfs(build_id):
+        try:
+            result = enqueue(
+                "POST", f"/v1/builds/{quote(build_id, safe='')}/rootfs", {},
+                f"Připravit rootfs image {build_id[:12]}", "build-rootfs",
+            )
+            audit("binary.prepare-rootfs", build_id)
+            flash_queued(result, "Příprava rootfs image zařazena")
+        except RuntimeError as exc:
+            flash(str(exc), "error")
+        return redirect(url_for("binaries"))
+
     @app.post("/instances")
     @login_required
     def create_instance():

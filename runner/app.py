@@ -1107,6 +1107,9 @@ def openapi_document() -> dict[str, Any]:
             "/v1/builds/{id}/config/preview": {
                 "post": {"summary": "Extract and native-save an archived build default config"},
             },
+            "/v1/builds/{id}/rootfs": {
+                "post": {"summary": "Prepare the immutable rootfs image for an archived build"},
+            },
             "/v1/configs": {
                 "get": {"summary": "List stored configuration snapshots"},
             },
@@ -2085,6 +2088,7 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
     action_routes = {
         "POST": (
             r"/v1/builds/[A-Za-z0-9._-]+/config/preview",
+            r"/v1/builds/[A-Za-z0-9._-]+/rootfs",
             r"/v1/configs/(?:preview|commit)",
             r"/v1/config-observer",
             r"/v1/instances/[0-9a-f-]+/(?:debug|restart|config/preview)",
@@ -2362,6 +2366,26 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                         rootfs = builder.rootfs_info(item.build_id)
                         rootfs_path = str(rootfs.get("rootfs_path") or "unavailable")
                         rootfs_mode = "isolated RootDirectory, ProtectSystem=strict"
+                    network_bindings = {}
+                    for kind in ("ingress", "egress"):
+                        profile_id = str(getattr(item, f"{kind}_network_profile_id", ""))
+                        selected = {
+                            "network_profile_id": profile_id,
+                            "name": "global/default",
+                            "kind": kind,
+                            "implemented": True,
+                        }
+                        if profile_id and network_profiles:
+                            try:
+                                selected = network_profiles.get(profile_id, kind)
+                            except BackendError:
+                                selected = {
+                                    "network_profile_id": profile_id,
+                                    "name": "unavailable",
+                                    "kind": kind,
+                                    "implemented": False,
+                                }
+                        network_bindings[kind] = selected
                     self._json(HTTPStatus.OK, {
                         "instance": asdict(item),
                         "execution": {
@@ -2378,6 +2402,7 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                             "binary": binary_path,
                             "build_type": build_type,
                             "network": network,
+                            "network_profiles": network_bindings,
                             "debug": {
                                 "unit": item.debug_unit,
                                 "address": item.debug_address,
@@ -2946,6 +2971,13 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                 try:
                     self._json(HTTPStatus.OK, create_build_default_preview(parts[2]))
                 except (ConfigError, BackendError, OSError, ValueError, TypeError) as exc:
+                    self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            if (len(parts) == 4 and parts[:2] == ["v1", "builds"]
+                    and parts[3] == "rootfs" and builder):
+                try:
+                    self._json(HTTPStatus.OK, builder.prepare_rootfs(parts[2]))
+                except (BackendError, OSError, ValueError) as exc:
                     self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
             if parts == ["v1", "configs", "preview"]:
