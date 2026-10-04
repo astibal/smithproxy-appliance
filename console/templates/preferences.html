@@ -1,0 +1,14 @@
+{% extends 'base.html' %}{% block content %}
+<div class="headline"><div><div class="eyebrow">{{ _('preferences.eyebrow') }}</div><h1>{{ _('preferences.title') }}</h1><p>{{ _('preferences.intro') }}</p></div></div>
+<section class="panel preferences-panel">
+  <div class="section-head"><div><h2>{{ _('preferences.password_title') }}</h2><p class="hint">{{ g.admin.email }}</p></div></div>
+  <form method="post" class="stack preferences-form" autocomplete="off">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label>{{ _('preferences.current_password') }}<input type="password" name="current_password" autocomplete="current-password" required autofocus></label>
+    <label>{{ _('preferences.new_password') }}<input type="password" name="new_password" minlength="12" autocomplete="new-password" required></label>
+    <label>{{ _('preferences.confirm_password') }}<input type="password" name="confirm_password" minlength="12" autocomplete="new-password" required></label>
+    <p class="hint">{{ _('preferences.password_hint') }}</p>
+    <div class="actions"><button>{{ _('preferences.save') }}</button></div>
+  </form>
+</section>
+{% endblock %}

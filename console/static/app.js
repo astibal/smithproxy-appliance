@@ -1,12 +1,19 @@
 (() => {
   const q = selector => document.querySelector(selector);
   const text = (selector, value) => { const node = q(selector); if (node) node.textContent = value; };
+  const locale = ['cs', 'en', 'fr'].includes(document.documentElement.lang) ? document.documentElement.lang : 'en';
+  const messages = {
+    cs: {unlimited:'bez limitu', enqueuing:'Zařazuji…', queueing:'Předávám požadavek do fronty…', queued:'Spuštění zařazeno', enqueueStart:'Zařadit spuštění', selected:'Vybráno', running:'běží', pending:'čeká', idle:'nic neběží', noTasks:'Zatím žádné úlohy.', openResult:'Otevřít výsledek →', noMatch:'Filtru neodpovídá žádná instance.', noInstances:'Žádné instance.', loading:'Načítám…', noLogs:'Žádné logy.', logsFailed:'Logy nelze načíst', checking:'ověřuji…', updating:'aktualizuji…', checked:'ověřeno', error:'chyba', profile:'profil', manual:'ruční výběr', noDeadline:'bez deadline', copy:'Kliknutím zkopírovat', copied:'Zkopírováno', copyFailed:'Kopírování selhalo'},
+    en: {unlimited:'unlimited', enqueuing:'Enqueuing…', queueing:'Submitting request to the queue…', queued:'Start enqueued', enqueueStart:'Enqueue start', selected:'Selected', running:'running', pending:'pending', idle:'nothing running', noTasks:'No tasks yet.', openResult:'Open result →', noMatch:'No instance matches the filter.', noInstances:'No instances.', loading:'Loading…', noLogs:'No logs.', logsFailed:'Cannot load logs', checking:'checking…', updating:'updating…', checked:'checked', error:'error', profile:'profile', manual:'manual selection', noDeadline:'no deadline', copy:'Click to copy', copied:'Copied', copyFailed:'Copy failed'},
+    fr: {unlimited:'sans limite', enqueuing:'Planification…', queueing:'Envoi de la demande dans la file…', queued:'Démarrage planifié', enqueueStart:'Planifier le démarrage', selected:'Sélectionné', running:'actives', pending:'en attente', idle:'aucune tâche active', noTasks:'Aucune tâche.', openResult:'Ouvrir le résultat →', noMatch:'Aucune instance ne correspond au filtre.', noInstances:'Aucune instance.', loading:'Chargement…', noLogs:'Aucun journal.', logsFailed:'Impossible de charger les journaux', checking:'vérification…', updating:'actualisation…', checked:'vérifié', error:'erreur', profile:'profil', manual:'sélection manuelle', noDeadline:'sans échéance', copy:'Cliquer pour copier', copied:'Copié', copyFailed:'Échec de la copie'}
+  };
+  const tr = key => messages[locale]?.[key] || messages.en[key] || key;
   const formatBytes = bytes => bytes ? `${(bytes / 1048576).toFixed(1)} MiB` : '0 MiB';
   const activeState = state => ['starting', 'running', 'orphaned'].includes(state);
   const problemState = state => ['failed', 'expired', 'orphaned'].includes(state);
   const short = value => value ? String(value).slice(0, 12) : '—';
   const ttl = deadline => {
-    if (!deadline) return 'bez limitu';
+    if (!deadline) return tr('unlimited');
     const seconds = Math.max(0, Math.round((new Date(deadline).getTime() - Date.now()) / 1000));
     if (seconds < 60) return `${seconds} s`;
     if (seconds < 3600) return `${Math.floor(seconds / 60)} min ${seconds % 60} s`;
@@ -68,8 +75,8 @@
     form?.addEventListener('submit', async event => {
       event.preventDefault();
       if (submit?.disabled) return;
-      if (submit) { submit.disabled = true; submit.textContent = 'Zařazuji…'; }
-      if (state) { state.textContent = 'Předávám požadavek do fronty…'; state.className = 'spawn-submit-state'; }
+      if (submit) { submit.disabled = true; submit.textContent = tr('enqueuing'); }
+      if (state) { state.textContent = tr('queueing'); state.className = 'spawn-submit-state'; }
       try {
         const response = await fetch(form.action, {
           method: 'POST', body: new FormData(form),
@@ -78,7 +85,7 @@
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
         if (state) {
-          state.textContent = `${data.message || 'Spuštění zařazeno'} · task ${short(data.task_id)}`;
+          state.textContent = `${data.message || tr('queued')} · task ${short(data.task_id)}`;
           state.className = 'spawn-submit-state ok';
         }
         document.dispatchEvent(new CustomEvent('task-queued'));
@@ -86,7 +93,7 @@
       } catch (error) {
         if (state) { state.textContent = error.message || String(error); state.className = 'spawn-submit-state error'; }
       } finally {
-        if (submit) { submit.disabled = false; submit.textContent = 'Zařadit spuštění'; }
+        if (submit) { submit.disabled = false; submit.textContent = tr('enqueueStart'); }
       }
     });
   }
@@ -98,7 +105,7 @@
         if (!select) return;
         select.value = button.dataset.useProfileBuild;
         select.dispatchEvent(new Event('change', {bubbles: true}));
-        button.textContent = 'Vybráno';
+        button.textContent = tr('selected');
         button.disabled = true;
       });
     });
@@ -135,6 +142,292 @@
     });
   }
 
+  function setupFirewallCountdowns() {
+    const countdowns = [...document.querySelectorAll('.firewall-countdown')];
+    if (!countdowns.length) return;
+    const duration = rawSeconds => {
+      const seconds = Math.max(0, Math.ceil(rawSeconds));
+      const days = Math.floor(seconds / 86400);
+      const hours = Math.floor((seconds % 86400) / 3600);
+      const minutes = Math.floor((seconds % 3600) / 60);
+      const rest = seconds % 60;
+      const clock = `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(rest).padStart(2, '0')}`;
+      return days ? `${days} d ${clock}` : clock;
+    };
+    const update = () => {
+      const now = Date.now();
+      countdowns.forEach(element => {
+        const expiry = Date.parse(element.closest('.firewall-expiry')?.dataset.expiresAt || '');
+        const remaining = (expiry - now) / 1000;
+        const elapsed = !Number.isFinite(expiry) || remaining <= 0;
+        element.textContent = elapsed ? 'expired' : duration(remaining);
+        element.classList.toggle('urgent', !elapsed && remaining <= 300);
+        element.classList.toggle('elapsed', elapsed);
+        const row = element.closest('.firewall-row');
+        row?.classList.toggle('expired', elapsed);
+        const extendButton = row?.querySelector('.firewall-extend-button');
+        if (extendButton) extendButton.textContent = elapsed ? 'Oživit' : '+ Čas';
+      });
+    };
+    update();
+    window.setInterval(update, 1000);
+  }
+
+  function setupFirewallExplainers() {
+    const cards = [...document.querySelectorAll('.firewall-status-card')];
+    const toggle = card => {
+      const open = !card.classList.contains('explain-open');
+      cards.forEach(candidate => {
+        candidate.classList.remove('explain-open');
+        candidate.setAttribute('aria-expanded', 'false');
+      });
+      if (open) {
+        card.classList.add('explain-open');
+        card.setAttribute('aria-expanded', 'true');
+      }
+    };
+    cards.forEach(card => {
+      card.addEventListener('click', () => toggle(card));
+      card.addEventListener('keydown', event => {
+        if (['Enter', ' '].includes(event.key)) { event.preventDefault(); toggle(card); }
+        if (event.key === 'Escape') {
+          card.classList.remove('explain-open'); card.setAttribute('aria-expanded', 'false');
+        }
+      });
+    });
+  }
+
+  function setupFirewallTopology() {
+    const root = q('#firewall-topology');
+    const state = q('#firewall-topology-state');
+    if (!root) return;
+    const attachDialog = q('#firewall-attach-dialog');
+    const attachForm = q('#firewall-attach-form');
+    const attachSource = q('#firewall-attach-source');
+    const attachInstance = q('#firewall-attach-instance');
+    const authorizationForm = q('.firewall-add-form');
+    const existingSelect = authorizationForm?.querySelector('[name="instance_id"]');
+    const profileSelect = authorizationForm?.querySelector('[name="runtime_profile_id"]');
+    const registerSource = authorizationForm?.querySelector('[name="register_source"]');
+    existingSelect?.addEventListener('change', () => {
+      if (existingSelect.value && profileSelect) profileSelect.value = '';
+      if (existingSelect.value && registerSource) registerSource.checked = true;
+    });
+    profileSelect?.addEventListener('change', () => {
+      if (profileSelect.value && existingSelect) existingSelect.value = '';
+      if (profileSelect.value && registerSource) registerSource.checked = true;
+    });
+    attachDialog?.querySelectorAll('[data-close]').forEach(button => {
+      button.addEventListener('click', () => attachDialog.close());
+    });
+    attachForm?.addEventListener('submit', event => {
+      if (!attachInstance?.value) { event.preventDefault(); return; }
+      attachForm.action = `/firewall/instances/${encodeURIComponent(attachInstance.value)}/sources`;
+    });
+    const make = (tag, className = '', value = '') => {
+      const element = document.createElement(tag);
+      if (className) element.className = className;
+      if (value !== '') element.textContent = value;
+      return element;
+    };
+    const topologyDuration = rawSeconds => {
+      const seconds = Math.max(0, Math.ceil(rawSeconds));
+      const days = Math.floor(seconds / 86400);
+      const hours = Math.floor((seconds % 86400) / 3600);
+      const minutes = Math.floor((seconds % 3600) / 60);
+      const rest = seconds % 60;
+      const clock = `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(rest).padStart(2, '0')}`;
+      return days ? `${days} d ${clock}` : clock;
+    };
+    const updateTopologyCountdowns = () => {
+      const now = Date.now();
+      root.querySelectorAll('.topology-source-countdown').forEach(element => {
+        const expiry = Date.parse(element.dataset.expiresAt || '');
+        const remaining = (expiry - now) / 1000;
+        const elapsed = !Number.isFinite(expiry) || remaining <= 0;
+        element.textContent = elapsed ? 'expired' : topologyDuration(remaining);
+        element.classList.toggle('urgent', !elapsed && remaining <= 300);
+        element.classList.toggle('elapsed', elapsed);
+      });
+    };
+    const renderTarget = instance => {
+      const target = make('a', `topology-target instance-target state-${instance.state}`);
+      target.href = `/?instance=${encodeURIComponent(instance.id)}`;
+      const heading = make('span', 'topology-target-heading');
+      heading.append(make('b', '', instance.namespace || `instance ${instance.id.slice(0, 8)}`));
+      heading.append(make('span', 'badge ok', instance.state.toUpperCase()));
+      target.append(heading);
+      const network = instance.network || {};
+      target.append(make('code', '', `${network.guest_ip || 'IP ?'} / ${network.guest_interface || '?'}  ←  ${network.host_interface || '?'}`));
+      if (network.guest_ip_v6) target.append(make('code', 'topology-ipv6', `${network.guest_ip_v6} / ${network.guest_interface || '?'}`));
+      target.append(make('small', '', `${instance.profile || 'custom'} · ${instance.user_id || 'user ?'} · PID ${instance.pid || '—'} · ${instance.id.slice(0, 12)}`));
+      return target;
+    };
+    const renderLane = (label, effective, mode, targets) => {
+      const lane = make('div', `topology-lane ${effective ? 'allowed' : 'blocked'}`);
+      const gate = make('span', 'topology-gate', mode || label);
+      gate.title = effective ? `${label}: provoz projde` : `${label}: provoz je zahozen`;
+      const gateStack = make('div', 'topology-gate-stack');
+      gateStack.append(gate);
+      lane.append(gateStack, make('span', 'topology-connector'));
+      const destination = make('div', 'topology-destinations');
+      targets.forEach(target => destination.append(target));
+      lane.append(destination);
+      return lane;
+    };
+    const render = payload => {
+      root.replaceChildren();
+      const entries = Array.isArray(payload.topology) ? payload.topology : [];
+      if (!entries.length) {
+        root.append(make('p', 'empty', 'Žádné autorizované source IP ani živé instance.'));
+      }
+      const sourceGroups = new Map();
+      entries.forEach(entry => {
+        const inputEffective = !payload.input_enforced || entry.input_allowed;
+        const forwardEffective = !payload.forward_enforced || entry.forward_allowed;
+        const targetIds = (entry.instances || []).map(instance => instance.id).sort();
+        const signature = JSON.stringify([inputEffective, forwardEffective, targetIds]);
+        if (!sourceGroups.has(signature)) sourceGroups.set(signature, []);
+        sourceGroups.get(signature).push(entry);
+      });
+      [...sourceGroups.values()].forEach(sourceEntries => {
+        const entry = sourceEntries[0];
+        const group = make('article', `topology-group${sourceEntries.some(item => item.active) ? '' : ' inactive'}${sourceEntries.length > 1 ? ' sources-merged' : ''}`);
+        const source = make('div', 'topology-source');
+        sourceEntries.forEach((sourceEntry, index) => {
+          const sourceItem = make('div', 'topology-source-item');
+          sourceItem.append(make('small', '', sourceEntries.length > 1 ? `SOURCE ${index + 1}/${sourceEntries.length}` : 'SOURCE'));
+          sourceItem.append(make('code', '', sourceEntry.source));
+          const flags = make('div', 'topology-source-flags');
+          if (sourceEntry.input_allowed) flags.append(make('span', 'badge ok', 'INPUT'));
+          if (sourceEntry.forward_allowed) flags.append(make('span', 'badge ok', 'FORWARD'));
+          if (sourceEntry.spawn_allowed) flags.append(make('span', 'badge', 'SPAWN POOL'));
+          sourceItem.append(flags);
+          (sourceEntry.expirations || []).forEach(expiration => {
+            const expiry = make('div', 'topology-source-expiry');
+            expiry.title = `${(expiration.chains || []).join(' + ').toUpperCase()} · ${expiration.system || 'authorization'} · ${expiration.expires_at}`;
+            expiry.append(make('span', 'topology-clock', '⏱'));
+            const countdown = make('b', 'topology-source-countdown', 'počítám…');
+            countdown.dataset.expiresAt = expiration.expires_at || '';
+            expiry.append(countdown);
+            expiry.append(make('small', '', (expiration.chains || []).join('+').toUpperCase()));
+            sourceItem.append(expiry);
+          });
+          sourceItem.append(make('small', '', (sourceEntry.systems || []).join(', ') || 'runtime routing'));
+          source.append(sourceItem);
+        });
+        const lanes = make('div', 'topology-lanes');
+        const inputEffective = !payload.input_enforced || entry.input_allowed;
+        const inputMode = payload.input_enforced ? (entry.input_allowed ? 'INPUT ALLOW' : 'INPUT DROP') : 'INPUT AUDIT';
+        const host = make('div', `topology-target host-target${inputEffective ? '' : ' denied'}`);
+        host.append(make('b', '', inputEffective ? 'SAS HOST' : 'BLOCKED'));
+        host.append(make('small', '', inputEffective ? 'služby na appliance' : 'globální INPUT policy'));
+        lanes.append(renderLane('INPUT', inputEffective, inputMode, [host]));
+        const forwardEffective = !payload.forward_enforced || entry.forward_allowed;
+        const forwardMode = payload.forward_enforced ? (entry.forward_allowed ? 'FWD ALLOW' : 'FWD DROP') : 'FWD AUDIT';
+        let targets = [];
+        if (!forwardEffective) {
+          const blocked = make('div', 'topology-target denied');
+          blocked.append(make('b', '', 'BLOCKED'));
+          blocked.append(make('small', '', 'globální FORWARD policy'));
+          targets = [blocked];
+        } else if ((entry.instances || []).length) {
+          targets = entry.instances.map(renderTarget);
+        } else {
+          const empty = make('div', 'topology-target empty-route');
+          empty.append(make('b', '', 'NO LIVE ROUTE'));
+          empty.append(make('small', '', sourceEntries.some(item => item.spawn_allowed) ? 'spawn slot je volný' : 'žádná odpovídající instance'));
+          targets = [empty];
+        }
+        const forwardLane = renderLane('FORWARD', forwardEffective, forwardMode, targets);
+        const attachableSources = sourceEntries.map(item => item.source).filter(source => !source.includes('/'));
+        const currentTargets = new Set((entry.instances || []).map(instance => instance.id));
+        const attachableInstances = (payload.active_instances || []).filter(instance => !currentTargets.has(instance.id));
+        if (forwardEffective && attachableSources.length && attachableInstances.length && attachDialog) {
+          const attach = make('button', 'topology-route-add', '+');
+          attach.type = 'button';
+          attach.title = 'Připojit source k další živé instanci';
+          attach.addEventListener('click', () => {
+            attachSource.replaceChildren(...attachableSources.map(source => {
+              const option = make('option', '', source); option.value = source; return option;
+            }));
+            attachInstance.replaceChildren(...attachableInstances.map(instance => {
+              const option = make('option', '', `${instance.namespace || instance.id.slice(0, 8)} · ${instance.profile} · ${instance.id.slice(0, 12)}`);
+              option.value = instance.id; return option;
+            }));
+            attachDialog.showModal();
+          });
+          forwardLane.querySelector('.topology-gate-stack')?.append(attach);
+        }
+        lanes.append(forwardLane);
+        group.append(source, lanes);
+        root.append(group);
+      });
+      const egressGroups = Array.isArray(payload.egress_groups) ? payload.egress_groups : [];
+      if (egressGroups.length) {
+        const heading = make('div', 'topology-egress-heading');
+        heading.append(make('b', '', 'INSTANCE OUTPUT'));
+        heading.append(make('span', '', 'Instance se stejným výsledným egress efektem jsou sloučené.'));
+        root.append(heading);
+      }
+      egressGroups.forEach(group => {
+        const diagram = make('article', 'topology-egress-group');
+        const members = make('div', 'topology-egress-members');
+        (group.instances || []).forEach(instance => {
+          const member = make('a', 'topology-egress-member');
+          member.href = `/?instance=${encodeURIComponent(instance.id)}`;
+          member.append(make('b', '', instance.namespace || instance.id.slice(0, 8)));
+          member.append(make('code', '', `${instance.guest_ip || 'IP ?'} · ${instance.guest_interface || '?'}`));
+          if (instance.guest_ip_v6) member.append(make('code', 'topology-ipv6', `${instance.guest_ip_v6} · IPv6`));
+          member.append(make('small', '', `${instance.profile || 'custom'} · ${instance.id.slice(0, 12)}`));
+          members.append(member);
+        });
+        const connector = make('div', 'topology-egress-connector');
+        connector.append(make('span', '', `${(group.instances || []).length}×`));
+        const output = make('div', `topology-egress-output mode-${group.mode}`);
+        const title = group.mode === 'masquerade' ? 'MASQUERADE' : group.mode === 'routed' ? 'ROUTED' : String(group.mode || 'UNKNOWN').toUpperCase();
+        output.title = 'Odvozeno z runtime networking konfigurace; nejde o změřený packet trace.';
+        output.append(make('small', 'effect-indication', 'INDICATION ONLY · SHARED EGRESS EFFECT'));
+        output.append(make('b', '', title));
+        output.append(make('code', '', group.interface || 'interface dle host route'));
+        output.append(make('span', 'effect-description', group.effect || ''));
+        if (group.route_via) output.append(make('small', '', `return route via ${group.route_via}`));
+        diagram.append(members, connector, output);
+        root.append(diagram);
+      });
+      if (state) {
+        const updated = Date.parse(payload.updated_at || '');
+        state.textContent = Number.isFinite(updated)
+          ? `živě · ${new Date(updated).toLocaleTimeString()}` : 'živě';
+        state.classList.remove('state-failed');
+      }
+      updateTopologyCountdowns();
+    };
+    try {
+      render(JSON.parse(q('#firewall-topology-initial')?.textContent || '{}'));
+    } catch (_) { /* the first poll will recover */ }
+    let refreshing = false;
+    const refresh = async () => {
+      if (refreshing || document.hidden) return;
+      refreshing = true;
+      try {
+        const response = await fetch(root.dataset.url, {headers: {'Accept': 'application/json'}});
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        render(await response.json());
+      } catch (error) {
+        if (state) {
+          state.textContent = `obnova selhala · ${error.message}`;
+          state.classList.add('state-failed');
+        }
+      } finally {
+        refreshing = false;
+      }
+    };
+    refresh();
+    window.setInterval(refresh, 5000);
+    window.setInterval(updateTopologyCountdowns, 1000);
+  }
+
   function setupBuildForm() {
     const form = q('#build-form');
     const submit = q('#build-submit');
@@ -144,7 +437,7 @@
       event.preventDefault();
       if (submit?.disabled) return;
       const ref = form.elements.ref?.value || 'master';
-      if (submit) { submit.disabled = true; submit.textContent = 'Zařazuji…'; }
+      if (submit) { submit.disabled = true; submit.textContent = tr('enqueuing'); }
       state.textContent = `'${ref}' build task is being enqueued…`;
       state.className = 'build-enqueue-state';
       try {
@@ -182,10 +475,10 @@
       text('#task-active-count', active.length);
       const running = active.filter(task => task.state === 'running').length;
       const pending = active.length - running;
-      text('#task-dock-summary', active.length ? `${running} běží · ${pending} čeká` : 'nic neběží');
+      text('#task-dock-summary', active.length ? `${running} ${tr('running')} · ${pending} ${tr('pending')}` : tr('idle'));
       const ordered = [...active, ...tasks.filter(task => !['pending', 'running'].includes(task.state))].slice(0, 30);
       if (!ordered.length) {
-        const empty = document.createElement('p'); empty.className = 'empty'; empty.textContent = 'Zatím žádné úlohy.';
+        const empty = document.createElement('p'); empty.className = 'empty'; empty.textContent = tr('noTasks');
         list.replaceChildren(empty); return;
       }
       list.replaceChildren(...ordered.map(task => {
@@ -206,7 +499,7 @@
         } else if (viewable) {
           tail = document.createElement('a');
           tail.href = `/tasks/${encodeURIComponent(task.task_id)}/result`;
-          tail.textContent = 'Otevřít výsledek →';
+          tail.textContent = tr('openResult');
         } else {
           tail = document.createElement('code'); tail.textContent = short(task.task_id);
         }
@@ -228,7 +521,7 @@
         if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
         render(data.tasks || []);
       } catch (error) {
-        text('#task-dock-summary', `chyba: ${error.message || error}`);
+        text('#task-dock-summary', `${tr('error')}: ${error.message || error}`);
       } finally {
         pollInFlight = false;
         schedulePoll(1500);
@@ -333,7 +626,7 @@
       const items = visibleInstances();
       if (!items.length) {
         const empty = document.createElement('p'); empty.className = 'empty';
-        empty.textContent = instances.length ? 'Filtru neodpovídá žádná instance.' : 'Žádné instance.';
+        empty.textContent = instances.length ? tr('noMatch') : tr('noInstances');
         list.replaceChildren(empty); return;
       }
       list.replaceChildren(...items.map(makeInstanceCard));
@@ -360,9 +653,9 @@
       text('#detail-rss', `RSS ${formatBytes(item.rss_bytes || 0)} · CLI ${item.cli_port ? `:${item.cli_port}` : '—'}`);
       text('#detail-source', item.source_ip || '—'); text('#detail-user', item.user_id || 'unknown user');
       text('#detail-namespace', item.namespace || '—'); text('#detail-profile', `${item.profile || 'custom'} · ${item.unit || 'unit unknown'}`);
-      text('#detail-ttl', ttl(item.deadline)); text('#detail-deadline', item.deadline ? new Date(item.deadline).toLocaleString() : 'bez deadline');
-      text('#detail-build', short(item.build_id)); text('#detail-runtime-profile', `${item.runtime_profile_id ? `profil ${short(item.runtime_profile_id)}` : 'ruční výběr'}${item.persistent ? ' · persistent' : ''}`);
-      text('#detail-config-id', short(item.config_id)); text('#detail-config-mode', `${String(item.config_mode || 'ro').toUpperCase()} · cert ${short(item.cert_bundle_id)}`);
+      text('#detail-ttl', ttl(item.deadline)); text('#detail-deadline', item.deadline ? new Date(item.deadline).toLocaleString() : tr('noDeadline'));
+      text('#detail-build', short(item.build_id)); text('#detail-runtime-profile', `${item.runtime_profile_id ? `${tr('profile')} ${short(item.runtime_profile_id)}` : tr('manual')}${item.persistent ? ' · persistent' : ''}`);
+      text('#detail-config-id', short(item.config_id)); text('#detail-config-mode', `${String(item.config_mode || 'ro').toUpperCase()} · ${item.filesystem_mode === 'rootfs' ? 'ROOTFS' : 'HOST FS'} · cert ${short(item.cert_bundle_id)}`);
       if (focusMode) document.title = `Smithproxy ${short(item.id)} · ${item.source_ip || 'instance'}`;
       const result = q('#detail-result'); result.hidden = !item.result; result.textContent = item.result || '';
       q('#detail-config').href = `/instances/${encodeURIComponent(item.id)}/config/download`;
@@ -393,16 +686,16 @@
       if (!selectedId || !output) return;
       const instanceId = selectedId;
       const requestId = ++logsRequest;
-      output.textContent = 'Načítám…';
+      output.textContent = tr('loading');
       try {
         const response = await fetch(`/api/instances/${encodeURIComponent(instanceId)}/logs`, {cache: 'no-store'});
         const data = await response.json();
         if (requestId !== logsRequest || instanceId !== selectedId) return;
         if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
-        output.textContent = data.output || 'Žádné logy.';
+        output.textContent = data.output || tr('noLogs');
       } catch (error) {
         if (requestId === logsRequest && instanceId === selectedId) {
-          output.textContent = `Logy nelze načíst: ${error.message || error}`;
+          output.textContent = `${tr('logsFailed')}: ${error.message || error}`;
         }
       }
     }
@@ -487,7 +780,7 @@
       if (!selectedId || !output) return;
       const instanceId = selectedId;
       const requestId = ++diagnosticsRequest;
-      output.replaceChildren(Object.assign(document.createElement('p'), {className: 'empty', textContent: 'Načítám…'}));
+      output.replaceChildren(Object.assign(document.createElement('p'), {className: 'empty', textContent: tr('loading')}));
       try {
         const response = await fetch(`/api/instances/${encodeURIComponent(instanceId)}/diagnostics`, {cache: 'no-store'});
         const data = await response.json();
@@ -500,10 +793,14 @@
         appendDiagRow(grid, 'Root filesystem', `${execution.rootfs || ''} · ${execution.rootfs_mode || ''}`);
         appendDiagRow(grid, 'Network namespace', `${execution.network_namespace || ''} · ${execution.network_namespace_path || ''}`);
         const network = execution.network || {};
-        appendDiagRow(grid, 'Síťový rozsah', network.subnet);
-        appendDiagRow(grid, 'Host veth', `${network.host_interface || '—'} · ${network.expected_host_address || '—'}`);
-        appendDiagRow(grid, 'Namespace veth', `${network.guest_interface || '—'} · ${network.expected_guest_address || '—'}`);
-        appendDiagRow(grid, 'Host interface — skutečnost', formatInterfaces(network.host_interfaces));
+        const ingress = network.ingress || {};
+        const egress = network.egress || {};
+        appendDiagRow(grid, 'Ingress pool / subnet', ingress.subnet);
+        appendDiagRow(grid, 'Ingress host → namespace', `${ingress.host_interface || '—'} ${ingress.expected_host_address || '—'} → ${ingress.guest_interface || '—'} ${ingress.expected_guest_address || '—'}`);
+        appendDiagRow(grid, 'Ingress interface — skutečnost', formatInterfaces(ingress.host_interfaces));
+        appendDiagRow(grid, 'Egress pool / subnet', egress.subnet);
+        appendDiagRow(grid, 'Egress namespace → host', `${egress.guest_interface || '—'} ${egress.expected_guest_address || '—'} → ${egress.host_interface || '—'} ${egress.expected_host_address || '—'}`);
+        appendDiagRow(grid, 'Egress interface — skutečnost', formatInterfaces(egress.host_interfaces));
         appendDiagRow(grid, 'Namespace interface — skutečnost', formatInterfaces(network.namespace_interfaces));
         appendDiagRow(grid, 'Namespace routy', formatRoutes(network.namespace_routes));
         appendDiagRow(grid, 'Host policy routy', formatRoutes(network.host_routes));
@@ -553,7 +850,7 @@
     async function pollInstances(manual = false) {
       if (polling) return;
       polling = true;
-      text('#instance-poll-state', manual ? 'ověřuji…' : 'aktualizuji…');
+      text('#instance-poll-state', manual ? tr('checking') : tr('updating'));
       try {
         const response = await fetch('/api/instances', {cache: 'no-store'});
         const data = await response.json();
@@ -561,10 +858,10 @@
         instances = (data.instances || []).sort((a, b) => Number(activeState(b.state)) - Number(activeState(a.state)) || String(b.created_at).localeCompare(String(a.created_at)));
         if (selectedId && !instances.some(item => item.id === selectedId)) selectedId = '';
         renderMetrics(); renderList(); renderDetail();
-        text('#instance-poll-state', `ověřeno ${new Date().toLocaleTimeString()}`);
+        text('#instance-poll-state', `${tr('checked')} ${new Date().toLocaleTimeString()}`);
         q('#runner-status').textContent = 'ok'; q('#runner-status').classList.add('ok');
       } catch (error) {
-        text('#instance-poll-state', `chyba: ${error.message || error}`);
+        text('#instance-poll-state', `${tr('error')}: ${error.message || error}`);
         q('#runner-status').textContent = 'unavailable'; q('#runner-status').classList.remove('ok');
       } finally { polling = false; }
     }
@@ -738,9 +1035,144 @@
   q('#gdb-font-decrease')?.addEventListener('click', () => setGdbTerminalFont(gdbFontSize - 1));
   q('#gdb-font-increase')?.addEventListener('click', () => setGdbTerminalFont(gdbFontSize + 1));
 
+  function setupWorkspaceWidth() {
+    const main = q('main');
+    const handles = [...document.querySelectorAll('[data-layout-resizer]')];
+    if (!main || !handles.length) return;
+    const storageKey = 'smithproxy-workspace-width';
+    const defaultWidth = 1440;
+    const clamp = value => Math.max(760, Math.min(window.innerWidth - 24, value));
+    const apply = (value, persist = true) => {
+      const width = Math.round(clamp(value));
+      document.documentElement.style.setProperty('--workspace-width', `${width}px`);
+      if (persist) localStorage.setItem(storageKey, String(width));
+      requestAnimationFrame(position);
+    };
+    const position = () => {
+      if (window.innerWidth <= 900) return;
+      const rect = main.getBoundingClientRect();
+      const left = q('[data-layout-resizer="left"]');
+      const right = q('[data-layout-resizer="right"]');
+      if (left) left.style.left = `${Math.max(3, rect.left - left.offsetWidth - 7)}px`;
+      if (right) right.style.left = `${Math.min(window.innerWidth - right.offsetWidth - 3, rect.right + 7)}px`;
+    };
+    const stored = Number(localStorage.getItem(storageKey));
+    apply(Number.isFinite(stored) && stored >= 760 ? stored : defaultWidth, false);
+    handles.forEach(handle => {
+      handle.setAttribute('aria-label', handle.dataset.layoutResizer === 'left' ? 'Resize workspace from left edge' : 'Resize workspace from right edge');
+      handle.addEventListener('pointerdown', event => {
+        if (window.innerWidth <= 900) return;
+        event.preventDefault();
+        handle.setPointerCapture(event.pointerId);
+        handle.classList.add('dragging');
+        document.body.classList.add('layout-resizing');
+      });
+      handle.addEventListener('pointermove', event => {
+        if (!handle.hasPointerCapture(event.pointerId)) return;
+        apply(2 * Math.abs(event.clientX - window.innerWidth / 2));
+      });
+      const finish = event => {
+        if (handle.hasPointerCapture(event.pointerId)) handle.releasePointerCapture(event.pointerId);
+        handle.classList.remove('dragging');
+        document.body.classList.remove('layout-resizing');
+      };
+      handle.addEventListener('pointerup', finish);
+      handle.addEventListener('pointercancel', finish);
+      handle.addEventListener('dblclick', () => {
+        localStorage.removeItem(storageKey);
+        apply(defaultWidth, false);
+      });
+      handle.addEventListener('keydown', event => {
+        if (!['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
+        event.preventDefault();
+        const current = main.getBoundingClientRect().width;
+        const outward = handle.dataset.layoutResizer === 'left' ? event.key === 'ArrowLeft' : event.key === 'ArrowRight';
+        apply(current + (outward ? 80 : -80));
+      });
+    });
+    window.addEventListener('resize', () => {
+      const current = Number(localStorage.getItem(storageKey)) || defaultWidth;
+      apply(current, false);
+    });
+    new ResizeObserver(position).observe(main);
+    position();
+  }
+
+  function setupCopyableValues() {
+    const selector = [
+      'main code', '.instance-cell-source', '#detail-full-id', '#detail-source',
+      '#detail-namespace', '#detail-build', '#detail-config-id',
+      '.lab-coordinates b', '.test-drive-ttl code', '[data-copy-value]'
+    ].join(',');
+    const excluded = 'a,button,summary,label,pre,textarea,input,select,.terminal-screen,.xterm';
+    const toast = document.createElement('div');
+    toast.className = 'copy-toast'; toast.setAttribute('role', 'status'); toast.hidden = true;
+    document.body.append(toast);
+    let toastTimer;
+
+    const valueOf = node => (node.dataset.copyValue || node.textContent || '').trim();
+    const decorate = root => {
+      const nodes = [];
+      if (root instanceof Element && root.matches(selector)) nodes.push(root);
+      if (root.querySelectorAll) nodes.push(...root.querySelectorAll(selector));
+      nodes.forEach(node => {
+        if (node.dataset.copyReady || node.closest(excluded) || !valueOf(node)) return;
+        node.dataset.copyReady = '1';
+        node.classList.add('copyable-value');
+        node.tabIndex = 0;
+        node.setAttribute('role', 'button');
+        node.setAttribute('aria-label', `${tr('copy')}: ${valueOf(node)}`);
+        node.title = tr('copy');
+      });
+    };
+    const fallbackCopy = value => {
+      const area = document.createElement('textarea');
+      area.value = value; area.readOnly = true;
+      area.style.position = 'fixed'; area.style.opacity = '0';
+      document.body.append(area); area.select();
+      const copied = document.execCommand('copy'); area.remove();
+      if (!copied) throw new Error('copy command rejected');
+    };
+    const copy = async node => {
+      const value = valueOf(node);
+      if (!value) return;
+      try {
+        if (navigator.clipboard?.writeText && window.isSecureContext) await navigator.clipboard.writeText(value);
+        else fallbackCopy(value);
+        node.classList.add('copied');
+        toast.textContent = `${tr('copied')}: ${value.length > 80 ? `${value.slice(0, 77)}…` : value}`;
+      } catch (_error) {
+        toast.textContent = tr('copyFailed');
+        toast.classList.add('error');
+      }
+      toast.hidden = false;
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => {
+        toast.hidden = true; toast.classList.remove('error'); node.classList.remove('copied');
+      }, 1300);
+    };
+    document.addEventListener('click', event => {
+      const node = event.target.closest?.('.copyable-value');
+      if (!node || window.getSelection()?.toString()) return;
+      event.preventDefault(); copy(node);
+    });
+    document.addEventListener('keydown', event => {
+      if (!event.target.matches?.('.copyable-value') || !['Enter', ' '].includes(event.key)) return;
+      event.preventDefault(); copy(event.target);
+    });
+    decorate(document);
+    new MutationObserver(records => records.forEach(record => record.addedNodes.forEach(decorate)))
+      .observe(document.body, {childList: true, subtree: true});
+  }
+
+  setupWorkspaceWidth();
+  setupCopyableValues();
   setupSpawnForm();
   setupProfileBuildUpgrade();
   setupProfileTtlControls();
+  setupFirewallCountdowns();
+  setupFirewallExplainers();
+  setupFirewallTopology();
   setupBuildForm();
   setupBuildPolling();
   setupTaskDock();

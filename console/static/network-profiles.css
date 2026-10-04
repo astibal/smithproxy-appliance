@@ -1,0 +1,65 @@
+/* Composable ingress / egress policy catalogue. */
+.network-profile-compose{display:grid;grid-template-columns:1fr 1fr;gap:14px;align-items:start}
+.network-profile-compose>.panel{margin:0}
+.network-profile-compose .section-head code{color:#72d9b2}
+.network-profile-fields{display:grid;grid-template-columns:1fr 1fr;gap:11px}
+.network-cidrs{min-height:105px}
+.network-profile-list{display:grid;border:1px solid var(--line)}
+.network-profile-row{display:grid;grid-template-columns:92px minmax(0,1fr) auto;gap:16px;align-items:start;padding:14px 16px;border-top:1px solid var(--line);background:#06130f}
+.network-profile-row:first-child{border-top:0}
+.network-profile-row>div:nth-child(2){display:grid;gap:5px}
+.network-profile-row small{color:var(--muted)}
+.network-profile-row code{width:max-content;max-width:100%;overflow-wrap:anywhere;color:#81ddb9}
+.network-profile-kind{padding-top:3px;color:#78dfb8;font:700 10px "Cascadia Mono","JetBrains Mono",Consolas,monospace;letter-spacing:1.2px}
+.network-binding{padding:10px 12px;border-left:3px solid #3f9e7a;background:#071a14}
+.network-binding.egress{border-left-color:#7793c9}
+.network-binding small{display:block;margin-top:5px;color:var(--muted);font:10px "Cascadia Mono","JetBrains Mono",Consolas,monospace}
+.runtime-binding-line{display:flex;flex-wrap:wrap;align-items:center;gap:7px;margin:10px 0 8px;padding:8px 10px;border:1px solid var(--line);background:#04110e;font:11px "Cascadia Mono","JetBrains Mono",Consolas,monospace}
+.runtime-binding-line span{padding:2px 5px;background:#153f32;color:#94efd0;font-size:9px;font-weight:700}
+.runtime-binding-line b{font-size:11px;color:#bde7d7}
+.runtime-binding-line b.not-ready{color:#f0c978}
+.runtime-binding-line i{color:#5f9f88;font-style:normal}
+.runtime-binding-line code{color:#d6ebe3}
+.runtime-profile-compose>button{align-self:end}
+.network-driver-guide{--driver-accent:#59dcb0;margin:2px 0 4px;border:1px solid #205442;background:linear-gradient(135deg,#04110e 0%,#071b15 100%);overflow:hidden}
+.network-driver-guide-egress{--driver-accent:#86aee8;border-color:#304b65;background:linear-gradient(135deg,#06110f 0%,#091720 100%)}
+.network-driver-guide-head{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:10px 12px;border-bottom:1px solid color-mix(in srgb,var(--driver-accent) 28%,transparent)}
+.network-driver-guide-head>div{display:grid;gap:3px}
+.network-driver-guide-head b{font-size:13px}
+.network-driver-guide-head .eyebrow{font-size:8px}
+.network-driver-state{padding:3px 7px;border:1px solid #28795e;background:#0d3b2e;color:#a6f1d3;font:700 9px "Cascadia Mono","JetBrains Mono",Consolas,monospace;letter-spacing:.7px}
+.network-driver-state.is-design{border-color:#8c6a2f;background:#493918;color:#f0cf85}
+.network-driver-panel{padding:12px}
+.network-driver-panel[hidden]{display:none}
+.network-driver-flow{display:grid;grid-template-columns:minmax(112px,1fr) 54px minmax(132px,1.25fr) 54px minmax(125px,1.1fr);align-items:stretch}
+.network-driver-node{display:grid;align-content:center;min-height:72px;padding:10px 12px;border:1px solid color-mix(in srgb,var(--driver-accent) 55%,#17352c);background:#071812}
+.network-driver-guide-egress .network-driver-node{background:#08161a}
+.network-driver-node small{color:#6fa58f;font:700 8px "Cascadia Mono","JetBrains Mono",Consolas,monospace;letter-spacing:1px}
+.network-driver-node strong{margin:4px 0;color:#d9f4e9;font-size:13px}
+.network-driver-node span{color:#7ea393;font-size:10px}
+.network-driver-node code{color:var(--driver-accent)}
+.network-driver-node.policy,.network-driver-node.ingress-port,.network-driver-node.egress-port{border-color:var(--driver-accent);box-shadow:inset 3px 0 0 color-mix(in srgb,var(--driver-accent) 65%,transparent)}
+.network-driver-arrow{position:relative;display:flex;align-items:center;justify-content:center;color:#6ba78f;font:8px "Cascadia Mono","JetBrains Mono",Consolas,monospace;font-style:normal;text-transform:uppercase}
+.network-driver-arrow:before{content:"";position:absolute;left:5px;right:10px;top:50%;border-top:1px solid var(--driver-accent)}
+.network-driver-arrow:after{content:"";position:absolute;right:5px;top:calc(50% - 4px);border-left:7px solid var(--driver-accent);border-top:4px solid transparent;border-bottom:4px solid transparent}
+.network-driver-arrow span{position:relative;top:-12px;padding:1px 4px;background:#061510;z-index:1}
+.network-driver-guide-egress .network-driver-arrow span{background:#08161a}
+.network-driver-panel>p{margin:10px 0 0;color:#8faea2;font-size:11px;line-height:1.45}
+.network-driver-panel>p b{color:var(--driver-accent)}
+.network-selector-guide{margin:0 12px 12px;border:1px solid #1c493a;background:#04100d}
+.network-selector-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:9px 11px;border-bottom:1px solid #153a2e}
+.network-selector-head>div{display:grid;gap:2px}.network-selector-head b{font-size:12px}.network-selector-head .eyebrow{font-size:8px}
+.network-selector-head>code{padding:3px 6px;border:1px solid #28795e;color:#8ae6c3;background:#0a291f;font-size:9px;overflow-wrap:anywhere;text-align:right}
+.network-selector-panel{padding:11px}.network-selector-panel[hidden]{display:none}
+.network-selector-flow{display:grid;grid-template-columns:minmax(138px,1.15fr) 54px minmax(128px,1fr) 54px minmax(118px,.9fr);align-items:stretch}
+.network-packet{display:grid;align-content:center;gap:4px;min-height:84px;padding:8px 10px;border:1px solid #285143;background:#071812}
+.network-packet>small{margin-bottom:2px;color:#659882;font:700 8px "Cascadia Mono","JetBrains Mono",Consolas,monospace;letter-spacing:.8px}
+.network-packet>span{display:grid;grid-template-columns:29px minmax(0,1fr);align-items:center;border-left:2px solid #28473c;background:#0a1e17;color:#6f9385}
+.network-packet>span i{padding:4px;color:#668a7c;font:700 8px "Cascadia Mono","JetBrains Mono",Consolas,monospace;font-style:normal;text-align:center}
+.network-packet>span b{min-width:0;padding:4px 6px;border-left:1px solid #28473c;font:600 10px "Cascadia Mono","JetBrains Mono",Consolas,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.network-packet>span.is-match{border-left-color:#59dcb0;background:#0d3025;color:#b5f0d8}.network-packet>span.is-match i{color:#79dfb8}.network-packet>span.is-match b{border-left-color:#30785e}
+.network-selector-rule{display:grid;align-content:center;min-height:84px;padding:9px 11px;border:1px solid #59dcb0;background:#09231a;box-shadow:inset 3px 0 0 #3da981}
+.network-selector-rule.compound{border-color:#cfaa61;box-shadow:inset 3px 0 0 #b98c3c;background:#28200f}
+.network-selector-rule small{color:#6fa58f;font:700 8px "Cascadia Mono","JetBrains Mono",Consolas,monospace;letter-spacing:1px}.network-selector-rule strong{margin:4px 0;color:#d9f4e9;font-size:12px}.network-selector-rule span{color:#7ea393;font-size:10px}
+.network-selector-panel>p{margin:9px 0 0;color:#829e93;font-size:10px;line-height:1.45}
+@media(max-width:900px){.network-profile-compose{grid-template-columns:1fr}.network-profile-fields{grid-template-columns:1fr}.network-profile-row{grid-template-columns:1fr}.network-profile-row>.actions{justify-content:flex-start}.runtime-binding-line{align-items:flex-start;flex-direction:column}.network-driver-flow,.network-selector-flow{grid-template-columns:1fr}.network-driver-arrow{min-height:30px}.network-driver-arrow:before{left:50%;right:auto;top:4px;bottom:9px;border-top:0;border-left:1px solid var(--driver-accent)}.network-driver-arrow:after{right:auto;left:calc(50% - 4px);top:auto;bottom:3px;border-left:4px solid transparent;border-right:4px solid transparent;border-top:7px solid var(--driver-accent);border-bottom:0}.network-driver-arrow span{top:0;left:30px}}

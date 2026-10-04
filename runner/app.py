@@ -38,6 +38,8 @@ from .task_queue import TaskQueue
 from .network_settings import NetworkSettings
 from .test_drive import TestDriveManager
 from .instance_layout import ensure_type_link, prepare_layout, remove_type_link
+from .firewall import FirewallManager
+from .network_profiles import NetworkProfileLibrary
 
 
 @dataclass
@@ -76,6 +78,12 @@ class Instance:
     crash_trace: str = ""
     stopped_at: str = ""
     persistent: bool = False
+    source_ips: list[str] = field(default_factory=list)
+    socks_port: int = 1080
+    http_port: int = 3128
+    ingress_network_profile_id: str = ""
+    egress_network_profile_id: str = ""
+    filesystem_mode: str = "host"
 
 
 @dataclass
@@ -155,7 +163,10 @@ class Manager:
         if not uuid_is_valid(instance_id):
             return None
         try:
-            return Instance(**json.loads(self._state_path(instance_id).read_text(encoding="utf-8")))
+            instance = Instance(**json.loads(self._state_path(instance_id).read_text(encoding="utf-8")))
+            if not instance.source_ips and instance.source_ip:
+                instance.source_ips = [instance.source_ip]
+            return instance
         except (OSError, ValueError, TypeError):
             return None
 
@@ -314,7 +325,9 @@ class Manager:
 
     def create(self, payload: object, binary_path: Path | None = None,
                template_path: Path | None = None, assets_dir: Path | None = None,
-               cert_bundle_dir: Path | None = None) -> Instance:
+               cert_bundle_dir: Path | None = None,
+               work_installer: Callable[[Path], None] | None = None,
+               rootfs_path: Path | None = None) -> Instance:
         if not isinstance(payload, dict):
             raise ConfigError("request body must be an object")
         allowed = {
@@ -324,6 +337,9 @@ class Manager:
             "cert_bundle_id",
             "auto_restart",
             "persistent",
+            "ingress_network_profile_id", "egress_network_profile_id",
+            "network_egress_mode", "network_sas_interface",
+            "filesystem_mode",
         }
         unknown = set(payload) - allowed
         if unknown:
@@ -339,6 +355,10 @@ class Manager:
             raise ConfigError(f"runtime_seconds must be between {self.min_runtime} and {runtime_max}")
         parameters = validate_parameters(payload.get("parameters", {}))
         source_ip = str(payload.get("source_ip", "")).strip()
+        try:
+            source_ip = str(ipaddress.ip_address(source_ip))
+        except ValueError as exc:
+            raise ConfigError("source_ip must be an IPv4 or IPv6 address") from exc
         build_id = str(payload.get("build_id", "active"))
         config_id = str(payload.get("config_id", "active"))
         if runtime_profile_id and not uuid_is_valid(runtime_profile_id):
@@ -346,6 +366,25 @@ class Manager:
         cert_bundle_id = str(payload.get("cert_bundle_id", ""))
         if cert_bundle_id and not uuid_is_valid(cert_bundle_id):
             raise ConfigError("cert_bundle_id must be a UUID")
+        ingress_network_profile_id = str(payload.get("ingress_network_profile_id", ""))
+        egress_network_profile_id = str(payload.get("egress_network_profile_id", ""))
+        for field_name, value in (
+            ("ingress_network_profile_id", ingress_network_profile_id),
+            ("egress_network_profile_id", egress_network_profile_id),
+        ):
+            if value and not uuid_is_valid(value):
+                raise ConfigError(f"{field_name} must be a UUID")
+        network_egress_mode = str(payload.get("network_egress_mode", ""))
+        if network_egress_mode not in {"", "masquerade", "routed"}:
+            raise ConfigError("network_egress_mode must be masquerade or routed")
+        network_sas_interface = str(payload.get("network_sas_interface", ""))
+        if network_sas_interface and not re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", network_sas_interface):
+            raise ConfigError("network_sas_interface is invalid")
+        filesystem_mode = str(payload.get("filesystem_mode", "host"))
+        if filesystem_mode not in {"host", "rootfs"}:
+            raise ConfigError("filesystem_mode must be host or rootfs")
+        if filesystem_mode == "rootfs" and not rootfs_path:
+            raise ConfigError("rootfs mode requires a prepared build rootfs")
         auto_restart = payload.get("auto_restart", False)
         if not isinstance(auto_restart, bool):
             raise ConfigError("auto_restart must be a boolean")
@@ -393,7 +432,11 @@ class Manager:
         config_mode = str(payload.get("config_mode", "ro"))
         if config_mode not in {"ro", "rw"}:
             raise ConfigError("config_mode must be ro or rw")
-        if profile not in {"custom", "magic-sni", "socks", "http-proxy"}:
+        # Native configs extracted directly from a build are catalogued as
+        # "default".  At runtime they use the same transparent dataplane as a
+        # custom config; rejecting that library classification made freshly
+        # extracted defaults impossible to spawn (including rootfs profiles).
+        if profile not in {"default", "custom", "magic-sni", "socks", "http-proxy"}:
             raise ConfigError("invalid configuration profile")
         if profile == "magic-sni" and (not rewrite_sni or not rewrite_sni_to):
             raise ConfigError("Magic SNI profile requires rewrite_sni and rewrite_sni_to")
@@ -413,7 +456,8 @@ class Manager:
             active = sum(i.state in {"starting", "running", "orphaned"} for i in self.list())
             if active >= self.max_instances:
                 raise ConfigError("instance limit reached")
-            if any(i.source_ip == source_ip and i.state in {"starting", "running", "orphaned"} for i in self.list()):
+            if any(source_ip in (i.source_ips or [i.source_ip])
+                   and i.state in {"starting", "running", "orphaned"} for i in self.list()):
                 raise ConfigError("source_ip already has an active instance")
             instance_id = str(uuid.uuid4())
             runtime_dir = self.runtime_root / instance_id
@@ -484,6 +528,8 @@ class Manager:
                 snapshot_path = self._config_path(instance_id)
                 snapshot_path.write_text(rendered_config, encoding="utf-8")
                 os.chmod(snapshot_path, 0o600)
+                if work_installer:
+                    work_installer(runtime_dir)
                 now = datetime.now(timezone.utc)
                 unit = self.backend.start(
                     instance_id, config_path, runtime, source_ip=source_ip,
@@ -498,6 +544,9 @@ class Manager:
                     assets_path=str(effective_assets) if effective_assets else "",
                     auto_restart=auto_restart,
                     hard_runtime_seconds=0 if runtime == 0 else self.max_total_runtime,
+                    egress_mode=network_egress_mode,
+                    sas_interface=network_sas_interface,
+                    rootfs_path=str(rootfs_path) if rootfs_path else "",
                 )
             except Exception:
                 shutil.rmtree(runtime_dir, ignore_errors=True)
@@ -523,7 +572,40 @@ class Manager:
                 cert_bundle_id=cert_bundle_id,
                 auto_restart=auto_restart,
                 persistent=persistent,
+                source_ips=[source_ip],
+                socks_port=parameters.get("socks_port", 1080),
+                http_port=parameters.get("http_port", 3128),
+                ingress_network_profile_id=ingress_network_profile_id,
+                egress_network_profile_id=egress_network_profile_id,
+                filesystem_mode=filesystem_mode,
             )
+            self._save(instance)
+            return instance
+
+    def attach_source(self, instance_id: str, source_ip: object) -> Instance:
+        try:
+            source = str(ipaddress.ip_address(str(source_ip).strip()))
+        except ValueError as exc:
+            raise ConfigError("source must be an IPv4 or IPv6 address") from exc
+        with self.lock:
+            instance = self._load(instance_id)
+            if not instance:
+                raise ConfigError("instance not found")
+            instance = self._reconcile(instance)
+            if instance.state not in {"starting", "running", "orphaned"}:
+                raise ConfigError("source can only be attached to an active instance")
+            sources = [item for item in (instance.source_ips or [instance.source_ip]) if item]
+            if source in sources:
+                return instance
+            pool = self.sources()
+            if pool and source not in pool:
+                raise ConfigError("source is not present in the configured pool")
+            self.backend.attach_source(
+                instance.id, source, instance.profile,
+                instance.socks_port, instance.http_port,
+            )
+            instance.source_ips = [*sources, source]
+            instance.result = f"source-attached:{source}"
             self._save(instance)
             return instance
 
@@ -1053,6 +1135,19 @@ def openapi_document() -> dict[str, Any]:
                 "put": {"summary": "Update a binary and configuration binding"},
                 "delete": {"summary": "Delete an unused runtime profile"},
             },
+            "/v1/network-profiles": {
+                "get": {"summary": "List ingress and egress network profiles"},
+                "post": {"summary": "Create an ingress or egress network profile"},
+            },
+            "/v1/network-profiles/{id}": {
+                "get": {"summary": "Read one network profile and its usage"},
+                "put": {"summary": "Update one network profile"},
+                "delete": {"summary": "Delete an unused network profile"},
+            },
+            "/v1/runtime-profiles/{id}/work-files": {
+                "put": {"summary": "Add or replace a file copied into new instance /work"},
+                "delete": {"summary": "Remove a /work file from a runtime profile"},
+            },
             "/v1/cert-bundles": {
                 "get": {"summary": "List CA and certificate bundles"},
                 "post": {"summary": "Generate a new CA keypair bundle"},
@@ -1093,6 +1188,22 @@ def openapi_document() -> dict[str, Any]:
             "/v1/settings/networking": {
                 "get": {"summary": "Read namespace allocation and SAS routing settings"},
                 "put": {"summary": "Update namespace allocation and SAS routing settings"},
+            },
+            "/v1/firewall": {
+                "get": {"summary": "Read the SAS-owned nft INPUT/FORWARD allow-list"},
+                "put": {"summary": "Enable or disable INPUT and instance FORWARD enforcement"},
+            },
+            "/v1/firewall/authorizations": {
+                "post": {"summary": "Authorize an IPv4/IPv6 source and optionally assign or spawn an instance"},
+            },
+            "/v1/instances/{id}/sources": {
+                "post": {"summary": "Attach another exact source IP to a live instance"},
+            },
+            "/v1/firewall/authorizations/{id}": {
+                "delete": {"summary": "Revoke one source authorization"},
+            },
+            "/v1/firewall/authorizations/{id}/extend": {
+                "post": {"summary": "Add time to an expiring source authorization"},
             },
             "/v1/instances/{id}/diagnostics": {
                 "get": {"summary": "Read execution model, paths and namespace details"},
@@ -1184,7 +1295,201 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     config_previews: ConfigPreviewLibrary | None = None,
                     tasks: TaskQueue | None = None,
                     network_settings: NetworkSettings | None = None,
-                    test_drives: TestDriveManager | None = None):
+                    test_drives: TestDriveManager | None = None,
+                    firewall: FirewallManager | None = None,
+                    network_profiles: NetworkProfileLibrary | None = None):
+    def firewall_context(sources: list[str] | None = None) -> tuple[str, list[str]]:
+        if not network_settings:
+            raise BackendError("network settings are unavailable")
+        settings = network_settings.get()
+        if firewall:
+            firewall.namespace_cidr_v6 = settings["namespace_cidr_v6"]
+        return settings["namespace_cidr"], (
+            manager.sources() if sources is None else sources
+        )
+
+    def firewall_state_view() -> dict[str, Any]:
+        if not firewall:
+            raise BackendError("firewall is unavailable")
+        namespace_cidr, sources = firewall_context()
+        state = firewall.view(namespace_cidr, sources)
+        active_states = {"starting", "running", "orphaned"}
+        instances = [item for item in manager.snapshot() if item.state in active_states]
+        profile_names = {
+            str(item.get("profile_id", "")): str(item.get("name", ""))
+            for item in (runtime_profiles.list() if runtime_profiles else [])
+        }
+        entries: dict[str, dict[str, Any]] = {}
+
+        def topology_entry(source: str) -> dict[str, Any]:
+            raw_source = str(source).strip()
+            try:
+                network = ipaddress.ip_network(raw_source, strict=False)
+                key = str(network)
+                display_source = (
+                    str(network.network_address) if network.prefixlen == network.max_prefixlen
+                    else key
+                )
+            except ValueError:
+                key = raw_source
+                display_source = raw_source
+            return entries.setdefault(key, {
+                "source": display_source, "source_cidr": key,
+                "input_allowed": False, "forward_allowed": False,
+                "spawn_allowed": False, "active": False, "systems": [], "instances": [],
+                "expirations": [],
+            })
+
+        def add_expiration(entry: dict[str, Any], authorization: dict[str, Any]) -> None:
+            expires_at = str(authorization.get("expires_at", ""))
+            authorization_id = str(authorization.get("authorization_id", ""))
+            if not expires_at or any(
+                item.get("authorization_id") == authorization_id
+                for item in entry["expirations"]
+            ):
+                return
+            entry["expirations"].append({
+                "authorization_id": authorization_id,
+                "expires_at": expires_at,
+                "system": str(authorization.get("system", "")),
+                "chains": list(authorization.get("chains", [])),
+                "active": bool(authorization.get("active")),
+            })
+
+        for source in sources:
+            entry = topology_entry(str(source))
+            entry["spawn_allowed"] = True
+            entry["forward_allowed"] = True
+            entry["active"] = True
+        for authorization in state.get("authorizations", []):
+            entry = topology_entry(str(authorization.get("source", "")))
+            system = str(authorization.get("system", ""))
+            if system and system not in entry["systems"]:
+                entry["systems"].append(system)
+            add_expiration(entry, authorization)
+            if authorization.get("active"):
+                entry["active"] = True
+                entry["input_allowed"] |= "input" in authorization.get("chains", [])
+                entry["forward_allowed"] |= "forward" in authorization.get("chains", [])
+
+        for instance in instances:
+            for source in (instance.source_ips or [instance.source_ip or "unknown"]):
+                topology_entry(source)["active"] = True
+        for source, entry in entries.items():
+            try:
+                network = ipaddress.ip_network(source, strict=False)
+            except ValueError:
+                network = None
+            if network and network.prefixlen == network.max_prefixlen:
+                address = network.network_address
+                for authorization in state.get("authorizations", []):
+                    if not authorization.get("active"):
+                        continue
+                    try:
+                        authorized_network = ipaddress.ip_network(
+                            str(authorization.get("source", "")), strict=False,
+                        )
+                    except ValueError:
+                        continue
+                    if address.version == authorized_network.version and address in authorized_network:
+                        add_expiration(entry, authorization)
+                        entry["input_allowed"] |= "input" in authorization.get("chains", [])
+                        entry["forward_allowed"] |= "forward" in authorization.get("chains", [])
+            for instance in instances:
+                try:
+                    matches = network is not None and any(
+                        ipaddress.ip_address(candidate) in network
+                        for candidate in (instance.source_ips or [instance.source_ip])
+                    )
+                except ValueError:
+                    matches = source in (instance.source_ips or [instance.source_ip])
+                if not matches:
+                    continue
+                network_view: dict[str, Any] = {}
+                try:
+                    allocation = manager.backend.allocation(instance.id)
+                    ingress = manager.backend.ingress_allocation(instance.id)
+                    network_view = {
+                        "subnet": ingress.subnet,
+                        "host_interface": ingress.host_if,
+                        "host_ip": ingress.host_ip,
+                        "guest_interface": ingress.guest_if,
+                        "guest_ip": ingress.guest_ip,
+                        "subnet_v6": ingress.subnet_v6,
+                        "host_ip_v6": ingress.host_ip_v6,
+                        "guest_ip_v6": ingress.guest_ip_v6,
+                        "egress_subnet": allocation.subnet,
+                        "egress_host_interface": allocation.host_if,
+                        "egress_host_ip": allocation.host_ip,
+                        "egress_guest_interface": allocation.guest_if,
+                        "egress_guest_ip": allocation.guest_ip,
+                        "egress_subnet_v6": allocation.subnet_v6,
+                        "egress_host_ip_v6": allocation.host_ip_v6,
+                        "egress_guest_ip_v6": allocation.guest_ip_v6,
+                        "egress_mode": allocation.egress_mode,
+                        "sas_interface": allocation.sas_interface,
+                    }
+                except (AttributeError, BackendError, TypeError):
+                    pass
+                entry["instances"].append({
+                    "id": instance.id, "state": instance.state, "pid": instance.pid,
+                    "namespace": instance.namespace, "user_id": instance.user_id,
+                    "profile": profile_names.get(instance.runtime_profile_id)
+                    or instance.profile or "custom",
+                    "network": network_view,
+                })
+        state["topology"] = sorted(
+            entries.values(), key=lambda item: (
+                not item["instances"],
+                int(ipaddress.ip_network(item["source"], strict=False).network_address)
+                if item["source"] != "unknown" else 2 ** 32,
+                item["source"],
+            )
+        )
+        route_via = network_settings.get().get("sas_route_via", "") if network_settings else ""
+        egress_groups: dict[str, dict[str, Any]] = {}
+        seen_instances: set[str] = set()
+        for entry in state["topology"]:
+            for instance in entry["instances"]:
+                if instance["id"] in seen_instances:
+                    continue
+                seen_instances.add(instance["id"])
+                network = instance.get("network", {})
+                mode = str(network.get("egress_mode", "unknown"))
+                interface = str(network.get("sas_interface", ""))
+                key = f"{mode}|{interface}"
+                group = egress_groups.setdefault(key, {
+                    "key": key, "mode": mode, "interface": interface,
+                    "route_via": route_via, "instances": [],
+                    "effect": (
+                        "SNAT / MASQUERADE na adresu SAS hostu"
+                        if mode == "masquerade" else
+                        "Routed egress — guest IP proxy zůstává zachována"
+                        if mode == "routed" else "Neznámý egress efekt"
+                    ),
+                })
+                group["instances"].append({
+                    "id": instance["id"], "namespace": instance["namespace"],
+                    "profile": instance["profile"],
+                    "guest_ip": network.get("egress_guest_ip", ""),
+                    "guest_ip_v6": network.get("egress_guest_ip_v6", ""),
+                    "guest_interface": network.get("egress_guest_interface", ""),
+                })
+        state["egress_groups"] = sorted(
+            egress_groups.values(), key=lambda item: (item["mode"], item["interface"])
+        )
+        state["active_instances"] = [{
+            "id": item.id, "namespace": item.namespace, "state": item.state,
+            "profile": profile_names.get(item.runtime_profile_id) or item.profile,
+            "user_id": item.user_id, "source_ips": item.source_ips or [item.source_ip],
+        } for item in instances]
+        state["runtime_profiles"] = [{
+            "profile_id": item.get("profile_id", ""), "name": item.get("name", ""),
+            "ttl_seconds": item.get("ttl_seconds"),
+        } for item in (runtime_profiles.list() if runtime_profiles else [])]
+        state["topology_updated_at"] = datetime.now(timezone.utc).isoformat()
+        return state
+
     def runtime_profile_ttl(payload: dict, default: int | None = 1800) -> int | None:
         ttl = payload.get("ttl_seconds", default)
         if ttl is None:
@@ -1198,9 +1503,24 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
             )
         return ttl
 
+    def network_binding(payload: dict, current: dict | None = None) -> tuple[str, str]:
+        values = []
+        for kind in ("ingress", "egress"):
+            field = f"{kind}_network_profile_id"
+            value = str(payload.get(field, (current or {}).get(field, "")))
+            if value:
+                if not network_profiles:
+                    raise ConfigError("network profiles are unavailable")
+                network_profiles.get(value, kind)
+            values.append(value)
+        return values[0], values[1]
+
     def profile_view(item: dict, *, artifacts: list[dict] | None = None,
                      instances: list[Instance] | None = None) -> dict:
         result = dict(item)
+        result["work_files"] = (
+            runtime_profiles.list_work_files(item["profile_id"]) if runtime_profiles else []
+        )
         result["available"] = True
         result["newer_build_available"] = False
         if config_library:
@@ -1227,9 +1547,18 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
             )
             result["build_ref"] = artifact.get("ref", "") if artifact else ""
             result["build_type"] = artifact.get("build_type", "") if artifact else ""
+            filesystem_mode = str(item.get("filesystem_mode", "host"))
+            result["filesystem_mode"] = filesystem_mode
+            result["rootfs_ready"] = filesystem_mode != "rootfs"
             if artifact is None:
                 result["available"] = False
             else:
+                if filesystem_mode == "rootfs":
+                    rootfs = builder.rootfs_info(str(item.get("build_id", "")))
+                    result["rootfs_ready"] = bool(rootfs.get("rootfs_ready"))
+                    result["rootfs_path"] = str(rootfs.get("rootfs_path", ""))
+                    if not result["rootfs_ready"]:
+                        result["available"] = False
                 try:
                     selected_at = datetime.fromisoformat(
                         str(artifact.get("commit_at", "")).replace("Z", "+00:00")
@@ -1280,7 +1609,35 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
             for instance in (instances if instances is not None else manager.snapshot())
             if instance.runtime_profile_id == item.get("profile_id")
         ]}
+        for kind in ("ingress", "egress"):
+            field = f"{kind}_network_profile_id"
+            network_id = str(item.get(field, ""))
+            result[f"{kind}_network_profile_name"] = "global/default"
+            result[f"{kind}_network_profile_ready"] = True
+            if network_id and network_profiles:
+                try:
+                    selected = network_profiles.get(network_id, kind)
+                    result[f"{kind}_network_profile_name"] = selected["name"]
+                    result[f"{kind}_network_profile_ready"] = bool(selected["implemented"])
+                    if not selected["implemented"]:
+                        result["available"] = False
+                except BackendError:
+                    result["available"] = False
+                    result[f"{kind}_network_profile_name"] = "unavailable"
+                    result[f"{kind}_network_profile_ready"] = False
         return result
+
+    def network_profile_view(item: dict) -> dict:
+        profile_id = str(item.get("network_profile_id", ""))
+        field = f"{item.get('kind')}_network_profile_id"
+        usage = []
+        if runtime_profiles:
+            usage = [
+                {"profile_id": profile["profile_id"], "name": profile["name"]}
+                for profile in runtime_profiles.list()
+                if profile.get(field) == profile_id
+            ]
+        return {**item, "usage": {"runtime_profiles": usage}}
 
     def config_usage(config_id: str) -> dict:
         profiles = []
@@ -1627,6 +1984,80 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
         task, created = tasks.submit(kind, label, dedupe_key, resource, function)
         return tasks.view(task, deduplicated=not created)
 
+    def spawn_instance(payload: dict[str, Any]) -> Instance:
+        if not builder:
+            return manager.create(payload)
+        effective_payload = dict(payload)
+        runtime_profile_id = str(payload.get("runtime_profile_id", ""))
+        if runtime_profile_id:
+            if not runtime_profiles:
+                raise ConfigError("runtime profiles are unavailable")
+            binding = runtime_profiles.get(runtime_profile_id)
+            effective_payload["build_id"] = binding["build_id"]
+            effective_payload["config_id"] = binding["config_id"]
+            effective_payload["cert_bundle_id"] = binding.get("cert_bundle_id", "")
+            effective_payload["auto_restart"] = bool(binding.get("auto_restart", False))
+            effective_payload["filesystem_mode"] = str(
+                binding.get("filesystem_mode", "host")
+            )
+            for kind in ("ingress", "egress"):
+                field = f"{kind}_network_profile_id"
+                network_id = str(binding.get(field, ""))
+                effective_payload[field] = network_id
+                if not network_id:
+                    continue
+                if not network_profiles:
+                    raise ConfigError("network profiles are unavailable")
+                selected_network = network_profiles.get(network_id, kind)
+                if not selected_network.get("implemented"):
+                    raise ConfigError(
+                        f"{kind} network profile uses a driver/selector not implemented by this runner"
+                    )
+                if kind == "egress":
+                    effective_payload["network_egress_mode"] = selected_network["mode"]
+                    effective_payload["network_sas_interface"] = selected_network["host_interface"]
+            profile_ttl = binding.get("ttl_seconds", 1800)
+            effective_payload["runtime_seconds"] = 0 if profile_ttl is None else profile_ttl
+        requested_build = str(effective_payload.get("build_id", "active"))
+        requested_config = str(effective_payload.get("config_id", "active"))
+        binary = builder.resolve_binary(requested_build)
+        filesystem_mode = str(effective_payload.get("filesystem_mode", "host"))
+        if filesystem_mode not in {"host", "rootfs"}:
+            raise ConfigError("filesystem_mode must be host or rootfs")
+        rootfs = None
+        if filesystem_mode == "rootfs":
+            # Spawn itself is already a background task. Existing archived
+            # builds are therefore upgraded to an immutable rootfs lazily,
+            # without blocking the runner HTTP thread.
+            builder.prepare_rootfs(requested_build)
+            rootfs = builder.resolve_rootfs(requested_build)
+        if requested_config == "active" and config_library:
+            raise ConfigError(
+                "active raw configuration cannot be spawned; select an approved native config"
+            )
+        if config_library and requested_config != "active":
+            selected_config = config_library.get(requested_config)
+            if not selected_config.get("native"):
+                raise ConfigError("instance spawn requires an approved native config")
+            effective_payload["profile"] = selected_config.get("profile", "custom")
+        config = builder.resolve_config(requested_config)
+        assets = builder.resolve_config_assets(requested_config)
+        builder.validate_config_text(config.read_text(encoding="utf-8"), requested_build, assets)
+        cert_bundle_id = str(effective_payload.get("cert_bundle_id", ""))
+        certs = cert_library.resolve(cert_bundle_id) if cert_bundle_id and cert_library else None
+        if cert_bundle_id and not cert_library:
+            raise BackendError("certificate bundles are unavailable")
+        return manager.create(
+            effective_payload, binary, config, assets_dir=assets,
+            cert_bundle_dir=certs,
+            work_installer=(
+                lambda destination: runtime_profiles.install_work_files(
+                    runtime_profile_id, destination,
+                )
+            ) if runtime_profile_id and runtime_profiles else None,
+            rootfs_path=rootfs,
+        )
+
     def wait_for_build() -> dict:
         if not builder:
             raise BackendError("builder is unavailable")
@@ -1657,35 +2088,45 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
             r"/v1/configs/(?:preview|commit)",
             r"/v1/config-observer",
             r"/v1/instances/[0-9a-f-]+/(?:debug|restart|config/preview)",
+            r"/v1/instances/[0-9a-f-]+/sources",
             r"/v1/cert-bundles",
             r"/v1/cert-bundles/[0-9a-f-]+/certificates",
             r"/v1/runtime-profiles",
+            r"/v1/network-profiles",
             r"/v1/test-drives",
             r"/v1/test-drives/[0-9a-f-]+/upgrade",
             r"/v1/test-drives/[0-9a-f-]+/(?:extend|restart|config-mode|config/preview)",
             r"/v1/instances/cleanup",
+            r"/v1/firewall/authorizations",
+            r"/v1/firewall/authorizations/[0-9a-f-]+/extend",
         ),
         "PUT": (
             r"/v1/runtime-profiles/[0-9a-f-]+",
+            r"/v1/network-profiles/[0-9a-f-]+",
             r"/v1/configs/[0-9a-f-]+/metadata",
             r"/v1/settings/networking",
+            r"/v1/firewall",
         ),
         "DELETE": (
             r"/v1/builds/[A-Za-z0-9._-]+",
             r"/v1/configs/previews/[0-9a-f-]+",
             r"/v1/instances/[0-9a-f-]+/debug",
             r"/v1/runtime-profiles/[0-9a-f-]+",
+            r"/v1/network-profiles/[0-9a-f-]+",
             r"/v1/cert-bundles/[0-9a-f-]+",
             r"/v1/configs/[0-9a-f-]+",
             r"/v1/instances/[0-9a-f-]+/record",
             r"/v1/instances/[0-9a-f-]+",
             r"/v1/test-drives/[0-9a-f-]+",
+            r"/v1/firewall/authorizations/[0-9a-f-]+",
         ),
     }
 
     def action_resource(path: str) -> str:
         if path == "/v1/instances/cleanup":
             return "instances:cleanup"
+        if path.startswith("/v1/firewall"):
+            return "firewall"
         match = re.fullmatch(r"/v1/test-drives/([0-9a-f-]+)(?:/.*)?", path)
         if match:
             return f"test-drive:{match.group(1)}"
@@ -1826,6 +2267,11 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     })
                 except (ConfigError, OSError) as exc:
                     self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
+            elif parts == ["v1", "firewall"] and firewall:
+                try:
+                    self._json(HTTPStatus.OK, firewall_state_view())
+                except (ConfigError, BackendError, OSError) as exc:
+                    self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
             elif parts == ["v1", "build"] and builder:
                 self._json(HTTPStatus.OK, build_status_view())
             elif parts == ["v1", "configs"] and config_library:
@@ -1846,6 +2292,19 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     })
                 except BackendError as exc:
                     self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
+            elif parts == ["v1", "network-profiles"] and network_profiles:
+                try:
+                    self._json(HTTPStatus.OK, {
+                        "profiles": [network_profile_view(item) for item in network_profiles.list()],
+                    })
+                except BackendError as exc:
+                    self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
+            elif (len(parts) == 3 and parts[:2] == ["v1", "network-profiles"]
+                  and network_profiles):
+                try:
+                    self._json(HTTPStatus.OK, network_profile_view(network_profiles.get(parts[2])))
+                except BackendError as exc:
+                    self._json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
             elif len(parts) == 3 and parts[:2] == ["v1", "runtime-profiles"] and runtime_profiles:
                 try:
                     self._json(HTTPStatus.OK, profile_view(runtime_profiles.get(parts[2])))
@@ -1897,13 +2356,19 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                         network = manager.backend.network_diagnostics(item.id)
                     except (AttributeError, BackendError):
                         network = {}
+                    rootfs_path = "/"
+                    rootfs_mode = "host-shared, ProtectSystem=strict"
+                    if item.filesystem_mode == "rootfs" and builder:
+                        rootfs = builder.rootfs_info(item.build_id)
+                        rootfs_path = str(rootfs.get("rootfs_path") or "unavailable")
+                        rootfs_mode = "isolated RootDirectory, ProtectSystem=strict"
                     self._json(HTTPStatus.OK, {
                         "instance": asdict(item),
                         "execution": {
                             "model": "systemd transient unit + network namespace",
                             "unit": item.unit,
-                            "rootfs": "/",
-                            "rootfs_mode": "host-shared, ProtectSystem=strict",
+                            "rootfs": rootfs_path,
+                            "rootfs_mode": rootfs_mode,
                             "network_namespace": item.namespace,
                             "network_namespace_path": f"/run/netns/{item.namespace}" if item.namespace else "unknown",
                             "runtime_dir": str(runtime_dir),
@@ -1955,6 +2420,48 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                 self._json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
                 return
             parts = self._path()
+            if parts == ["v1", "firewall"] and firewall:
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if length <= 0 or length > max_body:
+                        raise ConfigError("invalid firewall settings size")
+                    payload = json.loads(self.rfile.read(length))
+                    if not isinstance(payload, dict):
+                        raise ConfigError("firewall settings must be an object")
+                    namespace_cidr, sources = firewall_context()
+                    item = firewall.update_settings(
+                        payload.get("input_enforced", False),
+                        payload.get("forward_enforced", False),
+                        namespace_cidr, sources,
+                    )
+                    self._json(HTTPStatus.OK, item)
+                except (ConfigError, BackendError, OSError, ValueError,
+                        TypeError, json.JSONDecodeError) as exc:
+                    self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            if (len(parts) == 4 and parts[:2] == ["v1", "runtime-profiles"]
+                    and parts[3] == "work-files" and runtime_profiles):
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if length <= 0 or length > max_body:
+                        raise ConfigError("invalid profile work file request size")
+                    payload = json.loads(self.rfile.read(length))
+                    if not isinstance(payload, dict):
+                        raise ConfigError("request body must be an object")
+                    try:
+                        content = base64.b64decode(
+                            str(payload.get("content_base64", "")), validate=True,
+                        )
+                        mode = int(str(payload.get("mode", "0600")), 8)
+                    except (ValueError, TypeError) as exc:
+                        raise ConfigError("invalid work file content or mode") from exc
+                    item = runtime_profiles.put_work_file(
+                        parts[2], str(payload.get("path", "")), content, mode,
+                    )
+                    self._json(HTTPStatus.OK, item)
+                except (ConfigError, BackendError, OSError, json.JSONDecodeError) as exc:
+                    self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
             if parts == ["v1", "settings", "networking"] and network_settings:
                 try:
                     length = int(self.headers.get("Content-Length", "0"))
@@ -1970,28 +2477,49 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     namespace_network = ipaddress.ip_network(
                         validated_settings["namespace_cidr"]
                     )
+                    namespace_network_v6 = ipaddress.ip_network(
+                        validated_settings["namespace_cidr_v6"]
+                    )
+                    ingress_network = ipaddress.ip_network(validated_settings["ingress_cidr"])
+                    ingress_network_v6 = ipaddress.ip_network(
+                        validated_settings["ingress_cidr_v6"]
+                    )
                     sources = []
                     for raw_source in raw_sources:
                         try:
                             source = str(ipaddress.ip_address(str(raw_source)))
                         except ValueError as exc:
                             raise ConfigError(f"invalid authorized source IP: {raw_source}") from exc
-                        if ":" in source:
-                            raise ConfigError("authorized source IPs currently support IPv4 only")
-                        if ipaddress.ip_address(source) in namespace_network:
+                        address = ipaddress.ip_address(source)
+                        own_network = namespace_network_v6 if address.version == 6 else namespace_network
+                        own_ingress_network = (
+                            ingress_network_v6 if address.version == 6 else ingress_network
+                        )
+                        if address in own_network or address in own_ingress_network:
                             raise ConfigError(
-                                f"authorized source IP overlaps namespace CIDR: {source}"
+                                f"authorized source IP overlaps ingress/egress CIDR: {source}"
                             )
                         if source not in sources:
                             sources.append(source)
                     if not sources:
                         raise ConfigError("at least one authorized source IP is required")
+                    previous_sources = manager.sources()
                     settings = network_settings.update(validated_settings)
                     NetworkSettings._write(manager.sources_path, sources)
+                    if firewall:
+                        try:
+                            firewall.namespace_cidr_v6 = settings["namespace_cidr_v6"]
+                            firewall.reconcile(settings["namespace_cidr"], sources)
+                        except Exception:
+                            NetworkSettings._write(manager.sources_path, previous_sources)
+                            previous_settings = network_settings.get()
+                            firewall.namespace_cidr_v6 = previous_settings["namespace_cidr_v6"]
+                            firewall.reconcile(previous_settings["namespace_cidr"], previous_sources)
+                            raise
                     self._json(HTTPStatus.OK, {
                         **network_settings.view(), "authorized_source_ips": sources,
                     })
-                except (ConfigError, OSError, ValueError, TypeError,
+                except (ConfigError, BackendError, OSError, ValueError, TypeError,
                         json.JSONDecodeError) as exc:
                     self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
@@ -2011,12 +2539,22 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     if not isinstance(auto_restart, bool):
                         raise ConfigError("auto_restart must be a boolean")
                     current_profile = runtime_profiles.get(parts[2])
+                    filesystem_mode = str(payload.get(
+                        "filesystem_mode", current_profile.get("filesystem_mode", "host")
+                    ))
+                    if filesystem_mode not in {"host", "rootfs"}:
+                        raise ConfigError("filesystem_mode must be host or rootfs")
                     ttl_seconds = runtime_profile_ttl(
                         payload, current_profile.get("ttl_seconds", 1800)
+                    )
+                    ingress_network_id, egress_network_id = network_binding(
+                        payload, current_profile,
                     )
                     if build_id == "active":
                         raise ConfigError("runtime profiles must use an archived build")
                     builder.resolve_binary(build_id)
+                    if filesystem_mode == "rootfs":
+                        builder.prepare_rootfs(build_id)
                     selected_config = config_library.get(config_id)
                     if not selected_config.get("native"):
                         raise ConfigError("runtime profiles require an approved native config")
@@ -2028,9 +2566,26 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                         parts[2], str(payload.get("name", "")), build_id,
                         config_id, cert_bundle_id,
                         auto_restart, ttl_seconds,
+                        ingress_network_id, egress_network_id,
+                        filesystem_mode,
                     )
                     self._json(HTTPStatus.OK, profile_view(item))
                 except (ConfigError, BackendError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                    self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            if (len(parts) == 3 and parts[:2] == ["v1", "network-profiles"]
+                    and network_profiles):
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if length <= 0 or length > max_body:
+                        raise ConfigError("invalid network profile size")
+                    payload = json.loads(self.rfile.read(length))
+                    if not isinstance(payload, dict):
+                        raise ConfigError("network profile must be an object")
+                    item = network_profiles.update(parts[2], payload)
+                    self._json(HTTPStatus.OK, network_profile_view(item))
+                except (ConfigError, BackendError, ValueError, TypeError,
+                        json.JSONDecodeError) as exc:
                     self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
             if (len(parts) == 4 and parts[:2] == ["v1", "configs"]
@@ -2070,6 +2625,109 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     self._json(HTTPStatus.OK, manager.cleanup_nonpersistent())
                 except (BackendError, ConfigError, OSError) as exc:
                     self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                return
+            if parts == ["v1", "firewall", "authorizations"] and firewall:
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if length <= 0 or length > max_body:
+                        raise ConfigError("invalid firewall authorization size")
+                    payload = json.loads(self.rfile.read(length))
+                    if not isinstance(payload, dict):
+                        raise ConfigError("firewall authorization must be an object")
+                    source_network = ipaddress.ip_network(
+                        str(payload.get("source", "")).strip(), strict=False,
+                    )
+                    register_source = payload.get(
+                        "register_source", source_network.prefixlen == source_network.max_prefixlen,
+                    )
+                    if not isinstance(register_source, bool):
+                        raise ConfigError("register_source must be boolean")
+                    if register_source and source_network.prefixlen != source_network.max_prefixlen:
+                        raise ConfigError("only a single IPv4 or IPv6 address can be registered for instance spawn")
+                    instance_id = str(payload.get("instance_id", ""))
+                    runtime_profile_id = str(payload.get("runtime_profile_id", ""))
+                    if instance_id and runtime_profile_id:
+                        raise ConfigError("choose an existing instance or a runtime profile, not both")
+                    if (instance_id or runtime_profile_id) and not register_source:
+                        raise ConfigError("instance assignment requires register_source")
+                    if instance_id:
+                        target = manager.get(instance_id)
+                        if not target or target.state not in {"starting", "running", "orphaned"}:
+                            raise ConfigError("selected instance is not active")
+                    if runtime_profile_id:
+                        if not runtime_profiles:
+                            raise ConfigError("runtime profiles are unavailable")
+                        runtime_profiles.get(runtime_profile_id)
+                    current_sources = manager.sources()
+                    source_ip = str(source_network.network_address)
+                    prospective_sources = list(current_sources)
+                    source_added = register_source and source_ip not in prospective_sources
+                    if source_added:
+                        prospective_sources.append(source_ip)
+                    namespace_cidr, _ = firewall_context(prospective_sources)
+                    item = firewall.add(
+                        payload, namespace_cidr, prospective_sources,
+                        registered_source=source_added,
+                    )
+                    if source_added:
+                        NetworkSettings._write(manager.sources_path, prospective_sources)
+                    result: dict[str, Any] = dict(item)
+                    if instance_id:
+                        result["assigned_instance"] = asdict(
+                            manager.attach_source(instance_id, source_ip)
+                        )
+                    elif runtime_profile_id:
+                        result["spawned_instance"] = asdict(spawn_instance({
+                            "source_ip": source_ip,
+                            "runtime_profile_id": runtime_profile_id,
+                            "runtime_seconds": 1800,
+                            "user_id": str(payload.get("user_id", "admin-console")),
+                            "config_mode": "ro", "persistent": False,
+                            "parameters": {
+                                "socks_port": 1080, "plaintext_port": 50080,
+                                "tls_port": 50443, "http_port": 3128,
+                                "cli_port": 50000, "workers": 1, "pcap_quota_mb": 100,
+                            },
+                        }))
+                    self._json(HTTPStatus.CREATED, result)
+                except (ConfigError, BackendError, OSError, ValueError, TypeError,
+                        json.JSONDecodeError) as exc:
+                    self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            if (len(parts) == 4 and parts[:2] == ["v1", "instances"]
+                    and parts[3] == "sources"):
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if length <= 0 or length > max_body:
+                        raise ConfigError("invalid source attachment size")
+                    payload = json.loads(self.rfile.read(length))
+                    if not isinstance(payload, dict):
+                        raise ConfigError("source attachment must be an object")
+                    self._json(HTTPStatus.OK, asdict(
+                        manager.attach_source(parts[2], payload.get("source", ""))
+                    ))
+                except (ConfigError, BackendError, OSError, ValueError,
+                        TypeError, json.JSONDecodeError) as exc:
+                    self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            if (len(parts) == 5 and parts[:3] == ["v1", "firewall", "authorizations"]
+                    and parts[4] == "extend" and firewall):
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if length <= 0 or length > max_body:
+                        raise ConfigError("invalid firewall extension size")
+                    payload = json.loads(self.rfile.read(length))
+                    if not isinstance(payload, dict):
+                        raise ConfigError("firewall extension must be an object")
+                    namespace_cidr, sources = firewall_context()
+                    item = firewall.extend(
+                        parts[3], payload.get("additional_seconds"),
+                        namespace_cidr, sources,
+                    )
+                    self._json(HTTPStatus.OK, item)
+                except (ConfigError, BackendError, OSError, ValueError, TypeError,
+                        json.JSONDecodeError) as exc:
+                    self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
             if (len(parts) == 4 and parts[:2] == ["v1", "test-drives"]
                     and parts[3] == "upgrade" and test_drives and builder):
@@ -2601,6 +3259,12 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     if not isinstance(auto_restart, bool):
                         raise ConfigError("auto_restart must be a boolean")
                     ttl_seconds = runtime_profile_ttl(payload)
+                    filesystem_mode = str(payload.get("filesystem_mode", "host"))
+                    if filesystem_mode not in {"host", "rootfs"}:
+                        raise ConfigError("filesystem_mode must be host or rootfs")
+                    ingress_network_id, egress_network_id = network_binding(payload)
+                    if filesystem_mode == "rootfs":
+                        builder.prepare_rootfs(build_id)
                     if cert_bundle_id:
                         if not cert_library:
                             raise ConfigError("certificate bundles are unavailable")
@@ -2608,9 +3272,25 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     item = runtime_profiles.create(
                         str(payload.get("name", "")), build_id, config_id, cert_bundle_id,
                         auto_restart, ttl_seconds,
+                        ingress_network_id, egress_network_id,
+                        filesystem_mode,
                     )
                     self._json(HTTPStatus.CREATED, profile_view(item))
                 except (ConfigError, BackendError, json.JSONDecodeError) as exc:
+                    self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            if parts == ["v1", "network-profiles"] and network_profiles:
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if length <= 0 or length > max_body:
+                        raise ConfigError("invalid network profile size")
+                    payload = json.loads(self.rfile.read(length))
+                    if not isinstance(payload, dict):
+                        raise ConfigError("network profile must be an object")
+                    item = network_profiles.create(payload)
+                    self._json(HTTPStatus.CREATED, network_profile_view(item))
+                except (ConfigError, BackendError, ValueError, TypeError,
+                        json.JSONDecodeError) as exc:
                     self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
             if parts == ["v1", "configs"] and builder and config_library:
@@ -2711,49 +3391,7 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     raise ConfigError("request body must be an object")
 
                 def spawn_task() -> dict:
-                    if builder:
-                        effective_payload = dict(payload)
-                        runtime_profile_id = str(payload.get("runtime_profile_id", ""))
-                        if runtime_profile_id:
-                            if not runtime_profiles:
-                                raise ConfigError("runtime profiles are unavailable")
-                            binding = runtime_profiles.get(runtime_profile_id)
-                            effective_payload["build_id"] = binding["build_id"]
-                            effective_payload["config_id"] = binding["config_id"]
-                            effective_payload["cert_bundle_id"] = binding.get("cert_bundle_id", "")
-                            effective_payload["auto_restart"] = bool(binding.get("auto_restart", False))
-                            profile_ttl = binding.get("ttl_seconds", 1800)
-                            effective_payload["runtime_seconds"] = (
-                                0 if profile_ttl is None else profile_ttl
-                            )
-                        requested_build = str(effective_payload.get("build_id", "active"))
-                        requested_config = str(effective_payload.get("config_id", "active"))
-                        binary = builder.resolve_binary(requested_build)
-                        if requested_config == "active" and config_library:
-                            raise ConfigError(
-                                "active raw configuration cannot be spawned; select an approved native config"
-                            )
-                        if config_library and requested_config != "active":
-                            selected_config = config_library.get(requested_config)
-                            if not selected_config.get("native"):
-                                raise ConfigError("instance spawn requires an approved native config")
-                            effective_payload["profile"] = selected_config.get("profile", "custom")
-                        config = builder.resolve_config(requested_config)
-                        assets = builder.resolve_config_assets(requested_config)
-                        builder.validate_config_text(
-                            config.read_text(encoding="utf-8"), requested_build, assets
-                        )
-                        cert_bundle_id = str(effective_payload.get("cert_bundle_id", ""))
-                        certs = cert_library.resolve(cert_bundle_id) if cert_bundle_id and cert_library else None
-                        if cert_bundle_id and not cert_library:
-                            raise BackendError("certificate bundles are unavailable")
-                        item = manager.create(
-                            effective_payload, binary, config, assets_dir=assets,
-                            cert_bundle_dir=certs,
-                        )
-                    else:
-                        item = manager.create(payload)
-                    return asdict(item)
+                    return asdict(spawn_instance(payload))
 
                 canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
                 source = str(payload.get("source_ip", "unknown"))
@@ -2774,6 +3412,52 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                 self._json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
                 return
             parts = self._path()
+            if (len(parts) == 4 and parts[:3] == ["v1", "firewall", "authorizations"]
+                    and firewall):
+                try:
+                    item = firewall.get(parts[3])
+                    if not item:
+                        self._json(HTTPStatus.NOT_FOUND, {"error": "authorization not found"})
+                        return
+                    current_sources = manager.sources()
+                    prospective_sources = list(current_sources)
+                    if item.get("registered_source"):
+                        network = ipaddress.ip_network(str(item["source"]), strict=False)
+                        source_ip = str(network.network_address)
+                        still_registered = any(
+                            current.get("authorization_id") != parts[3]
+                            and current.get("registered_source")
+                            and current.get("source") == item.get("source")
+                            for current in firewall.load()["authorizations"]
+                        )
+                        if not still_registered and source_ip in prospective_sources:
+                            prospective_sources.remove(source_ip)
+                    namespace_cidr, _ = firewall_context(prospective_sources)
+                    deleted = firewall.delete(parts[3], namespace_cidr, prospective_sources)
+                    if prospective_sources != current_sources:
+                        NetworkSettings._write(manager.sources_path, prospective_sources)
+                    self._json(HTTPStatus.OK, deleted)
+                except (ConfigError, BackendError, OSError, ValueError) as exc:
+                    self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            if (len(parts) == 4 and parts[:2] == ["v1", "runtime-profiles"]
+                    and parts[3] == "work-files" and runtime_profiles):
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if length <= 0 or length > max_body:
+                        raise ConfigError("invalid profile work file delete request")
+                    payload = json.loads(self.rfile.read(length))
+                    if not isinstance(payload, dict):
+                        raise ConfigError("request body must be an object")
+                    item = runtime_profiles.delete_work_file(
+                        parts[2], str(payload.get("path", "")),
+                    )
+                    self._json(HTTPStatus.OK, item) if item else self._json(
+                        HTTPStatus.NOT_FOUND, {"error": "work file not found"}
+                    )
+                except (ConfigError, BackendError, OSError, json.JSONDecodeError) as exc:
+                    self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
             if len(parts) == 3 and parts[:2] == ["v1", "test-drives"] and test_drives:
                 try:
                     item = test_drives.destroy(parts[2])
@@ -2829,6 +3513,22 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                 self._json(HTTPStatus.OK, item) if item else self._json(
                     HTTPStatus.NOT_FOUND, {"error": "not found"}
                 )
+                return
+            if (len(parts) == 3 and parts[:2] == ["v1", "network-profiles"]
+                    and network_profiles):
+                try:
+                    item = network_profiles.get(parts[2])
+                    field = f"{item['kind']}_network_profile_id"
+                    if runtime_profiles and any(
+                        profile.get(field) == parts[2] for profile in runtime_profiles.list()
+                    ):
+                        self._json(HTTPStatus.CONFLICT, {
+                            "error": "network profile is referenced by a runtime profile",
+                        })
+                        return
+                    self._json(HTTPStatus.OK, network_profiles.delete(parts[2]))
+                except BackendError as exc:
+                    self._json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
                 return
             if len(parts) == 3 and parts[:2] == ["v1", "cert-bundles"] and cert_library:
                 bundle_id = parts[2]
@@ -2899,6 +3599,8 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
 
 
 def reaper(manager: Manager, test_drives: TestDriveManager | None = None,
+           firewall: FirewallManager | None = None,
+           network_settings: NetworkSettings | None = None,
            interval_seconds: float = 2.0) -> None:
     while True:
         try:
@@ -2908,6 +3610,11 @@ def reaper(manager: Manager, test_drives: TestDriveManager | None = None,
             manager.cleanup_stopped()
             if test_drives:
                 test_drives.list()
+            if firewall and network_settings:
+                firewall.namespace_cidr_v6 = network_settings.get()["namespace_cidr_v6"]
+                firewall.reconcile(
+                    network_settings.get()["namespace_cidr"], manager.sources(),
+                )
         except Exception as exc:
             print(f"instance reconciliation failed: {exc}")
         time.sleep(interval_seconds)
@@ -3029,6 +3736,9 @@ def main() -> None:
             "CZ_RUNNER_NETWORK_ALLOCATIONS", "/var/lib/capture-zone-runner/network-allocations.json"
         )),
     )
+    firewall = FirewallManager(Path(os.environ.get(
+        "CZ_RUNNER_FIREWALL", "/var/lib/capture-zone-runner/firewall.json"
+    )))
     namespace_backend = NamespaceBackend(
         os.environ.get("CZ_RUNNER_SMITHPROXY", "/usr/local/lib/capture-zone/smithproxy"),
         network_settings,
@@ -3055,6 +3765,9 @@ def main() -> None:
     )))
     runtime_profiles = RuntimeProfileLibrary(Path(os.environ.get(
         "CZ_RUNNER_RUNTIME_PROFILES", "/var/lib/capture-zone-runner/runtime-profiles.json"
+    )))
+    network_profiles = NetworkProfileLibrary(Path(os.environ.get(
+        "CZ_RUNNER_NETWORK_PROFILES", "/var/lib/capture-zone-runner/network-profiles.json"
     )))
     cert_library = CertBundleLibrary(Path(os.environ.get(
         "CZ_RUNNER_CERT_LIBRARY", "/var/lib/capture-zone-runner/cert-library"
@@ -3098,11 +3811,15 @@ def main() -> None:
     # whether an orphaned unit should be stopped.
     manager.reconcile_orphans()
     test_drives.cleanup_orphans()
+    initial_network = network_settings.get()
+    firewall.namespace_cidr_v6 = initial_network["namespace_cidr_v6"]
+    firewall.apply(initial_network["namespace_cidr"], manager.sources())
     host = os.environ.get("CZ_RUNNER_HOST", "127.0.0.1")
     port = int(os.environ.get("CZ_RUNNER_PORT", "9080"))
     ws_port = int(os.environ.get("CZ_RUNNER_WS_PORT", "9081"))
     threading.Thread(
-        target=reaper, args=(manager, test_drives), daemon=True, name="instance-reaper"
+        target=reaper, args=(manager, test_drives, firewall, network_settings),
+        daemon=True, name="instance-reaper"
     ).start()
     server = ThreadingHTTPServer((host, port), handler_factory(
         manager, token, builder=builder, config_library=config_library,
@@ -3112,6 +3829,8 @@ def main() -> None:
         tasks=tasks,
         network_settings=network_settings,
         test_drives=test_drives,
+        firewall=firewall,
+        network_profiles=network_profiles,
     ))
     ws_server = serve(
         websocket_handler_factory(manager, token, builder, test_drives), host, ws_port,

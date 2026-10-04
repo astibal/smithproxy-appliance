@@ -23,6 +23,7 @@ SAFE_ID = re.compile(r"^[0-9a-f-]{36}$")
 UNIT_RE = re.compile(r"^capture-zone-smithproxy-([0-9a-f-]{36})\.service$")
 TEST_DRIVE_UNIT_RE = re.compile(r"^capture-zone-testdrive-([0-9a-f-]{36})\.service$")
 TEST_DRIVE_INGRESS_NAMESPACE = uuid.UUID("7fa9bc87-6a15-44d2-90cf-f20188b07c42")
+INSTANCE_INGRESS_NAMESPACE = uuid.UUID("15f53cb7-6dc9-49e7-9d8d-4df3ff1aa3f2")
 
 
 def systemd_timespan_microseconds(value: str) -> int:
@@ -146,6 +147,11 @@ class NetworkAllocation:
     subnet: str = ""
     egress_mode: str = "masquerade"
     sas_interface: str = ""
+    subnet_v6: str = ""
+    host_ip_v6: str = ""
+    guest_ip_v6: str = ""
+    role: str = "egress"
+    owner_id: str = ""
 
 
 class NamespaceBackend:
@@ -198,22 +204,45 @@ class NamespaceBackend:
         ]
 
     @staticmethod
-    def _legacy_allocation(instance_id: str) -> NetworkAllocation:
+    def _rootfs_execution_properties(config_path: Path, rootfs_path: str) -> tuple[list[str], str]:
+        if not rootfs_path:
+            return [], ""
+        effective_rootfs = Path(rootfs_path).resolve()
+        if not effective_rootfs.is_dir() or not (
+            effective_rootfs / "usr/bin/smithproxy"
+        ).is_file():
+            raise BackendError("prepared Smithproxy rootfs is unavailable")
+        return ([
+            f"--property=RootDirectory={effective_rootfs}",
+            "--property=MountAPIVFS=yes",
+            "--property=WorkingDirectory=/work",
+            # Preserve the current absolute runtime mountpoint without
+            # creating per-instance directories in the shared rootfs.
+            f"--property=TemporaryFileSystem={config_path.parent.parent}",
+        ], "/usr/bin/smithproxy")
+
+    @staticmethod
+    def _legacy_allocation(instance_id: str, role: str = "egress",
+                           owner_id: str = "") -> NetworkAllocation:
         if not SAFE_ID.fullmatch(instance_id):
             raise BackendError("invalid instance id")
         compact = instance_id.replace("-", "")
         number = int(compact[:8], 16)
-        second = 64 + ((number >> 14) % 64)
+        second = 100 if role == "ingress" else 200
         third = (number >> 6) & 255
         fourth = (number & 63) * 4
-        suffix = compact[:8]
+        owner_id = owner_id or instance_id
+        suffix = owner_id.replace("-", "")[:8]
+        host_prefix = "czi" if role == "ingress" else "czo"
+        guest_if = "di0" if role == "ingress" else "do0"
         return NetworkAllocation(
-            namespace=f"cz-{suffix}", host_if=f"czh{suffix[:8]}", guest_if="eth0",
+            namespace=f"cz-{suffix}", host_if=f"{host_prefix}{suffix}", guest_if=guest_if,
             host_ip=f"10.{second}.{third}.{fourth + 1}", guest_ip=f"10.{second}.{third}.{fourth + 2}",
             table=f"cz_{suffix}",
             route_table=10000 + (number % 40000),
             mark=0x100000 + (number % 0xEFFFFF),
             subnet=f"10.{second}.{third}.{fourth}/30",
+            role=role, owner_id=owner_id,
         )
 
     def allocation(self, instance_id: str) -> NetworkAllocation:
@@ -228,10 +257,27 @@ class NamespaceBackend:
                     raise BackendError(f"invalid saved network allocation: {exc}") from exc
         return self._legacy_allocation(instance_id)
 
+    @staticmethod
+    def ingress_id(instance_id: str) -> str:
+        if not SAFE_ID.fullmatch(instance_id):
+            raise BackendError("invalid instance id")
+        return str(uuid.uuid5(INSTANCE_INGRESS_NAMESPACE, instance_id))
+
+    def ingress_allocation(self, instance_id: str) -> NetworkAllocation:
+        ingress_id = self.ingress_id(instance_id)
+        if self.network_settings:
+            value = self.network_settings.allocations().get(ingress_id)
+            if isinstance(value, dict):
+                try:
+                    return NetworkAllocation(**value)
+                except TypeError as exc:
+                    raise BackendError(f"invalid saved ingress allocation: {exc}") from exc
+        return self._legacy_allocation(ingress_id, "ingress", instance_id)
+
     def _live_subnets(self) -> set[str]:
         result = set()
         for interface in self._ip_json(["ip", "-j", "addr", "show"]):
-            if not str(interface.get("ifname", "")).startswith(("czh", "czi")):
+            if not str(interface.get("ifname", "")).startswith(("czi", "czo")):
                 continue
             for address in interface.get("addr_info", []):
                 if address.get("family") == "inet" and address.get("prefixlen") == 30:
@@ -243,16 +289,27 @@ class NamespaceBackend:
                         pass
         return result
 
-    def _allocate(self, instance_id: str) -> NetworkAllocation:
+    def _allocate(self, instance_id: str, role: str = "egress",
+                  owner_id: str = "") -> NetworkAllocation:
+        if role not in {"ingress", "egress"}:
+            raise BackendError("invalid network allocation role")
+        owner_id = owner_id or instance_id
         if not self.network_settings:
-            return self._legacy_allocation(instance_id)
+            return self._legacy_allocation(instance_id, role, owner_id)
         with self.allocation_lock, self.network_settings.lock:
             values = self.network_settings.allocations()
             existing = values.get(instance_id)
             if isinstance(existing, dict):
-                return NetworkAllocation(**existing)
+                item = NetworkAllocation(**existing)
+                if item.role != role or item.owner_id not in {"", owner_id}:
+                    raise BackendError("saved network allocation has an incompatible role")
+                if item.guest_if not in {"di0", "do0"}:
+                    raise BackendError("legacy network allocation must be cleaned before spawn")
+                return item
             settings = self.network_settings.get()
-            network = ipaddress.ip_network(settings["namespace_cidr"])
+            network_key = "ingress_cidr" if role == "ingress" else "namespace_cidr"
+            network_v6_key = "ingress_cidr_v6" if role == "ingress" else "namespace_cidr_v6"
+            network = ipaddress.ip_network(settings[network_key])
             used = {
                 str(value.get("subnet")) for value in values.values()
                 if isinstance(value, dict) and value.get("subnet")
@@ -264,16 +321,34 @@ class NamespaceBackend:
             if selected is None:
                 raise BackendError("namespace /30 allocation pool is exhausted")
             index = (int(selected.network_address) - int(network.network_address)) // 4
-            compact = instance_id.replace("-", "")
-            suffix = compact[:8]
+            network_v6 = ipaddress.ip_network(settings[network_v6_key])
+            selected_v6 = ipaddress.ip_network(
+                (int(network_v6.network_address) + index * 4, 126)
+            )
+            if not selected_v6.subnet_of(network_v6):
+                raise BackendError("namespace /126 allocation pool is exhausted")
+            suffix = owner_id.replace("-", "")[:8]
             hosts = list(selected.hosts())
+            hosts_v6 = list(selected_v6.hosts())
+            capacity = min(
+                ipaddress.ip_network(settings["ingress_cidr"]).num_addresses // 4,
+                ipaddress.ip_network(settings["ingress_cidr_v6"]).num_addresses // 4,
+                ipaddress.ip_network(settings["namespace_cidr"]).num_addresses // 4,
+                ipaddress.ip_network(settings["namespace_cidr_v6"]).num_addresses // 4,
+            )
+            identity_offset = 0 if role == "ingress" else capacity
+            host_prefix = "czi" if role == "ingress" else "czo"
+            guest_if = "di0" if role == "ingress" else "do0"
             item = NetworkAllocation(
-                namespace=f"cz-{suffix}", host_if=f"czh{suffix[:8]}", guest_if="eth0",
+                namespace=f"cz-{suffix}", host_if=f"{host_prefix}{suffix}", guest_if=guest_if,
                 host_ip=str(hosts[0]), guest_ip=str(hosts[1]), table=f"cz_{suffix}",
-                route_table=settings["route_table_start"] + index,
-                mark=settings["mark_start"] + index, subnet=str(selected),
+                route_table=settings["route_table_start"] + identity_offset + index,
+                mark=settings["mark_start"] + identity_offset + index, subnet=str(selected),
                 egress_mode=settings["egress_mode"],
                 sas_interface=settings["sas_interface"],
+                subnet_v6=str(selected_v6), host_ip_v6=str(hosts_v6[0]),
+                guest_ip_v6=str(hosts_v6[1]),
+                role=role, owner_id=owner_id,
             )
             values[instance_id] = asdict(item)
             self.network_settings.save_allocations(values)
@@ -287,9 +362,13 @@ class NamespaceBackend:
 
     def _cleanup_network(self, allocation: NetworkAllocation) -> None:
         self._run(["nft", "delete", "table", "ip", allocation.table], tolerate_missing=True)
+        self._run(["nft", "delete", "table", "inet", allocation.table], tolerate_missing=True)
         self._run(["ip", "rule", "delete", "fwmark", hex(allocation.mark),
                    "table", str(allocation.route_table)], tolerate_missing=True)
         self._run(["ip", "route", "flush", "table", str(allocation.route_table)], tolerate_missing=True)
+        self._run(["ip", "-6", "rule", "delete", "fwmark", hex(allocation.mark),
+                   "table", str(allocation.route_table)], tolerate_missing=True)
+        self._run(["ip", "-6", "route", "flush", "table", str(allocation.route_table)], tolerate_missing=True)
         self._run(["ip", "netns", "delete", allocation.namespace], tolerate_missing=True)
         self._run(["ip", "link", "delete", allocation.host_if], tolerate_missing=True)
 
@@ -311,10 +390,7 @@ class NamespaceBackend:
 
     def network_diagnostics(self, instance_id: str) -> dict:
         allocation = self.allocation(instance_id)
-        subnet = allocation.subnet or str(ipaddress.ip_network(f"{allocation.host_ip}/30", strict=False))
-        host_interfaces = self._ip_json([
-            "ip", "-j", "addr", "show", "dev", allocation.host_if,
-        ])
+        ingress = self.ingress_allocation(instance_id)
         namespace_interfaces = self._ip_json([
             "ip", "-j", "-n", allocation.namespace, "addr", "show",
         ])
@@ -322,22 +398,42 @@ class NamespaceBackend:
             "ip", "-j", "-n", allocation.namespace, "route", "show", "table", "all",
         ])
         host_routes = self._ip_json([
-            "ip", "-j", "route", "show", "table", str(allocation.route_table),
+            "ip", "-j", "route", "show", "table", str(ingress.route_table),
         ])
         host_rules = [
             item for item in self._ip_json(["ip", "-j", "rule", "show"])
-            if str(item.get("table", "")) == str(allocation.route_table)
+            if str(item.get("table", "")) == str(ingress.route_table)
         ]
+        def link_view(item: NetworkAllocation) -> dict:
+            subnet = item.subnet or str(ipaddress.ip_network(
+                f"{item.host_ip}/30", strict=False,
+            ))
+            return {
+                "role": item.role, "subnet": subnet,
+                "host_interface": item.host_if, "guest_interface": item.guest_if,
+                "expected_host_address": f"{item.host_ip}/30",
+                "expected_guest_address": f"{item.guest_ip}/30",
+                "subnet_v6": item.subnet_v6,
+                "expected_host_address_v6": (
+                    f"{item.host_ip_v6}/126" if item.host_ip_v6 else ""
+                ),
+                "expected_guest_address_v6": (
+                    f"{item.guest_ip_v6}/126" if item.guest_ip_v6 else ""
+                ),
+                "host_interfaces": self._ip_json([
+                    "ip", "-j", "addr", "show", "dev", item.host_if,
+                ]),
+            }
+        ingress_view = link_view(ingress)
+        egress_view = link_view(allocation)
         return {
-            "present": bool(host_interfaces and namespace_interfaces),
-            "subnet": subnet,
-            "host_interface": allocation.host_if,
-            "guest_interface": allocation.guest_if,
-            "expected_host_address": f"{allocation.host_ip}/30",
-            "expected_guest_address": f"{allocation.guest_ip}/30",
-            "route_table": allocation.route_table,
-            "packet_mark": hex(allocation.mark),
-            "host_interfaces": host_interfaces,
+            "present": bool(
+                ingress_view["host_interfaces"] and egress_view["host_interfaces"]
+                and namespace_interfaces
+            ),
+            "ingress": ingress_view, "egress": egress_view,
+            "route_table": ingress.route_table,
+            "packet_mark": hex(ingress.mark),
             "namespace_interfaces": namespace_interfaces,
             "namespace_routes": namespace_routes,
             "host_routes": host_routes,
@@ -350,41 +446,110 @@ class NamespaceBackend:
               http_port: int = 3128, smithproxy_binary: str = "",
               profile: str = "custom", config_mode: str = "ro",
               assets_path: str = "", auto_restart: bool = False,
-              hard_runtime_seconds: int = 86400) -> str:
+              hard_runtime_seconds: int = 86400, egress_mode: str = "",
+              sas_interface: str = "", rootfs_path: str = "") -> str:
         try:
             source = str(ipaddress.ip_address(source_ip))
         except ValueError as exc:
             raise BackendError("source_ip must be a valid IP address") from exc
-        if ":" in source:
-            raise BackendError("the MVP namespace backend currently supports IPv4 source addresses only")
-        allocation = self._allocate(instance_id)
+        allocation = self._allocate(instance_id, "egress", instance_id)
+        ingress_id = self.ingress_id(instance_id)
+        try:
+            ingress = self._allocate(ingress_id, "ingress", instance_id)
+        except Exception:
+            if self.network_settings:
+                self.network_settings.release(instance_id)
+            raise
+        if egress_mode or sas_interface:
+            allocation = replace(
+                allocation,
+                egress_mode=egress_mode or allocation.egress_mode,
+                sas_interface=sas_interface or allocation.sas_interface,
+            )
+            if self.network_settings:
+                allocations = self.network_settings.allocations()
+                allocations[instance_id] = asdict(allocation)
+                self.network_settings.save_allocations(allocations)
+        source_address = ipaddress.ip_address(source)
+        if source_address.version == 6 and not ingress.guest_ip_v6:
+            raise BackendError("IPv6 requires a dual-stack network allocation")
+        self._cleanup_network(ingress)
         self._cleanup_network(allocation)
         try:
             self._run(["ip", "netns", "add", allocation.namespace])
+            # Egress pair: proxy-originated traffic follows the namespace
+            # default route through do0.
             self._run(["ip", "link", "add", allocation.host_if, "type", "veth", "peer", "name", allocation.guest_if])
             self._run(["ip", "link", "set", allocation.guest_if, "netns", allocation.namespace])
             self._run(["ip", "addr", "add", f"{allocation.host_ip}/30", "dev", allocation.host_if])
+            if allocation.host_ip_v6:
+                self._run(["ip", "-6", "addr", "add", f"{allocation.host_ip_v6}/126",
+                           "dev", allocation.host_if])
             self._run(["ip", "link", "set", allocation.host_if, "up"])
             self._run(["ip", "-n", allocation.namespace, "addr", "add", f"{allocation.guest_ip}/30", "dev", allocation.guest_if])
+            if allocation.guest_ip_v6:
+                self._run(["ip", "-n", allocation.namespace, "-6", "addr", "add",
+                           f"{allocation.guest_ip_v6}/126", "dev", allocation.guest_if])
             self._run(["ip", "-n", allocation.namespace, "link", "set", "lo", "up"])
             self._run(["ip", "-n", allocation.namespace, "link", "set", allocation.guest_if, "up"])
             self._run(["ip", "-n", allocation.namespace, "route", "add", "default", "via", allocation.host_ip])
+            if allocation.host_ip_v6:
+                self._run(["ip", "-n", allocation.namespace, "-6", "route", "add", "default",
+                           "via", allocation.host_ip_v6])
 
-            self._run(["ip", "route", "add", "default", "via", allocation.guest_ip,
-                       "dev", allocation.host_if, "table", str(allocation.route_table)])
-            self._run(["ip", "rule", "add", "fwmark", hex(allocation.mark),
-                       "table", str(allocation.route_table), "priority", "1000"])
+            # Ingress pair: selected client traffic enters exclusively through
+            # di0. A host route keeps replies to that client off do0.
+            self._run(["ip", "link", "add", ingress.host_if, "type", "veth",
+                       "peer", "name", ingress.guest_if])
+            self._run(["ip", "link", "set", ingress.guest_if, "netns", allocation.namespace])
+            self._run(["ip", "addr", "add", f"{ingress.host_ip}/30", "dev", ingress.host_if])
+            if ingress.host_ip_v6:
+                self._run(["ip", "-6", "addr", "add", f"{ingress.host_ip_v6}/126",
+                           "dev", ingress.host_if])
+            self._run(["ip", "link", "set", ingress.host_if, "up"])
+            self._run(["ip", "-n", allocation.namespace, "addr", "add",
+                       f"{ingress.guest_ip}/30", "dev", ingress.guest_if])
+            if ingress.guest_ip_v6:
+                self._run(["ip", "-n", allocation.namespace, "-6", "addr", "add",
+                           f"{ingress.guest_ip_v6}/126", "dev", ingress.guest_if])
+            self._run(["ip", "-n", allocation.namespace, "link", "set", ingress.guest_if, "up"])
+            if source_address.version == 6:
+                self._run(["ip", "-n", allocation.namespace, "-6", "route", "replace",
+                           f"{source}/128", "via", ingress.host_ip_v6, "dev", ingress.guest_if])
+            else:
+                self._run(["ip", "-n", allocation.namespace, "route", "replace",
+                           f"{source}/32", "via", ingress.host_ip, "dev", ingress.guest_if])
+
+            self._run(["ip", "route", "add", "default", "via", ingress.guest_ip,
+                       "dev", ingress.host_if, "table", str(ingress.route_table)])
+            self._run(["ip", "rule", "add", "fwmark", hex(ingress.mark),
+                       "table", str(ingress.route_table), "priority", "1000"])
+            if ingress.guest_ip_v6:
+                self._run(["ip", "-6", "route", "add", "default", "via", ingress.guest_ip_v6,
+                           "dev", ingress.host_if, "table", str(ingress.route_table)])
+                self._run(["ip", "-6", "rule", "add", "fwmark", hex(ingress.mark),
+                           "table", str(ingress.route_table), "priority", "1000"])
             self._run(["ip", "-n", allocation.namespace, "rule", "add", "fwmark", "0x1",
                        "table", "100", "priority", "100"])
             self._run(["ip", "-n", allocation.namespace, "route", "add", "local", "0.0.0.0/0",
                        "dev", "lo", "table", "100"])
+            if allocation.guest_ip_v6:
+                self._run(["ip", "-n", allocation.namespace, "-6", "rule", "add", "fwmark", "0x1",
+                           "table", "100", "priority", "100"])
+                self._run(["ip", "-n", allocation.namespace, "-6", "route", "add", "local", "::/0",
+                           "dev", "lo", "table", "100"])
 
             explicit_port = socks_port if profile == "socks" else http_port
             explicit = profile in {"socks", "http-proxy"}
-            match = f"ip saddr {source} tcp dport {explicit_port}" if explicit else f"ip saddr {source}"
+            family = "ip6" if source_address.version == 6 else "ip"
+            destination = ingress.guest_ip_v6 if source_address.version == 6 else ingress.guest_ip
+            match = f"{family} saddr {source} tcp dport {explicit_port}" if explicit else f"{family} saddr {source}"
             dnat_chain = (
                 " chain proxy_dnat { type nat hook prerouting priority dstnat; policy accept;\n"
-                f"  ip saddr {source} tcp dport {explicit_port} dnat to {allocation.guest_ip}:{explicit_port}\n }}\n"
+                f"  {family} saddr {source} tcp dport {explicit_port} "
+                f"dnat {'ip6 ' if source_address.version == 6 else ''}to "
+                f"{'[' if source_address.version == 6 else ''}{destination}"
+                f"{']' if source_address.version == 6 else ''}:{explicit_port}\n }}\n"
                 if explicit else ""
             )
             snat_rule = ""
@@ -393,10 +558,12 @@ class NamespaceBackend:
                     f'oifname "{allocation.sas_interface}" ' if allocation.sas_interface else ""
                 )
                 snat_rule = f"  {interface_match}ip saddr {allocation.guest_ip} masquerade\n"
+                if allocation.guest_ip_v6:
+                    snat_rule += f"  {interface_match}ip6 saddr {allocation.guest_ip_v6} masquerade\n"
             rules = (
-                f"table ip {allocation.table} {{\n"
+                f"table inet {allocation.table} {{\n"
                 " chain prerouting { type filter hook prerouting priority mangle; policy accept;\n"
-                f"  {match} meta mark set {hex(allocation.mark)}\n"
+                f"  {match} meta mark set {hex(ingress.mark)}\n"
                 f" }}\n{dnat_chain} chain postrouting {{ type nat hook postrouting priority srcnat; policy accept;\n"
                 f"{snat_rule} }}\n}}"
             )
@@ -407,10 +574,10 @@ class NamespaceBackend:
 
             if not explicit:
                 namespace_rules = (
-                    "table ip capture_zone {\n"
+                    "table inet capture_zone {\n"
                     " chain prerouting { type filter hook prerouting priority mangle; policy accept;\n"
-                    f"  iifname \"{allocation.guest_if}\" tcp dport 443 tproxy to :{tls_port} meta mark set 0x1\n"
-                    f"  iifname \"{allocation.guest_if}\" tcp dport != 443 tproxy to :{plaintext_port} meta mark set 0x1\n"
+                    f"  iifname \"{ingress.guest_if}\" tcp dport 443 tproxy to :{tls_port} meta mark set 0x1\n"
+                    f"  iifname \"{ingress.guest_if}\" tcp dport != 443 tproxy to :{plaintext_port} meta mark set 0x1\n"
                     " }\n}"
                 )
                 completed = subprocess.run(
@@ -427,12 +594,19 @@ class NamespaceBackend:
             # alone does not isolate PID files.
             private_run = config_path.parent / "run"
             effective_binary = Path(smithproxy_binary or self.smithproxy_binary).resolve()
+            rootfs_properties = []
+            executable = str(effective_binary)
+            if rootfs_path:
+                rootfs_properties, executable = self._rootfs_execution_properties(
+                    config_path, rootfs_path
+                )
             command = [
                 "systemd-run", "--quiet", f"--unit={unit}",
                 "--property=Type=simple", "--property=KillMode=control-group",
                 "--property=TimeoutStopSec=10s",
                 "--property=MemoryMax=1G", "--property=TasksMax=256",
                 f"--property=NetworkNamespacePath=/run/netns/{allocation.namespace}",
+                *rootfs_properties,
                 *self._instance_storage_properties(
                     config_path, private_run, effective_binary,
                 ),
@@ -461,26 +635,68 @@ class NamespaceBackend:
                 if not asset_root.is_relative_to(config_path.parent.resolve()):
                     raise BackendError("instance assets must be private to its runtime workspace")
             command.extend([
-                "--", str(effective_binary), "--config-file", str(config_path),
+                "--", executable, "--config-file", str(config_path),
             ])
             self._run(command)
             return unit
         except Exception:
+            self._cleanup_network(ingress)
             self._cleanup_network(allocation)
             if self.network_settings:
                 self.network_settings.release(instance_id)
+                self.network_settings.release(ingress_id)
             raise
 
     def stop(self, unit: str) -> None:
         instance_id = unit.removeprefix("capture-zone-smithproxy-").removesuffix(".service")
+        ingress_id = self.ingress_id(instance_id)
         self.stop_debug(instance_id)
         completed = subprocess.run(["systemctl", "stop", unit], capture_output=True, text=True,
                                    timeout=20, check=False)
         if completed.returncode and "not loaded" not in completed.stderr.lower():
             raise BackendError(completed.stderr.strip() or "systemctl stop failed")
+        self._cleanup_network(self.ingress_allocation(instance_id))
         self._cleanup_network(self.allocation(instance_id))
         if self.network_settings:
             self.network_settings.release(instance_id)
+            self.network_settings.release(ingress_id)
+
+    def attach_source(self, instance_id: str, source_ip: str, profile: str,
+                      socks_port: int = 1080, http_port: int = 3128) -> None:
+        allocation = self.allocation(instance_id)
+        ingress = self.ingress_allocation(instance_id)
+        source = ipaddress.ip_address(source_ip)
+        if source.version == 6 and not ingress.guest_ip_v6:
+            raise BackendError("IPv6 attachment requires a dual-stack instance")
+        table_family = "inet" if allocation.guest_ip_v6 else "ip"
+        address_family = "ip6" if source.version == 6 else "ip"
+        destination = ingress.guest_ip_v6 if source.version == 6 else ingress.guest_ip
+        explicit_port = socks_port if profile == "socks" else http_port
+        lines = [
+            f"add rule {table_family} {allocation.table} prerouting {address_family} saddr {source} "
+            f"meta mark set {hex(ingress.mark)}"
+        ]
+        if profile in {"socks", "http-proxy"}:
+            lines.append(
+                f"add rule {table_family} {allocation.table} proxy_dnat {address_family} saddr {source} "
+                f"tcp dport {explicit_port} dnat {'ip6 ' if source.version == 6 else ''}to "
+                f"{'[' if source.version == 6 else ''}{destination}"
+                f"{']' if source.version == 6 else ''}:{explicit_port}"
+            )
+        completed = subprocess.run(
+            ["nft", "-f", "/dev/stdin"], input="\n".join(lines) + "\n",
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        if completed.returncode:
+            raise BackendError(completed.stderr.strip() or "cannot attach source route")
+        route = ["ip", "-n", allocation.namespace]
+        if source.version == 6:
+            route.extend(["-6", "route", "replace", f"{source}/128", "via",
+                          ingress.host_ip_v6, "dev", ingress.guest_if])
+        else:
+            route.extend(["route", "replace", f"{source}/32", "via",
+                          ingress.host_ip, "dev", ingress.guest_if])
+        self._run(route)
 
     @staticmethod
     def test_drive_unit_name(drive_id: str) -> str:
@@ -497,43 +713,47 @@ class NamespaceBackend:
     def start_test_drive(self, drive_id: str, binary: Path, config_path: Path,
                          private_run: Path, resolver_path: Path, ttl_seconds: int,
                          config_mode: str = "ro"):
-        allocation = replace(self._allocate(drive_id), guest_if="do0")
+        allocation = self._allocate(drive_id, "egress", drive_id)
         ingress_id = self.test_drive_ingress_id(drive_id)
         try:
-            ingress_raw = self._allocate(ingress_id)
+            ingress = self._allocate(ingress_id, "ingress", drive_id)
         except Exception:
             if self.network_settings:
                 self.network_settings.release(drive_id)
             raise
-        ingress = replace(
-            ingress_raw, namespace=allocation.namespace,
-            host_if=f"czi{drive_id.replace('-', '')[:8]}", guest_if="di0",
-        )
         self._cleanup_network(allocation)
-        # The allocator gives the ingress lease its own synthetic namespace
-        # identity. Test Drive joins both veths into the proxy namespace.
-        self._cleanup_network(ingress_raw)
+        self._cleanup_network(ingress)
         try:
             self._run(["ip", "netns", "add", allocation.namespace])
             self._run(["ip", "link", "add", allocation.host_if, "type", "veth",
                        "peer", "name", allocation.guest_if])
             self._run(["ip", "link", "set", allocation.guest_if, "netns", allocation.namespace])
             self._run(["ip", "addr", "add", f"{allocation.host_ip}/30", "dev", allocation.host_if])
+            self._run(["ip", "-6", "addr", "add", f"{allocation.host_ip_v6}/126",
+                       "dev", allocation.host_if])
             self._run(["ip", "link", "set", allocation.host_if, "up"])
             self._run(["ip", "-n", allocation.namespace, "addr", "add",
                        f"{allocation.guest_ip}/30", "dev", allocation.guest_if])
+            self._run(["ip", "-n", allocation.namespace, "-6", "addr", "add",
+                       f"{allocation.guest_ip_v6}/126", "dev", allocation.guest_if])
             self._run(["ip", "-n", allocation.namespace, "link", "set", "lo", "up"])
             self._run(["ip", "-n", allocation.namespace, "link", "set",
                        allocation.guest_if, "up"])
             self._run(["ip", "-n", allocation.namespace, "route", "add", "default",
                        "via", allocation.host_ip])
+            self._run(["ip", "-n", allocation.namespace, "-6", "route", "add", "default",
+                       "via", allocation.host_ip_v6])
             self._run(["ip", "link", "add", ingress.host_if, "type", "veth",
                        "peer", "name", ingress.guest_if])
             self._run(["ip", "link", "set", ingress.guest_if, "netns", allocation.namespace])
             self._run(["ip", "addr", "add", f"{ingress.host_ip}/30", "dev", ingress.host_if])
+            self._run(["ip", "-6", "addr", "add", f"{ingress.host_ip_v6}/126",
+                       "dev", ingress.host_if])
             self._run(["ip", "link", "set", ingress.host_if, "up"])
             self._run(["ip", "-n", allocation.namespace, "addr", "add",
                        f"{ingress.guest_ip}/30", "dev", ingress.guest_if])
+            self._run(["ip", "-n", allocation.namespace, "-6", "addr", "add",
+                       f"{ingress.guest_ip_v6}/126", "dev", ingress.guest_if])
             self._run(["ip", "-n", allocation.namespace, "link", "set",
                        ingress.guest_if, "up"])
             # Accepted connections must return through di0 while independent
@@ -543,13 +763,18 @@ class NamespaceBackend:
                        "table", "101"])
             self._run(["ip", "-n", allocation.namespace, "rule", "add", "from",
                        f"{ingress.guest_ip}/32", "table", "101", "priority", "101"])
+            self._run(["ip", "-n", allocation.namespace, "-6", "route", "add", "default",
+                       "via", ingress.host_ip_v6, "dev", ingress.guest_if, "table", "101"])
+            self._run(["ip", "-n", allocation.namespace, "-6", "rule", "add", "from",
+                       f"{ingress.guest_ip_v6}/128", "table", "101", "priority", "101"])
             interface_match = (
                 f'oifname "{allocation.sas_interface}" ' if allocation.sas_interface else ""
             )
             rules = (
-                f"table ip {allocation.table} {{\n"
+                f"table inet {allocation.table} {{\n"
                 " chain postrouting { type nat hook postrouting priority srcnat; policy accept;\n"
                 f"  {interface_match}ip saddr {allocation.guest_ip} masquerade\n"
+                f"  {interface_match}ip6 saddr {allocation.guest_ip_v6} masquerade\n"
                 " }\n}"
             )
             completed = subprocess.run(

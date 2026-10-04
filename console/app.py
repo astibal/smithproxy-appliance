@@ -19,6 +19,11 @@ from flask_sock import Sock
 from websockets.sync.client import connect as websocket_connect
 from werkzeug.security import check_password_hash, generate_password_hash
 
+try:
+    from .i18n import LANGUAGES, translate
+except ImportError:  # Flask's ``--app /absolute/path/app.py`` loader.
+    from i18n import LANGUAGES, translate
+
 
 def partition_branches(branches, *, now=None, attic_days=365):
     """Keep old remote refs available without crowding the active catalogue."""
@@ -68,6 +73,9 @@ def create_app(test_config=None):
 
     admin_lock = threading.RLock()
 
+    def tr(key):
+        return translate(getattr(g, "locale", session.get("locale", "cs")), key)
+
     def load_admins():
         path = Path(app.config["ADMIN_FILE"])
         try:
@@ -107,7 +115,13 @@ def create_app(test_config=None):
                 else max(90, app.config["RUNNER_TIMEOUT"])
             )
             with urlopen(req, timeout=timeout) as response:
-                return json.load(response)
+                result = json.load(response)
+                if method == "GET" and path == "/v1/status":
+                    build = result.setdefault("build", {})
+                    build["artifacts"] = artifact_library_view(
+                        build.get("artifacts", [])
+                    )
+                return result
         except HTTPError as exc:
             try:
                 message = json.load(exc).get("error", str(exc))
@@ -141,10 +155,20 @@ def create_app(test_config=None):
                 if parsed[key].tzinfo is None:
                     parsed[key] = parsed[key].replace(tzinfo=timezone.utc)
                 result[f"{key}_display"] = parsed[key].astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-                result[f"{key}_age_days"] = max(0, int((now - parsed[key]).total_seconds() // 86400))
+                age_seconds = max(0, int((now - parsed[key]).total_seconds()))
+                result[f"{key}_age_days"] = age_seconds // 86400
+                if age_seconds < 60:
+                    result[f"{key}_age_compact"] = "teď"
+                elif age_seconds < 3600:
+                    result[f"{key}_age_compact"] = f"{age_seconds // 60} min"
+                elif age_seconds < 172800:
+                    result[f"{key}_age_compact"] = f"{age_seconds // 3600} h"
+                else:
+                    result[f"{key}_age_compact"] = f"{age_seconds // 86400} d"
             except (TypeError, ValueError):
                 result[f"{key}_display"] = "neznámé"
                 result[f"{key}_age_days"] = None
+                result[f"{key}_age_compact"] = "?"
         if "built_at" in parsed and "commit_at" in parsed:
             result["build_lag_days"] = max(
                 0, int((parsed["built_at"] - parsed["commit_at"]).total_seconds() // 86400)
@@ -155,25 +179,54 @@ def create_app(test_config=None):
 
     def artifact_library_view(items):
         artifacts = [artifact_time_view(item) for item in items]
+        def timestamp(item, key):
+            try:
+                value = datetime.fromisoformat(str(item.get(key, "")).replace("Z", "+00:00"))
+                return value.replace(tzinfo=value.tzinfo or timezone.utc).timestamp()
+            except (TypeError, ValueError):
+                return float("-inf")
+
+        artifacts.sort(
+            key=lambda item: (
+                bool(item.get("rootfs_ready")),
+                timestamp(item, "built_at"), timestamp(item, "commit_at"),
+                str(item.get("build_id", item.get("commit_id", ""))),
+            ), reverse=True,
+        )
         groups = {}
         for item in artifacts:
             key = (item.get("ref", ""), item.get("build_type", "Release"))
-            try:
-                commit_at = datetime.fromisoformat(
-                    str(item.get("commit_at", "")).replace("Z", "+00:00")
-                )
-            except (TypeError, ValueError):
-                continue
-            groups.setdefault(key, []).append((commit_at, item))
+            groups.setdefault(key, []).append(item)
         for candidates in groups.values():
-            newest_at, newest = max(candidates, key=lambda candidate: candidate[0])
-            for commit_at, item in candidates:
-                item["newer_build_available"] = commit_at < newest_at
-                item["code_behind_days"] = max(
-                    0, int((newest_at - commit_at).total_seconds() // 86400)
+            latest_build = max(candidates, key=lambda item: timestamp(item, "built_at"))
+            newest = max(candidates, key=lambda item: timestamp(item, "commit_at"))
+            newest_at = timestamp(newest, "commit_at")
+            for item in candidates:
+                commit_at = timestamp(item, "commit_at")
+                item["is_latest_build"] = item is latest_build
+                comparable = commit_at != float("-inf") and newest_at != float("-inf")
+                item["newer_build_available"] = comparable and commit_at < newest_at
+                item["code_behind_days"] = (
+                    max(0, int((newest_at - commit_at) // 86400)) if comparable else 0
                 )
                 item["newest_build_id"] = newest.get("build_id", newest.get("commit_id", ""))
                 item["newest_commit_id"] = newest.get("commit_id", "")
+        for item in artifacts:
+            prefix = "★ NEJNOVĚJŠÍ" if item.get("is_latest_build") else "starší"
+            image = "image/rootfs ✓" if item.get("rootfs_ready") else "image/rootfs nevytvořen"
+            stale = " · ⚠ novější kód existuje" if item.get("newer_build_available") else ""
+            item["choice_label"] = (
+                f"{prefix} · {item.get('ref') or 'detached'} · "
+                f"{item.get('build_type', 'Release')} · "
+                f"build {item.get('built_at_age_compact', '?')} · "
+                f"commit {item.get('commit_at_age_compact', '?')} · "
+                f"{str(item.get('commit_id', ''))[:12]} · {image}{stale}"
+            )
+            item["choice_title"] = (
+                f"Build: {item.get('built_at_display', 'neznámé')}; "
+                f"commit: {item.get('commit_at_display', 'neznámé')}; "
+                f"ID: {item.get('build_id', item.get('commit_id', ''))}"
+            )
         return artifacts
 
     def login_required(view):
@@ -186,6 +239,11 @@ def create_app(test_config=None):
 
     @app.before_request
     def security():
+        requested_locale = session.get("locale")
+        if requested_locale not in LANGUAGES:
+            best = request.accept_languages.best_match(list(LANGUAGES))
+            requested_locale = best or "cs"
+        g.locale = requested_locale
         g.admin = None
         if session.get("admin_id"):
             g.admin = next(
@@ -199,7 +257,10 @@ def create_app(test_config=None):
 
     @app.context_processor
     def globals_():
-        return {"csrf_token": session.setdefault("csrf_token", secrets.token_urlsafe(24))}
+        return {
+            "csrf_token": session.setdefault("csrf_token", secrets.token_urlsafe(24)),
+            "_": tr, "locale": g.locale, "languages": LANGUAGES,
+        }
 
     @app.after_request
     def headers(response):
@@ -218,16 +279,67 @@ def create_app(test_config=None):
             admin = next((item for item in load_admins()
                           if item.get("email") == request.form.get("email", "").lower()), None)
             if admin and check_password_hash(admin["password_hash"], request.form.get("password", "")):
-                session.clear(); session["admin_id"] = admin["id"]; session["csrf_token"] = secrets.token_urlsafe(24)
+                locale = g.locale
+                session.clear(); session["locale"] = locale
+                session["admin_id"] = admin["id"]; session["csrf_token"] = secrets.token_urlsafe(24)
                 audit("admin.login", admin["email"])
                 return redirect(url_for("console"))
-            flash("Neplatné přihlášení.", "error")
+            flash(tr("login.invalid"), "error")
         return render_template("login.html")
+
+    @app.post("/language/<locale_code>")
+    def set_language(locale_code):
+        if locale_code not in LANGUAGES:
+            abort(404)
+        session["locale"] = locale_code
+        target = request.form.get("next", "/")
+        if not target.startswith("/") or target.startswith("//"):
+            target = url_for("console") if g.admin else url_for("login")
+        return redirect(target)
 
     @app.post("/logout")
     def logout():
+        locale = g.locale
         session.clear()
+        session["locale"] = locale
         return redirect(url_for("login"))
+
+    @app.route("/preferences", methods=["GET", "POST"])
+    @login_required
+    def preferences():
+        if request.method == "POST":
+            current = request.form.get("current_password", "")
+            new = request.form.get("new_password", "")
+            confirmation = request.form.get("confirm_password", "")
+            if not check_password_hash(g.admin.get("password_hash", ""), current):
+                flash(tr("preferences.wrong_password"), "error")
+            elif len(new) < 12:
+                flash(tr("preferences.password_short"), "error")
+            elif new != confirmation:
+                flash(tr("preferences.password_mismatch"), "error")
+            elif check_password_hash(g.admin.get("password_hash", ""), new):
+                flash(tr("preferences.password_same"), "error")
+            else:
+                with admin_lock:
+                    admins = load_admins()
+                    admin = next((item for item in admins
+                                  if str(item.get("id")) == str(g.admin.get("id"))), None)
+                    if not admin:
+                        abort(409, "administrator account no longer exists")
+                    # Revalidate under the same lock used for the write. This
+                    # avoids overwriting a concurrent password change.
+                    if not check_password_hash(admin.get("password_hash", ""), current):
+                        flash(tr("preferences.wrong_password"), "error")
+                        return render_template("preferences.html"), 400
+                    admin["password_hash"] = generate_password_hash(new)
+                    admin["password_changed_at"] = datetime.now(timezone.utc).isoformat()
+                    save_admins(admins)
+                audit("admin.password.change", g.admin.get("email", ""))
+                session["csrf_token"] = secrets.token_urlsafe(24)
+                flash(tr("preferences.password_changed"), "success")
+                return redirect(url_for("preferences"))
+            return render_template("preferences.html"), 400
+        return render_template("preferences.html")
 
     @app.get("/")
     @login_required
@@ -254,9 +366,6 @@ def create_app(test_config=None):
     def binaries():
         try:
             status = api("GET", "/v1/status")
-            status["build"]["artifacts"] = artifact_library_view(
-                status["build"].get("artifacts", [])
-            )
             refs = status["build"].setdefault("refs", {})
             active, attic = partition_branches(refs.get("branches", []))
             refs["active_branches"] = active
@@ -458,11 +567,98 @@ def create_app(test_config=None):
             status = api("GET", "/v1/status")
             profiles = api("GET", "/v1/runtime-profiles")["profiles"]
             bundles = api("GET", "/v1/cert-bundles")["bundles"]
+            network_profiles = api("GET", "/v1/network-profiles")["profiles"]
         except RuntimeError as exc:
-            status, profiles, bundles, error = {"build": {"artifacts": [], "configs": []}}, [], [], str(exc)
+            status, profiles, bundles, network_profiles, error = {
+                "build": {"artifacts": [], "configs": []}
+            }, [], [], [], str(exc)
         return render_template(
-            "runtime_profiles.html", status=status, profiles=profiles, bundles=bundles, error=error
+            "runtime_profiles.html", status=status, profiles=profiles, bundles=bundles,
+            network_profiles=network_profiles, error=error,
         )
+
+    def network_profile_payload():
+        kind = request.form.get("kind", "")
+        payload = {
+            "kind": kind, "name": request.form.get("name", ""),
+            "description": request.form.get("description", ""),
+            "address_family": request.form.get("address_family", "dual"),
+            "driver": request.form.get("driver", ""),
+            "interface_name": request.form.get("interface_name", ""),
+        }
+        if kind == "ingress":
+            payload.update({
+                "selector": request.form.get("selector", "source"),
+                "require_authorization": request.form.get("require_authorization") == "on",
+                "destination_cidrs": [line.strip() for line in request.form.get(
+                    "destination_cidrs", ""
+                ).splitlines() if line.strip()],
+            })
+        elif kind == "egress":
+            payload.update({
+                "mode": request.form.get("mode", "masquerade"),
+                "host_interface": request.form.get("host_interface", ""),
+            })
+        return payload
+
+    @app.route("/network-profiles", methods=["GET", "POST"])
+    @login_required
+    def network_profile_library():
+        if request.method == "POST":
+            try:
+                payload = network_profile_payload()
+                result = enqueue(
+                    "POST", "/v1/network-profiles", payload,
+                    f"Vytvořit {payload.get('kind')} network profil", "network-profile-create",
+                )
+                audit("network-profile.create", result.get("task_id", ""))
+                flash_queued(result)
+            except RuntimeError as exc:
+                flash(str(exc), "error")
+            return redirect(url_for("network_profile_library"))
+        try:
+            profiles = api("GET", "/v1/network-profiles")["profiles"]
+            return render_template("network_profiles.html", profiles=profiles, error=None)
+        except RuntimeError as exc:
+            return render_template("network_profiles.html", profiles=[], error=str(exc))
+
+    @app.route("/network-profiles/<profile_id>/edit", methods=["GET", "POST"])
+    @login_required
+    def edit_network_profile(profile_id):
+        try:
+            profile = api("GET", f"/v1/network-profiles/{quote(profile_id, safe='')}")
+        except RuntimeError as exc:
+            flash(str(exc), "error")
+            return redirect(url_for("network_profile_library"))
+        if request.method == "POST":
+            try:
+                payload = network_profile_payload()
+                payload["kind"] = profile["kind"]
+                result = enqueue(
+                    "PUT", f"/v1/network-profiles/{quote(profile_id, safe='')}", payload,
+                    f"Upravit network profil {profile_id[:12]}", "network-profile-update",
+                )
+                audit("network-profile.edit", profile_id)
+                flash_queued(result)
+                return redirect(url_for("network_profile_library"))
+            except RuntimeError as exc:
+                profile = {**profile, **network_profile_payload()}
+                return render_template("network_profile_editor.html", profile=profile, error=str(exc)), 400
+        return render_template("network_profile_editor.html", profile=profile, error=None)
+
+    @app.post("/network-profiles/<profile_id>/delete")
+    @login_required
+    def delete_network_profile(profile_id):
+        try:
+            result = enqueue(
+                "DELETE", f"/v1/network-profiles/{quote(profile_id, safe='')}", None,
+                f"Smazat network profil {profile_id[:12]}", "network-profile-delete",
+            )
+            audit("network-profile.delete", profile_id)
+            flash_queued(result)
+        except RuntimeError as exc:
+            flash(str(exc), "error")
+        return redirect(url_for("network_profile_library"))
 
     @app.get("/settings")
     @login_required
@@ -473,6 +669,121 @@ def create_app(test_config=None):
         except RuntimeError as exc:
             return render_template("settings.html", networking={}, error=str(exc))
 
+    @app.get("/firewall")
+    @login_required
+    def firewall():
+        try:
+            state = api("GET", "/v1/firewall")
+            return render_template("firewall.html", firewall=state, error=None)
+        except RuntimeError as exc:
+            return render_template("firewall.html", firewall={}, error=str(exc))
+
+    @app.get("/firewall/topology")
+    @login_required
+    def firewall_topology():
+        try:
+            state = api("GET", "/v1/firewall")
+            return jsonify({
+                "topology": state.get("topology", []),
+                "egress_groups": state.get("egress_groups", []),
+                "active_instances": state.get("active_instances", []),
+                "input_enforced": state.get("input_enforced", False),
+                "forward_enforced": state.get("forward_enforced", False),
+                "updated_at": state.get("topology_updated_at", ""),
+            })
+        except RuntimeError as exc:
+            return jsonify(error=str(exc)), 503
+
+    @app.post("/firewall/settings")
+    @login_required
+    def update_firewall_settings():
+        try:
+            result = enqueue("PUT", "/v1/firewall", {
+                "input_enforced": request.form.get("input_enforced") == "on",
+                "forward_enforced": request.form.get("forward_enforced") == "on",
+            }, "Použít globální firewall policy", "firewall-settings")
+            audit("firewall.settings", result.get("task_id", ""))
+            flash_queued(result)
+        except RuntimeError as exc:
+            flash(str(exc), "error")
+        return redirect(url_for("firewall"))
+
+    @app.post("/firewall/authorizations")
+    @login_required
+    def add_firewall_authorization():
+        try:
+            chains = [name for name in ("input", "forward")
+                      if request.form.get(f"chain_{name}") == "on"]
+            ttl = request.form.get("ttl_seconds", "").strip()
+            payload = {
+                "source": request.form.get("source", ""),
+                "chains": chains,
+                "label": request.form.get("label", ""),
+                "system": request.form.get("system", "admin-console"),
+                "register_source": request.form.get("register_source") == "on",
+                "instance_id": request.form.get("instance_id", ""),
+                "runtime_profile_id": request.form.get("runtime_profile_id", ""),
+                "user_id": request.form.get("user_id", "admin-console"),
+            }
+            if ttl:
+                payload["ttl_seconds"] = int(ttl)
+            result = enqueue("POST", "/v1/firewall/authorizations", payload,
+                             f"Autorizovat source {payload['source']}", "firewall-authorize")
+            audit("firewall.authorization.add", f"{payload['source']}:{result.get('task_id', '')}")
+            flash_queued(result)
+        except (RuntimeError, ValueError) as exc:
+            flash(str(exc), "error")
+        return redirect(url_for("firewall"))
+
+    @app.post("/firewall/instances/<instance_id>/sources")
+    @login_required
+    def attach_firewall_source(instance_id):
+        try:
+            source = request.form.get("source", "")
+            result = enqueue(
+                "POST", f"/v1/instances/{quote(instance_id, safe='')}/sources",
+                {"source": source}, f"Připojit source {source} k {instance_id[:12]}",
+                "instance-source-attach",
+            )
+            audit("instance.source.attach", f"{instance_id}:{source}")
+            flash_queued(result)
+        except RuntimeError as exc:
+            flash(str(exc), "error")
+        return redirect(url_for("firewall"))
+
+    @app.post("/firewall/authorizations/<authorization_id>/delete")
+    @login_required
+    def delete_firewall_authorization(authorization_id):
+        try:
+            result = enqueue(
+                "DELETE", f"/v1/firewall/authorizations/{quote(authorization_id, safe='')}",
+                None, f"Odebrat firewall autorizaci {authorization_id[:12]}",
+                "firewall-revoke",
+            )
+            audit("firewall.authorization.delete", authorization_id)
+            flash_queued(result)
+        except RuntimeError as exc:
+            flash(str(exc), "error")
+        return redirect(url_for("firewall"))
+
+    @app.post("/firewall/authorizations/<authorization_id>/extend")
+    @login_required
+    def extend_firewall_authorization(authorization_id):
+        try:
+            seconds = int(request.form.get("additional_seconds", "3600"))
+            result = enqueue(
+                "POST",
+                f"/v1/firewall/authorizations/{quote(authorization_id, safe='')}/extend",
+                {"additional_seconds": seconds},
+                f"Prodloužit firewall autorizaci {authorization_id[:12]} o {seconds} s",
+                "firewall-extend",
+            )
+            audit("firewall.authorization.extend", f"{authorization_id}:{seconds}")
+            flash_queued(result)
+        except (RuntimeError, ValueError) as exc:
+            flash(str(exc), "error")
+        return redirect(url_for("firewall"))
+
     @app.post("/settings/networking")
     @login_required
     def update_networking_settings():
@@ -482,10 +793,15 @@ def create_app(test_config=None):
                 if line.strip()
             ]
             result = enqueue("PUT", "/v1/settings/networking", {
+                "ingress_cidr": request.form.get("ingress_cidr", ""),
+                "ingress_cidr_v6": request.form.get("ingress_cidr_v6", ""),
                 "namespace_cidr": request.form.get("namespace_cidr", ""),
                 "allocation_prefix": 30,
+                "namespace_cidr_v6": request.form.get("namespace_cidr_v6", ""),
+                "allocation_prefix_v6": 126,
                 "egress_mode": request.form.get("egress_mode", "masquerade"),
                 "sas_route_via": request.form.get("sas_route_via", ""),
+                "sas_route_via_v6": request.form.get("sas_route_via_v6", ""),
                 "sas_interface": request.form.get("sas_interface", ""),
                 "route_table_start": int(request.form.get("route_table_start", "60000")),
                 "mark_start": int(request.form.get("mark_start", "268435456"), 0),
@@ -512,6 +828,13 @@ def create_app(test_config=None):
                 "cert_bundle_id": request.form.get("cert_bundle_id", ""),
                 "auto_restart": request.form.get("auto_restart") == "on",
                 "ttl_seconds": ttl_seconds,
+                "ingress_network_profile_id": request.form.get(
+                    "ingress_network_profile_id", ""
+                ),
+                "egress_network_profile_id": request.form.get(
+                    "egress_network_profile_id", ""
+                ),
+                "filesystem_mode": request.form.get("filesystem_mode", "host"),
             }, "Vytvořit runtime profil", "profile-create")
             audit("runtime-profile.create", result.get("task_id", ""))
             flash_queued(result)
@@ -526,13 +849,14 @@ def create_app(test_config=None):
             profile = api("GET", f"/v1/runtime-profiles/{quote(profile_id, safe='')}")
             status = api("GET", "/v1/status")
             bundles = api("GET", "/v1/cert-bundles")["bundles"]
+            network_profiles = api("GET", "/v1/network-profiles")["profiles"]
         except RuntimeError as exc:
             flash(str(exc), "error")
             return redirect(url_for("runtime_profiles"))
         if request.method == "GET":
             return render_template(
                 "runtime_profile_editor.html", profile=profile, status=status,
-                bundles=bundles, error=None,
+                bundles=bundles, network_profiles=network_profiles, error=None,
             )
         values = {}
         try:
@@ -546,6 +870,13 @@ def create_app(test_config=None):
                     None if request.form.get("ttl_unlimited") == "on"
                     else int(request.form.get("ttl_seconds", "1800"))
                 ),
+                "ingress_network_profile_id": request.form.get(
+                    "ingress_network_profile_id", ""
+                ),
+                "egress_network_profile_id": request.form.get(
+                    "egress_network_profile_id", ""
+                ),
+                "filesystem_mode": request.form.get("filesystem_mode", "host"),
             }
             result = enqueue("PUT", f"/v1/runtime-profiles/{quote(profile_id, safe='')}", values,
                              f"Upravit runtime profil {profile_id[:12]}", "profile-update")
@@ -555,8 +886,44 @@ def create_app(test_config=None):
         except (RuntimeError, ValueError) as exc:
             return render_template(
                 "runtime_profile_editor.html", profile={**profile, **values}, status=status,
-                bundles=bundles, error=str(exc),
+                bundles=bundles, network_profiles=network_profiles, error=str(exc),
             ), 400
+
+    @app.post("/runtime-profiles/<profile_id>/work-files")
+    @login_required
+    def upload_runtime_profile_work_file(profile_id):
+        try:
+            uploaded = request.files.get("file")
+            if not uploaded or not uploaded.filename:
+                raise RuntimeError("Vyber soubor pro /work.")
+            content = uploaded.read(40 * 1024 + 1)
+            if len(content) > 40 * 1024:
+                raise RuntimeError("Soubor pro /work může mít nejvýše 40 KiB.")
+            target = request.form.get("path", "").strip() or Path(uploaded.filename).name
+            result = api("PUT", f"/v1/runtime-profiles/{quote(profile_id, safe='')}/work-files", {
+                "path": target,
+                "mode": request.form.get("mode", "0600"),
+                "content_base64": base64.b64encode(content).decode("ascii"),
+            })
+            audit("runtime-profile.work-file.upload", f"{profile_id}:{result.get('path', target)}")
+            flash(f"Soubor /work/{result.get('path', target)} uložen.", "success")
+        except RuntimeError as exc:
+            flash(str(exc), "error")
+        return redirect(url_for("edit_runtime_profile", profile_id=profile_id))
+
+    @app.post("/runtime-profiles/<profile_id>/work-files/delete")
+    @login_required
+    def delete_runtime_profile_work_file(profile_id):
+        path = request.form.get("path", "")
+        try:
+            api("DELETE", f"/v1/runtime-profiles/{quote(profile_id, safe='')}/work-files", {
+                "path": path,
+            })
+            audit("runtime-profile.work-file.delete", f"{profile_id}:{path}")
+            flash(f"Soubor /work/{path} smazán.", "success")
+        except RuntimeError as exc:
+            flash(str(exc), "error")
+        return redirect(url_for("edit_runtime_profile", profile_id=profile_id))
 
     @app.get("/cert-bundles")
     @login_required
@@ -696,9 +1063,6 @@ def create_app(test_config=None):
         try:
             status = api("GET", "/v1/status")
             configs = api("GET", "/v1/configs")["configs"]
-            status["build"]["artifacts"] = artifact_library_view(
-                status["build"].get("artifacts", [])
-            )
             if request.method == "POST":
                 task = enqueue("POST", "/v1/config-observer", {
                     "build_id": selected_build,
@@ -794,6 +1158,7 @@ def create_app(test_config=None):
                 },
                 "config_mode": request.form.get("config_mode", "ro"),
                 "persistent": request.form.get("persistent") == "on",
+                "filesystem_mode": request.form.get("filesystem_mode", "host"),
                 "runtime_seconds": int(request.form.get("runtime_seconds", "3600")),
                 "parameters": {"socks_port": 1080, "plaintext_port": 50080, "tls_port": 50443,
                                "http_port": 3128, "cli_port": 50000,
@@ -1113,9 +1478,6 @@ def create_app(test_config=None):
             if task.get("kind") == "config-observer":
                 status = api("GET", "/v1/status")
                 configs = api("GET", "/v1/configs")["configs"]
-                status["build"]["artifacts"] = artifact_library_view(
-                    status["build"].get("artifacts", [])
-                )
                 return render_template(
                     "config_observer.html", status=status, configs=configs, result=result,
                     error=None, selected_build=result.get("build_id", ""),

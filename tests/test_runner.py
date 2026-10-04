@@ -1,6 +1,7 @@
 import json
 import gzip
 import hashlib
+import shutil
 import tempfile
 import unittest
 import uuid
@@ -18,11 +19,13 @@ from runner.config_library import ConfigLibrary
 from runner.config_previews import ConfigPreviewLibrary
 from runner.namespace import NamespaceBackend, parse_unit_status, systemd_timespan_microseconds
 from runner.network_settings import NetworkSettings
+from runner.network_profiles import NetworkProfileLibrary
 from runner.runtime_profiles import RuntimeProfileLibrary
 from runner.cert_library import CertBundleLibrary
 from runner.systemd import BackendError, UnitStatus
 from runner.task_queue import TaskQueue
 from runner.test_drive import TestDriveManager
+from runner.firewall import FirewallManager
 
 
 class FakeCliSocket:
@@ -76,6 +79,9 @@ class FakeBackend:
             raise BackendError("unit is unknown")
         self.extended_runtime = (unit, total_seconds)
 
+    def attach_source(self, instance_id, source_ip, profile, socks_port, http_port):
+        self.attached_source = (instance_id, source_ip, profile, socks_port, http_port)
+
     def status(self, unit):
         state = self.units.get(unit, "inactive")
         result = "exit-code" if state == "failed" else "success"
@@ -120,7 +126,7 @@ class FakeBackend:
         self.units[unit] = "active"
         egress = SimpleNamespace(
             namespace=f"cz-{drive_id[:8]}", guest_if="do0", guest_ip="10.0.0.2",
-            host_if=f"czh{drive_id[:8]}", host_ip="10.0.0.1", subnet="10.0.0.0/30",
+            host_if=f"czo{drive_id[:8]}", host_ip="10.0.0.1", subnet="10.0.0.0/30",
         )
         ingress = SimpleNamespace(
             namespace=f"cz-{drive_id[:8]}", guest_if="di0", guest_ip="10.0.0.6",
@@ -204,6 +210,25 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("--property=NoNewPrivileges=yes", command)
         self.assertTrue((workspace / "tmp").is_dir())
         self.assertTrue((workspace / "captures").is_dir())
+
+    def test_rootfs_execution_preserves_current_runtime_mountpoints(self):
+        root = Path(self.temp.name)
+        rootfs = root / "rootfs"
+        (rootfs / "usr/bin").mkdir(parents=True)
+        (rootfs / "usr/bin/smithproxy").write_bytes(b"binary")
+        config = root / "instances" / "instance-id" / "smithproxy.cfg"
+        config.parent.mkdir(parents=True)
+        config.write_text("settings={};", encoding="utf-8")
+        properties, executable = NamespaceBackend._rootfs_execution_properties(
+            config, str(rootfs),
+        )
+        self.assertEqual("/usr/bin/smithproxy", executable)
+        self.assertIn(f"--property=RootDirectory={rootfs}", properties)
+        self.assertIn("--property=MountAPIVFS=yes", properties)
+        self.assertIn("--property=WorkingDirectory=/work", properties)
+        self.assertIn(
+            f"--property=TemporaryFileSystem={config.parent.parent}", properties,
+        )
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -410,6 +435,19 @@ class RunnerTests(unittest.TestCase):
         with self.assertRaises(ConfigError):
             self.manager.create(payload)
 
+    def test_attach_additional_ipv6_source_to_live_instance(self):
+        item = self.manager.create({
+            "runtime_seconds": 30, "source_ip": "198.51.100.10",
+            "user_id": "test-user", "parameters": {"socks_port": 1080},
+        })
+        updated = self.manager.attach_source(item.id, "2001:db8::10")
+        self.assertEqual(["198.51.100.10", "2001:db8::10"], updated.source_ips)
+        self.assertEqual(
+            (item.id, "2001:db8::10", "custom", 1080, 3128),
+            self.backend.attached_source,
+        )
+        self.assertEqual(updated.source_ips, self.manager.get(item.id).source_ips)
+
     def test_create_records_and_passes_selected_build(self):
         selected_binary = Path(self.temp.name, "builds", "a" * 40, "smithproxy")
         selected_template = Path(self.temp.name, "selected.cfg")
@@ -424,6 +462,30 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual("b" * 40, item.config_id)
         self.assertEqual(str(selected_binary), self.backend.last_network["smithproxy_binary"])
         self.assertEqual(1, self.backend.native_save_calls)
+
+    def test_create_passes_prepared_rootfs_as_opt_in_variant(self):
+        selected_binary = Path(self.temp.name, "builds", "a" * 40, "smithproxy")
+        selected_template = Path(self.temp.name, "selected-rootfs.cfg")
+        selected_template.write_text('settings={ socks_port="{{SOCKS_PORT}}"; };')
+        rootfs = Path(self.temp.name, "rootfs")
+        rootfs.mkdir()
+        item = self.manager.create({
+            "runtime_seconds": 30, "source_ip": "198.51.100.10",
+            "user_id": "rootfs-user", "filesystem_mode": "rootfs",
+            "build_id": "a" * 40, "config_id": "b" * 40,
+            "parameters": {"socks_port": 1080},
+        }, selected_binary, selected_template, rootfs_path=rootfs)
+        self.assertEqual("rootfs", item.filesystem_mode)
+        self.assertEqual(str(rootfs), self.backend.last_network["rootfs_path"])
+
+    def test_build_default_config_profile_uses_transparent_dataplane(self):
+        item = self.manager.create({
+            "runtime_seconds": 30, "source_ip": "198.51.100.10",
+            "user_id": "default-config-user", "profile": "default",
+            "parameters": {"socks_port": 1080},
+        })
+        self.assertEqual("default", item.profile)
+        self.assertEqual("default", self.backend.last_network["profile"])
 
     def test_exact_runtime_preflight_rejects_before_backend_start(self):
         selected_binary = Path(self.temp.name, "builds", "smithproxy")
@@ -882,6 +944,28 @@ starttls_signatures = (
         with self.assertRaises(BackendError):
             builder.resolve_binary(f"{revision}-release")
 
+    def test_builder_prepares_verified_minimal_rootfs_without_executing_elf(self):
+        revision = "c" * 40
+        build_id = f"{revision}-release"
+        builder = SmithproxyBuilder(
+            Path(self.temp.name, "source"), Path(self.temp.name, "bin", "smithproxy")
+        )
+        artifact = builder.library_dir / build_id
+        artifact.mkdir(parents=True)
+        shutil.copy2("/bin/true", artifact / "smithproxy")
+        (artifact / "smithproxy").chmod(0o755)
+        info = builder.prepare_rootfs(build_id)
+        rootfs = Path(info["rootfs_path"])
+        self.assertTrue(info["rootfs_ready"])
+        self.assertTrue((rootfs / "usr/bin/smithproxy").is_file())
+        self.assertTrue((rootfs / "etc/passwd").is_file())
+        self.assertTrue(any(
+            path.is_file() and path.name.startswith("lib") and ".so" in path.name
+            for path in rootfs.rglob("*")
+        ))
+        first_created = info["rootfs_created_at"]
+        self.assertEqual(first_created, builder.prepare_rootfs(build_id)["rootfs_created_at"])
+
     def test_builder_accepts_explicit_parallelism(self):
         builder = SmithproxyBuilder(
             Path(self.temp.name, "source"), Path(self.temp.name, "bin", "smithproxy"), jobs=7,
@@ -1153,9 +1237,24 @@ starttls_signatures = (
         self.assertEqual("10.250.0.0/30", first.subnet)
         self.assertEqual("10.250.0.1", first.host_ip)
         self.assertEqual("10.250.0.2", first.guest_ip)
+        self.assertEqual("fd42:ca7:200::/126", first.subnet_v6)
+        self.assertEqual("fd42:ca7:200::1", first.host_ip_v6)
+        self.assertEqual("fd42:ca7:200::2", first.guest_ip_v6)
         self.assertEqual("10.250.0.4/30", second.subnet)
         self.assertEqual("routed", first.egress_mode)
         self.assertEqual("eth1", first.sas_interface)
+        self.assertEqual("do0", first.guest_if)
+        self.assertTrue(first.host_if.startswith("czo"))
+        ingress_id = backend.ingress_id(first_id)
+        ingress = backend._allocate(ingress_id, "ingress", first_id)
+        self.assertEqual("10.100.0.0/30", ingress.subnet)
+        self.assertEqual("fd42:ca7:100::/126", ingress.subnet_v6)
+        self.assertEqual("di0", ingress.guest_if)
+        self.assertTrue(ingress.host_if.startswith("czi"))
+        self.assertEqual(first.namespace, ingress.namespace)
+        self.assertNotEqual(first.route_table, ingress.route_table)
+        self.assertNotEqual(first.mark, ingress.mark)
+        self.assertEqual(2, settings.view()["allocated_instances"])
         self.assertEqual(first, backend.allocation(first_id))
         self.assertEqual("ip route add 10.250.0.0/29 via 192.0.2.10",
                          settings.view()["sas_route_command"])
@@ -1193,17 +1292,131 @@ starttls_signatures = (
         self.assertIsNone(item["ttl_seconds"])
         updated = library.update(
             item["profile_id"], "Magic next", "b" * 40, str(uuid.uuid4()), "bundle-id",
-            ttl_seconds=900,
+            ttl_seconds=900, filesystem_mode="rootfs",
         )
         self.assertEqual(item["profile_id"], updated["profile_id"])
         self.assertEqual("Magic next", updated["name"])
         self.assertEqual("b" * 40, updated["build_id"])
         self.assertEqual(900, updated["ttl_seconds"])
+        self.assertEqual("rootfs", updated["filesystem_mode"])
         self.assertTrue(updated["updated_at"])
+        work_file = library.put_work_file(
+            item["profile_id"], "ssh/id_ed25519", b"private-key\n", 0o600,
+        )
+        self.assertEqual("ssh/id_ed25519", work_file["path"])
+        self.assertEqual("0600", work_file["mode"])
+        destination = Path(self.temp.name, "instance-work")
+        destination.mkdir()
+        library.install_work_files(item["profile_id"], destination)
+        installed = destination / "ssh" / "id_ed25519"
+        self.assertEqual(b"private-key\n", installed.read_bytes())
+        self.assertEqual(0o600, installed.stat().st_mode & 0o777)
+        with self.assertRaises(BackendError):
+            library.put_work_file(item["profile_id"], "../escape", b"no")
+        with self.assertRaises(BackendError):
+            library.put_work_file(item["profile_id"], "smithproxy.cfg", b"no")
         document = json.loads(Path(self.temp.name, "runtime-profiles.json").read_text())
         self.assertEqual(item["profile_id"], document["profiles"][0]["profile_id"])
         self.assertEqual(item["profile_id"], library.delete(item["profile_id"])["profile_id"])
         self.assertEqual([], library.list())
+        self.assertFalse((library.work_root / item["profile_id"]).exists())
+
+    def test_network_profiles_are_atomic_composable_bindings(self):
+        library = NetworkProfileLibrary(Path(self.temp.name, "network-profiles.json"))
+        ingress = library.create({
+            "kind": "ingress", "name": "Authorized source · dual",
+            "description": "current dataplane", "address_family": "dual",
+            "driver": "split-veth", "selector": "source",
+            "require_authorization": True, "interface_name": "di0",
+            "destination_cidrs": [],
+        })
+        egress = library.create({
+            "kind": "egress", "name": "Routed via lab uplink",
+            "description": "current dataplane with an override",
+            "address_family": "dual", "driver": "split-veth",
+            "mode": "routed", "interface_name": "do0",
+            "host_interface": "lab0",
+        })
+        self.assertTrue(ingress["implemented"])
+        self.assertTrue(egress["implemented"])
+        design = library.create({
+            "kind": "ingress", "name": "Destination design",
+            "driver": "split-veth", "selector": "destination",
+            "address_family": "dual", "interface_name": "di0",
+            "require_authorization": True,
+            "destination_cidrs": ["10.10.0.9/24"],
+        })
+        self.assertEqual("10.10.0.0/24", design["destination_cidrs"][0])
+        self.assertFalse(design["implemented"])
+        updated = library.update(egress["network_profile_id"], {
+            **egress, "name": "Masquerade via lab uplink", "mode": "masquerade",
+        })
+        self.assertEqual("masquerade", updated["mode"])
+        with self.assertRaisesRegex(BackendError, "destination selector"):
+            library.create({
+                "kind": "ingress", "name": "Broken destination",
+                "driver": "split-veth", "selector": "destination",
+                "address_family": "dual", "interface_name": "di0",
+                "require_authorization": True, "destination_cidrs": [],
+            })
+        document = json.loads(Path(self.temp.name, "network-profiles.json").read_text())
+        self.assertEqual(1, document["schema"])
+        self.assertEqual(3, len(document["profiles"]))
+        self.assertEqual(
+            ingress["network_profile_id"],
+            library.delete(ingress["network_profile_id"])["network_profile_id"],
+        )
+
+    def test_firewall_renders_scoped_input_and_instance_forward_allowlists(self):
+        applied = []
+        firewall = FirewallManager(
+            Path(self.temp.name, "firewall.json"), executor=applied.append,
+        )
+        firewall.apply("10.200.0.0/16", ["198.51.100.10"])
+        self.assertIn("table inet capture_zone_access", applied[-1])
+        self.assertNotIn("SAS INPUT deny", applied[-1])
+        firewall.update_settings(True, True, "10.200.0.0/16", ["198.51.100.10"])
+        item = firewall.add({
+            "source": "203.0.113.40", "chains": ["input", "forward"],
+            "system": "capture-portal", "label": "user session", "ttl_seconds": 300,
+        }, "10.200.0.0/16", ["198.51.100.10"], registered_source=True)
+        ruleset = applied[-1]
+        self.assertIn("203.0.113.40/32", ruleset)
+        self.assertIn("oifname \"czi*\"", ruleset)
+        self.assertIn("ip saddr 10.200.0.0/16 accept", ruleset)
+        self.assertIn("ip6 saddr @input_sources_v6 accept", ruleset)
+        self.assertIn("ip6 saddr fd42:ca7:200::/64 accept", ruleset)
+        ipv6_item = firewall.add({
+            "source": "2001:db8::40", "chains": ["input", "forward"],
+            "system": "capture-portal", "label": "IPv6 session", "ttl_seconds": 300,
+        }, "10.200.0.0/16", ["198.51.100.10"])
+        self.assertIn("2001:db8::40/128", applied[-1])
+        self.assertTrue(firewall.view("10.200.0.0/16", ["198.51.100.10"])[
+            "authorizations"
+        ][0]["active"])
+        refreshed = firewall.add({
+            "source": "203.0.113.40", "chains": ["input", "forward"],
+            "system": "capture-portal", "label": "refreshed session", "ttl_seconds": 600,
+        }, "10.200.0.0/16", ["198.51.100.10"])
+        self.assertEqual(item["authorization_id"], refreshed["authorization_id"])
+        self.assertEqual("refreshed session", refreshed["label"])
+        self.assertEqual(2, len(firewall.load()["authorizations"]))
+        previous_expiry = datetime.fromisoformat(refreshed["expires_at"])
+        extended = firewall.extend(
+            item["authorization_id"], 300,
+            "10.200.0.0/16", ["198.51.100.10"],
+        )
+        self.assertEqual(
+            previous_expiry + timedelta(seconds=300),
+            datetime.fromisoformat(extended["expires_at"]),
+        )
+        self.assertEqual(item["authorization_id"], firewall.delete(
+            item["authorization_id"], "10.200.0.0/16", ["198.51.100.10"],
+        )["authorization_id"])
+        firewall.delete(
+            ipv6_item["authorization_id"], "10.200.0.0/16", ["198.51.100.10"],
+        )
+        self.assertEqual([], firewall.load()["authorizations"])
 
     def test_certificate_library_generates_real_ca_and_leaf(self):
         library = CertBundleLibrary(Path(self.temp.name, "cert-library"))

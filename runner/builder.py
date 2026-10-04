@@ -21,6 +21,10 @@ from .config import PARAMETERS, TOKEN_RE, render_template
 REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40,64}$")
 BUILD_ID_RE = re.compile(r"^([0-9a-f]{40,64})-(release|debug)$")
+READELF_NEEDED_RE = re.compile(r"\(NEEDED\).*Shared library: \[([^]]+)]")
+READELF_INTERPRETER_RE = re.compile(r"Requesting program interpreter: ([^]]+)")
+LDCONFIG_RE = re.compile(r"^\s*(\S+)\s+\([^)]*\)\s+=>\s+(/\S+)\s*$")
+ROOTFS_SCHEMA = 2
 
 
 @dataclass
@@ -50,6 +54,7 @@ class SmithproxyBuilder:
         self.source_dir = source_dir
         self.output = output
         self.library_dir = output.parent / "builds"
+        self.rootfs_library_dir = output.parent / "rootfs"
         self.native_cache_dir = native_cache_dir or output.parent / "native-config-cache"
         self.repository = repository
         self.config_library = config_library
@@ -246,6 +251,7 @@ class SmithproxyBuilder:
                     "commit_at": str(metadata.get("commit_at", "")),
                     "build_type": str(metadata.get("build_type", "Release")),
                     "size_bytes": binary.stat().st_size,
+                    **self.rootfs_info(path.name, binary),
                 })
             except (OSError, ValueError, TypeError):
                 continue
@@ -308,6 +314,7 @@ class SmithproxyBuilder:
             if target.parent != self.library_dir or not target.is_dir():
                 raise BackendError("archived build path is unavailable")
             shutil.rmtree(target)
+            shutil.rmtree(self.rootfs_library_dir / build_id, ignore_errors=True)
             cache_key = self.native_cache_key(
                 item.get("commit_id", ""), item.get("ref", ""),
                 item.get("build_type", "Release"),
@@ -315,6 +322,209 @@ class SmithproxyBuilder:
             shutil.rmtree(self.native_cache_dir / cache_key, ignore_errors=True)
             self._prune_default_configs(self.artifacts())
             return item
+
+    @staticmethod
+    def _file_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def rootfs_info(self, build_id: str, binary: Path | None = None) -> dict[str, Any]:
+        """Describe a verified optional rootfs without creating it."""
+        root = self.rootfs_library_dir / build_id
+        try:
+            metadata = json.loads((root / "rootfs.json").read_text(encoding="utf-8"))
+            selected_binary = binary or self.resolve_binary(build_id)
+            wanted = self._file_sha256(selected_binary)
+            ready = (
+                metadata.get("schema") == ROOTFS_SCHEMA
+                and metadata.get("build_id") == build_id
+                and metadata.get("binary_sha256") == wanted
+                and (root / "usr/bin/smithproxy").is_file()
+            )
+            return {
+                "rootfs_ready": bool(ready),
+                "rootfs_path": str(root) if ready else "",
+                "rootfs_size_bytes": int(metadata.get("size_bytes", 0)) if ready else 0,
+                "rootfs_created_at": str(metadata.get("created_at", "")) if ready else "",
+            }
+        except (OSError, ValueError, TypeError, json.JSONDecodeError, BackendError):
+            return {
+                "rootfs_ready": False, "rootfs_path": "",
+                "rootfs_size_bytes": 0, "rootfs_created_at": "",
+            }
+
+    @staticmethod
+    def _readelf(path: Path, *arguments: str) -> str:
+        try:
+            completed = subprocess.run(
+                ["readelf", *arguments, str(path)], capture_output=True, text=True,
+                timeout=30, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise BackendError(f"cannot inspect ELF dependency metadata: {exc}") from exc
+        if completed.returncode:
+            raise BackendError(
+                (completed.stderr or completed.stdout).strip()[-2000:]
+                or "readelf rejected the selected binary"
+            )
+        return completed.stdout
+
+    @classmethod
+    def _elf_dependencies(cls, path: Path) -> tuple[list[str], str, list[str]]:
+        dynamic = cls._readelf(path, "-d")
+        program = cls._readelf(path, "-l")
+        needed = READELF_NEEDED_RE.findall(dynamic)
+        interpreter_match = READELF_INTERPRETER_RE.search(program)
+        interpreter = interpreter_match.group(1) if interpreter_match else ""
+        runpaths = []
+        for line in dynamic.splitlines():
+            if "(RPATH)" not in line and "(RUNPATH)" not in line:
+                continue
+            match = re.search(r"Library (?:rpath|runpath): \[([^]]*)]", line)
+            if match:
+                runpaths.extend(item for item in match.group(1).split(":") if item)
+        return needed, interpreter, runpaths
+
+    @staticmethod
+    def _library_cache() -> dict[str, list[Path]]:
+        try:
+            completed = subprocess.run(
+                ["ldconfig", "-p"], capture_output=True, text=True,
+                timeout=30, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise BackendError(f"cannot inspect host library cache: {exc}") from exc
+        if completed.returncode:
+            raise BackendError(completed.stderr.strip() or "ldconfig -p failed")
+        result: dict[str, list[Path]] = {}
+        for line in completed.stdout.splitlines():
+            match = LDCONFIG_RE.match(line)
+            if match:
+                result.setdefault(match.group(1), []).append(Path(match.group(2)))
+        return result
+
+    @classmethod
+    def _resolve_elf_closure(cls, binary: Path) -> tuple[set[Path], Path | None]:
+        """Resolve DT_NEEDED recursively from metadata; never execute the ELF."""
+        cache = cls._library_cache()
+        resolved: set[Path] = set()
+        pending = [binary]
+        interpreter: Path | None = None
+        while pending:
+            current = pending.pop()
+            needed, current_interpreter, runpaths = cls._elf_dependencies(current)
+            if current == binary and current_interpreter:
+                interpreter = Path(current_interpreter)
+                if not interpreter.is_file():
+                    raise BackendError("ELF interpreter is unavailable on this host")
+            origin = current.parent
+            search = []
+            for raw in runpaths:
+                expanded = raw.replace("$ORIGIN", str(origin)).replace("${ORIGIN}", str(origin))
+                if expanded.startswith("/"):
+                    search.append(Path(expanded))
+            for name in needed:
+                candidates = [directory / name for directory in search]
+                candidates.extend(cache.get(name, []))
+                dependency = next((item for item in candidates if item.is_file()), None)
+                if dependency is None:
+                    raise BackendError(f"rootfs dependency is unavailable: {name}")
+                destination_identity = Path(os.path.abspath(dependency))
+                if destination_identity not in resolved:
+                    resolved.add(destination_identity)
+                    pending.append(dependency.resolve())
+        return resolved, interpreter
+
+    @staticmethod
+    def _copy_rootfs_file(source: Path, root: Path, destination: Path | None = None) -> None:
+        target = root / str(destination or source).lstrip("/")
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+        shutil.copy2(source.resolve(), target, follow_symlinks=True)
+
+    def prepare_rootfs(self, build_id: str) -> dict[str, Any]:
+        """Create an atomic minimal RootDirectory tree for one archived build."""
+        if not BUILD_ID_RE.fullmatch(build_id):
+            raise BackendError("rootfs mode requires an archived Release or Debug build")
+        binary = self.resolve_binary(build_id)
+        current = self.rootfs_info(build_id, binary)
+        if current["rootfs_ready"]:
+            return current
+        with self.lock:
+            current = self.rootfs_info(build_id, binary)
+            if current["rootfs_ready"]:
+                return current
+            self.rootfs_library_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            target = self.rootfs_library_dir / build_id
+            temporary = self.rootfs_library_dir / f".{build_id}.new"
+            previous = self.rootfs_library_dir / f".{build_id}.old"
+            shutil.rmtree(temporary, ignore_errors=True)
+            shutil.rmtree(previous, ignore_errors=True)
+            for relative in (
+                "usr/bin", "etc", "etc/ssl/certs", "run", "tmp", "work",
+                "var/tmp", "var/smithproxy/data", "proc", "sys", "dev",
+            ):
+                (temporary / relative).mkdir(parents=True, exist_ok=True, mode=0o755)
+            (temporary / "var/run").symlink_to("../run")
+            # Preserve the existing absolute read-only build mount. Runtime
+            # configs and diagnostics may legitimately refer to this path.
+            (temporary / str(binary.parent).lstrip("/")).mkdir(
+                parents=True, exist_ok=True, mode=0o755
+            )
+            self._copy_rootfs_file(binary, temporary, Path("/usr/bin/smithproxy"))
+            dependencies, interpreter = self._resolve_elf_closure(binary)
+            for dependency in sorted(dependencies, key=str):
+                self._copy_rootfs_file(dependency, temporary)
+            if interpreter:
+                self._copy_rootfs_file(interpreter, temporary)
+            for name in ("nsswitch.conf", "hosts", "resolv.conf", "services", "protocols"):
+                source = Path("/etc") / name
+                if source.is_file():
+                    self._copy_rootfs_file(source, temporary)
+            (temporary / "etc/passwd").write_text("root:x:0:0:root:/root:/usr/sbin/nologin\n")
+            (temporary / "etc/group").write_text("root:x:0:\n")
+            host_certificates = Path("/etc/ssl/certs")
+            if host_certificates.is_dir():
+                shutil.copytree(
+                    host_certificates, temporary / "etc/ssl/certs",
+                    dirs_exist_ok=True, symlinks=True,
+                )
+            # OpenSSL providers are loaded with dlopen() and consequently do
+            # not appear in DT_NEEDED. Preserve their absolute host paths.
+            for provider_root in Path("/usr/lib").glob("*/ossl-modules"):
+                if provider_root.is_dir():
+                    shutil.copytree(
+                        provider_root,
+                        temporary / str(provider_root).lstrip("/"),
+                        dirs_exist_ok=True, symlinks=True,
+                    )
+            total_size = sum(
+                item.stat().st_size for item in temporary.rglob("*")
+                if item.is_file() and not item.is_symlink()
+            )
+            metadata = {
+                "schema": ROOTFS_SCHEMA, "build_id": build_id,
+                "binary_sha256": self._file_sha256(binary),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "entrypoint": "/usr/bin/smithproxy",
+                "size_bytes": total_size,
+            }
+            (temporary / "rootfs.json").write_text(
+                json.dumps(metadata, separators=(",", ":")) + "\n", encoding="utf-8"
+            )
+            if target.exists():
+                target.replace(previous)
+            temporary.replace(target)
+            shutil.rmtree(previous, ignore_errors=True)
+            return self.rootfs_info(build_id, binary)
+
+    def resolve_rootfs(self, build_id: str) -> Path:
+        info = self.rootfs_info(build_id)
+        if not info["rootfs_ready"]:
+            raise BackendError("selected build rootfs is unavailable; save the profile again")
+        return Path(info["rootfs_path"])
 
     def resolve_config(self, config_id: str) -> Path:
         if config_id == "active":
@@ -440,8 +650,19 @@ class SmithproxyBuilder:
             ).start()
             return asdict(self.state)
 
-    def _command(self, command: list[str], cwd: Path | None = None) -> str:
+    def _command(self, command: list[str], cwd: Path | None = None,
+                 timeout: int | None = None) -> str:
         effective = command
+        if command and command[0] == "git":
+            # Build workers run as root and intentionally do not inherit the
+            # interactive user's SSH agent.  Public GitHub submodules may
+            # still be recorded as git@github.com URLs; rewrite only those to
+            # HTTPS so a deleted submodule can be reconstructed unattended.
+            effective = [
+                "git", "-c",
+                "url.https://github.com/.insteadOf=git@github.com:",
+                *command[1:],
+            ]
         if command[:2] == ["cmake", "--build"]:
             # Keep all requested compiler jobs, but let the API/web processes
             # win CPU and I/O scheduling immediately under load.
@@ -449,8 +670,26 @@ class SmithproxyBuilder:
             if shutil.which("ionice"):
                 effective += ["ionice", "-c", "2", "-n", "7"]
             effective += command
-        completed = subprocess.run(effective, cwd=cwd, capture_output=True, text=True,
-                                   timeout=1800, check=False)
+        if timeout is None:
+            timeout = 600 if command and command[0] == "git" else 1800
+        try:
+            completed = subprocess.run(
+                effective, cwd=cwd, capture_output=True, text=True,
+                timeout=timeout, check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            partial = "\n".join(filter(None, [
+                exc.stdout if isinstance(exc.stdout, str) else "",
+                exc.stderr if isinstance(exc.stderr, str) else "",
+            ])).strip()
+            with self.lock:
+                self.state.log = (
+                    self.state.log + "\n$ " + " ".join(command) + "\n"
+                    + partial + f"\ncommand timed out after {timeout}s"
+                )[-100_000:]
+            raise BackendError(
+                f"{command[0]} timed out after {timeout}s"
+            ) from exc
         output = (completed.stdout + "\n" + completed.stderr).strip()
         with self.lock:
             self.state.log = (self.state.log + "\n$ " + " ".join(command) + "\n" + output)[-100_000:]

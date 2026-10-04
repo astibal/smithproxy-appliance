@@ -1,0 +1,66 @@
+<aside class="network-driver-guide network-driver-guide-{{ kind }}" data-network-driver-guide="{{ kind }}" aria-live="polite">
+  <div class="network-driver-guide-head">
+    <div><span class="eyebrow">TOPOLOGIE DRIVERU</span><b>Co tato volba udělá v dataplane</b></div>
+    <span class="network-driver-state" data-driver-state></span>
+  </div>
+
+  {% if kind == 'ingress' %}
+  <div class="network-driver-panel" data-driver-panel="split-veth">
+    <div class="network-driver-flow">
+      <div class="network-driver-node source"><small>ZDROJ</small><strong>authorized IP</strong><span>IPv4 / IPv6</span></div>
+      <i class="network-driver-arrow"><span>paket</span></i>
+      <div class="network-driver-node policy"><small>HOST POLICY</small><strong>nft + fwmark</strong><span>výběr podle <b data-driver-match-label>source IP</b></span></div>
+      <i class="network-driver-arrow"><span>route</span></i>
+      <div class="network-driver-node namespace"><small>INSTANCE NETNS</small><strong><span data-interface-label>di0</span> · Smithproxy</strong><span>ingress veth <code>czi*</code></span></div>
+    </div>
+    <p><b>Split-veth</b> nechá host vybrat namespace podle selectoru a pošle paket samostatným <code>di0</code>. Produkčně je nyní realizovaný source selector; ostatní kombinace zůstávají návrhem.</p>
+  </div>
+  <section class="network-selector-guide" data-selector-guide>
+    <div class="network-selector-head">
+      <div><span class="eyebrow">MATCH SELECTOR</span><b>Podle čeho vybrat cestu do instance</b></div>
+      <code data-selector-state>SOURCE</code>
+    </div>
+    <div class="network-selector-panel" data-selector-panel="source">
+      <div class="network-selector-flow">
+        <div class="network-packet"><small>PAKET · <span data-family-label>DUAL</span></small><span class="is-match"><i>SRC</i><b data-source-label>authorized IP</b></span><span><i>DST</i><b>libovolný cíl</b></span></div>
+        <i class="network-driver-arrow"><span>match src</span></i>
+        <div class="network-selector-rule"><small>SELECTOR</small><strong>source IP</strong><span>identita provozu určuje instanci</span></div>
+        <i class="network-driver-arrow"><span>route</span></i>
+        <div class="network-driver-node namespace"><small>VÝSLEDEK</small><strong>1 instance</strong><span>per-source binding</span></div>
+      </div>
+      <p>Rozhoduje pouze zdroj. Cíl může být libovolný; stejná source IP patří v daném okamžiku jedné vybrané cestě.</p>
+    </div>
+    <div class="network-selector-panel" data-selector-panel="destination" hidden>
+      <div class="network-selector-flow">
+        <div class="network-packet"><small>PAKET · <span data-family-label>DUAL</span></small><span><i>SRC</i><b>libovolný zdroj</b></span><span class="is-match"><i>DST</i><b data-destination-label>destination CIDR</b></span></div>
+        <i class="network-driver-arrow"><span>match dst</span></i>
+        <div class="network-selector-rule"><small>SELECTOR</small><strong>destination CIDR</strong><span>cílová síť určuje instanci</span></div>
+        <i class="network-driver-arrow"><span>route</span></i>
+        <div class="network-driver-node namespace"><small>VÝSLEDEK</small><strong>1 instance</strong><span>per-destination binding</span></div>
+      </div>
+      <p>Rozhoduje cílová adresa. Více klientů může sdílet stejnou instanci, pokud míří do některého CIDR tohoto profilu.</p>
+    </div>
+    <div class="network-selector-panel" data-selector-panel="source-destination" hidden>
+      <div class="network-selector-flow">
+        <div class="network-packet"><small>PAKET · <span data-family-label>DUAL</span></small><span class="is-match"><i>SRC</i><b data-source-label>authorized IP</b></span><span class="is-match"><i>DST</i><b data-destination-label>destination CIDR</b></span></div>
+        <i class="network-driver-arrow"><span>src + dst</span></i>
+        <div class="network-selector-rule compound"><small>SELECTOR · AND</small><strong>oba musí sedět</strong><span>source ∩ destination</span></div>
+        <i class="network-driver-arrow"><span>route</span></i>
+        <div class="network-driver-node namespace"><small>VÝSLEDEK</small><strong>přesná cesta</strong><span>nejpřísnější binding</span></div>
+      </div>
+      <p>Pravidlo platí jen při současné shodě zdroje i cíle. Jiná cílová síť ani jiný klient tuto cestu nepoužije.</p>
+    </div>
+  </section>
+  {% else %}
+  <div class="network-driver-panel" data-driver-panel="split-veth">
+    <div class="network-driver-flow">
+      <div class="network-driver-node namespace"><small>INSTANCE NETNS</small><strong>Smithproxy</strong><span>oddělený datový tok</span></div>
+      <i class="network-driver-arrow"><span>egress</span></i>
+      <div class="network-driver-node egress-port"><small>DEDICATED OUT</small><strong><span data-interface-label>do0</span></strong><span>samostatný veth pár</span></div>
+      <i class="network-driver-arrow"><span data-egress-effect>MASQUERADE</span></i>
+      <div class="network-driver-node uplink"><small>UPLINK</small><strong data-uplink-label>global route</strong><span>SAS host</span></div>
+    </div>
+    <p><b>Split-veth</b> vyvádí provoz samostatným <code>do0</code>. Ingress a egress mají oddělené adresní pooly, routy i diagnostiku.</p>
+  </div>
+  {% endif %}
+</aside>

@@ -87,8 +87,135 @@ jejich obsah. Bundle se váže k runtime profilu přes `cert_bundle_id`.
 GET /v1/sources
 ```
 
-Vrací administrátorem nakonfigurované adresy a jejich dostupnost. Jedna source
-IP může mít nejvýše jednu aktivní instanci.
+Vrací administrátorem nakonfigurované IPv4/IPv6 adresy a jejich dostupnost.
+Jedna source IP může být připojena k více živým instancím; konkrétní výsledná
+cesta je dána per-instance nft routingem.
+
+## Globální INPUT / FORWARD firewall
+
+Runner spravuje pouze vlastní nft tabulku `inet capture_zone_access`; cizí
+iptables/nftables pravidla neimportuje ani nepřepisuje.
+
+```http
+GET    /v1/firewall
+PUT    /v1/firewall
+POST   /v1/firewall/authorizations
+POST   /v1/firewall/authorizations/{authorization_id}/extend
+DELETE /v1/firewall/authorizations/{authorization_id}
+POST   /v1/instances/{instance_id}/sources
+```
+
+Enforcement je po prvním nasazení vypnutý. `PUT` jej zapíná nezávisle:
+
+```json
+{"input_enforced":false,"forward_enforced":true}
+```
+
+Automatická autorizace z jiného Capture Zone systému:
+
+```json
+{
+  "source": "198.51.100.24",
+  "chains": ["forward"],
+  "system": "capture-zone-portal",
+  "label": "user 4711",
+  "ttl_seconds": 1800,
+  "register_source": true,
+  "runtime_profile_id": "profile-uuid",
+  "user_id": "4711"
+}
+```
+
+Místo `runtime_profile_id` lze poslat `instance_id` a připojit adresu k živé
+instanci; obě pole současně jsou chyba. Profilový spawn používá pouze uložený
+runtime profil, nikoli volně dodanou dvojici binárka/config.
+
+`register_source` u jedné IPv4 nebo IPv6 současně přidá adresu do spawn source poolu.
+CIDR lze autorizovat ve firewallu, ale nelze jej registrovat jako jednu spawn
+adresu. INPUT enforcement povoluje loopback, established/related a explicitní
+INPUT zdroje. FORWARD enforcement se vztahuje jen na ingress do rozhraní
+`czi*`; established návraty a egress přes `czo*` zůstávají povolené. IPv4 a
+IPv6 mají samostatné nft interval sety. Nové instance dostávají dva páry
+`/30` + `/126`: ingress `czi* ↔ di0` a egress `do0 ↔ czo*`.
+`extend` přijímá `{"additional_seconds":3600}`. U živého záznamu přičte čas
+k existující expiraci, u expirovaného počítá nový deadline od okamžiku volání.
+Trvalou autorizaci bez expirace prodloužit nelze.
+
+## Ingress / egress síťové profily
+
+Síťový profil je samostatná, stateless JSON položka. Runtime profil skládá
+binárku, Smithproxy config, volitelný cert bundle a právě jeden ingress a jeden
+egress profil. Prázdná vazba znamená globální/default split-veth networking.
+
+```http
+GET    /v1/network-profiles
+POST   /v1/network-profiles
+GET    /v1/network-profiles/{id}
+PUT    /v1/network-profiles/{id}
+DELETE /v1/network-profiles/{id}
+```
+
+Jediný driver je `split-veth`: ingress vždy používá `di0`, egress vždy `do0`.
+Pro ingress je nyní realizovaný `selector: source`, povinná autorizace a
+dual-stack. Egress může zvolit `masquerade|routed` a host uplink. Destination
+selektory a single-family položky se ukládají jako návrh s
+`implemented: false`; spawn je bezpečně odmítne.
+
+```json
+{
+  "kind": "ingress",
+  "name": "Authorized source · dual",
+  "driver": "split-veth",
+  "selector": "source",
+  "address_family": "dual",
+  "interface_name": "di0",
+  "require_authorization": true,
+  "destination_cidrs": []
+}
+```
+
+```json
+{
+  "kind": "egress",
+  "name": "Routed via lab uplink",
+  "driver": "split-veth",
+  "mode": "routed",
+  "address_family": "dual",
+  "interface_name": "do0",
+  "host_interface": "lab0"
+}
+```
+
+Použitý síťový profil nelze smazat, dokud na něj odkazuje runtime profil.
+Změna katalogové položky se týká až nových spawnů; běžící instance drží svůj
+síťový snapshot.
+
+## Volitelný Smithproxy rootfs
+
+Runtime profil má `filesystem_mode: "host"|"rootfs"`. Výchozí `host` zachovává
+dosavadní systemd filesystem sandbox. `rootfs` připraví pro zvolený archivovaný
+build minimální immutable adresářový strom a spustí Smithproxy s
+`RootDirectory=`. Jde o opt-in variantu; existující profily se automaticky
+nepřevádějí.
+
+Dependency closure vzniká pouze z ELF metadat přes `readelf` a host linker
+cache; analyzovaná binárka se při balení nespouští. Rootfs obsahuje vlastní
+`/usr/bin/smithproxy`, dynamický loader, transitivní knihovny, CA trust a
+OpenSSL provider moduly. Manifest je svázán SHA-256 hashem archivované binárky.
+Změna binárky tedy rootfs automaticky zneplatní.
+
+Stávající runtime mountpointy zůstávají stejné:
+
+```text
+per-instance run      -> /run
+per-instance workspace-> /work
+per-instance capture  -> /var/smithproxy/data
+workspace             -> původní absolutní runtime cesta
+build directory       -> původní absolutní read-only cesta
+```
+
+Rootfs se vytvoří při uložení rootfs runtime profilu nebo líně uvnitř
+background spawn tasku. Běžící host-sandbox instance tím nejsou ovlivněné.
 
 ## Instance
 
