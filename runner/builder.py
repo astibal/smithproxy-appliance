@@ -24,7 +24,7 @@ BUILD_ID_RE = re.compile(r"^([0-9a-f]{40,64})-(release|debug)$")
 READELF_NEEDED_RE = re.compile(r"\(NEEDED\).*Shared library: \[([^]]+)]")
 READELF_INTERPRETER_RE = re.compile(r"Requesting program interpreter: ([^]]+)")
 LDCONFIG_RE = re.compile(r"^\s*(\S+)\s+\([^)]*\)\s+=>\s+(/\S+)\s*$")
-ROOTFS_SCHEMA = 3
+ROOTFS_SCHEMA = 4
 
 
 @dataclass
@@ -446,6 +446,39 @@ class SmithproxyBuilder:
         target.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
         shutil.copy2(source.resolve(), target, follow_symlinks=True)
 
+    @staticmethod
+    def _copy_rootfs_certificates(source: Path, target: Path) -> None:
+        """Snapshot CApath without links escaping the isolated filesystem.
+
+        Keep OpenSSL hash links, but materialize certificates whose distro
+        links point to /usr/share or /usr/local/share. No host bind is needed.
+        """
+        source = source.resolve()
+        shutil.copytree(source, target, dirs_exist_ok=True, symlinks=True)
+        for entry in source.rglob("*"):
+            if not entry.is_symlink():
+                continue
+            try:
+                resolved = entry.resolve(strict=True)
+                if not resolved.is_file():
+                    raise ValueError("certificate link is not a regular file")
+                raw = Path(os.readlink(entry))
+                lexical = Path(os.path.abspath(raw if raw.is_absolute() else entry.parent / raw))
+                destination = target / entry.relative_to(source)
+                destination.unlink()
+                if lexical.is_relative_to(source):
+                    # Rebase absolute internal links too: they must not resolve
+                    # against the host while inspecting/exporting this image.
+                    internal = target / lexical.relative_to(source)
+                    destination.symlink_to(os.path.relpath(internal, destination.parent))
+                else:
+                    shutil.copy2(resolved, destination)
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise BackendError(f"cannot package CA certificate {entry}: {exc}") from exc
+        for entry in target.rglob("*"):
+            if entry.is_symlink() and (not entry.is_file() or not entry.resolve().is_relative_to(target.resolve())):
+                raise BackendError(f"invalid packaged CA certificate link: {entry}")
+
     def prepare_rootfs(self, build_id: str) -> dict[str, Any]:
         """Create an atomic minimal RootDirectory tree for one archived build."""
         if not BUILD_ID_RE.fullmatch(build_id):
@@ -502,10 +535,7 @@ class SmithproxyBuilder:
             (temporary / "etc/group").write_text("root:x:0:\n")
             host_certificates = Path("/etc/ssl/certs")
             if host_certificates.is_dir():
-                shutil.copytree(
-                    host_certificates, temporary / "etc/ssl/certs",
-                    dirs_exist_ok=True, symlinks=True,
-                )
+                self._copy_rootfs_certificates(host_certificates, temporary / "etc/ssl/certs")
             # OpenSSL providers are loaded with dlopen() and consequently do
             # not appear in DT_NEEDED. Preserve their absolute host paths.
             for provider_root in Path("/usr/lib").glob("*/ossl-modules"):
