@@ -8,6 +8,7 @@ import uuid
 import subprocess
 import threading
 import time
+from unittest.mock import patch
 from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -20,6 +21,7 @@ from runner.config_previews import ConfigPreviewLibrary
 from runner.namespace import NamespaceBackend, parse_unit_status, systemd_timespan_microseconds
 from runner.network_settings import NetworkSettings
 from runner.network_profiles import NetworkProfileLibrary
+from runner.headless_endpoints import HeadlessEndpointLibrary
 from runner.runtime_profiles import RuntimeProfileLibrary
 from runner.cert_library import CertBundleLibrary
 from runner.systemd import BackendError, UnitStatus
@@ -79,7 +81,8 @@ class FakeBackend:
             raise BackendError("unit is unknown")
         self.extended_runtime = (unit, total_seconds)
 
-    def attach_source(self, instance_id, source_ip, profile, socks_port, http_port):
+    def attach_source(self, instance_id, source_ip, profile, socks_port, http_port,
+                      tls_port=50443, plaintext_port=50080):
         self.attached_source = (instance_id, source_ip, profile, socks_port, http_port)
 
     def status(self, unit):
@@ -487,12 +490,14 @@ class RunnerTests(unittest.TestCase):
             "ingress_network_profile_id": ingress_id,
             "egress_network_profile_id": egress_id,
             "network_egress_mode": "routed",
+            "network_egress_driver": "on-a-stick",
             "network_sas_interface": "lab0",
             "parameters": {"socks_port": 1080},
         })
         self.assertEqual(ingress_id, item.ingress_network_profile_id)
         self.assertEqual(egress_id, item.egress_network_profile_id)
         self.assertEqual("routed", self.backend.last_network["egress_mode"])
+        self.assertEqual("on-a-stick", self.backend.last_network["egress_driver"])
         self.assertEqual("lab0", self.backend.last_network["sas_interface"])
 
     def test_build_default_config_profile_uses_transparent_dataplane(self):
@@ -566,13 +571,13 @@ class RunnerTests(unittest.TestCase):
             "parameters": {"socks_port": 1080},
         })
         item.state = "failed"
-        item.pid = 999999
+        item.members = [{"role": "smithproxy", "pid": 999999, "rss_bytes": 1}]
         item.resources_cleaned = True
         self.manager._save(item)
         current = self.manager.get(item.id)
         self.assertEqual("running", current.state)
-        self.assertEqual(4242, current.pid)
-        self.assertEqual(64 * 1024, current.rss_bytes)
+        self.assertEqual(4242, current.members[0]["pid"])
+        self.assertEqual(64 * 1024, current.slice_rss_bytes)
         self.assertFalse(current.resources_cleaned)
 
     def test_reconcile_clears_dead_pid_and_marks_cleanup(self):
@@ -581,13 +586,13 @@ class RunnerTests(unittest.TestCase):
             "user_id": "test-user",
             "parameters": {"socks_port": 1080},
         })
-        item.pid = 4242
+        item.members = [{"role": "smithproxy", "pid": 4242, "rss_bytes": 64 * 1024}]
         self.manager._save(item)
         self.backend.units[item.unit] = "inactive"
         current = self.manager.get(item.id)
-        self.assertEqual(0, current.pid)
+        self.assertEqual([], current.members)
         self.assertTrue(current.resources_cleaned)
-        self.assertEqual(0, current.rss_bytes)
+        self.assertEqual(0, current.slice_rss_bytes)
 
     def test_auto_restart_preserves_resources_and_records_crash(self):
         item = self.manager.create({
@@ -595,7 +600,7 @@ class RunnerTests(unittest.TestCase):
             "user_id": "test-user", "auto_restart": True,
             "parameters": {"socks_port": 1080},
         })
-        item.pid = 4242
+        item.members = [{"role": "smithproxy", "pid": 4242, "rss_bytes": 64 * 1024}]
         self.manager._save(item)
         self.backend.units[item.unit] = "failed"
         current = self.manager.get(item.id)
@@ -694,7 +699,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual("active", self.backend.units[unit])
         discovered = self.manager.get(orphan_id)
         self.assertEqual("orphaned", discovered.state)
-        self.assertEqual(4242, discovered.pid)
+        self.assertEqual(4242, discovered.members[0]["pid"])
 
     def test_rejects_unknown_parameter(self):
         with self.assertRaises(ConfigError):
@@ -975,6 +980,8 @@ starttls_signatures = (
         rootfs = Path(info["rootfs_path"])
         self.assertTrue(info["rootfs_ready"])
         self.assertTrue((rootfs / "usr/bin/smithproxy").is_file())
+        self.assertTrue((rootfs / "bin/sh").is_file())
+        self.assertTrue((rootfs / "opt/sas/bin").is_dir())
         self.assertTrue((rootfs / "etc/passwd").is_file())
         self.assertTrue(any(
             path.is_file() and path.name.startswith("lib") and ".so" in path.name
@@ -1287,6 +1294,135 @@ starttls_signatures = (
         settings.release(first_id)
         reused = backend._allocate(str(uuid.uuid4()))
         self.assertEqual("10.250.0.0/30", reused.subnet)
+        self.assertEqual("10.240.0.1", first.fabric_ip)
+        self.assertEqual("fd42:ca7:240::1", first.fabric_ip_v6)
+        self.assertEqual(1, first.tuntom_tunnel_id)
+
+    def test_on_a_stick_uses_only_di0_for_ingress_and_proxy_egress(self):
+        settings = NetworkSettings(
+            Path(self.temp.name, "stick-network.json"),
+            Path(self.temp.name, "stick-allocations.json"),
+        )
+        backend = NamespaceBackend("/bin/true", network_settings=settings)
+        backend._live_subnets = lambda: set()
+        commands = []
+        backend._run = lambda command, **_kwargs: commands.append(command)
+        instance_id = str(uuid.uuid4())
+        workspace = Path(self.temp.name, "stick-runtime", instance_id)
+        workspace.mkdir(parents=True)
+        config = workspace / "smithproxy.cfg"
+        config.write_text("settings = {};", encoding="utf-8")
+        completed = SimpleNamespace(returncode=0, stdout="", stderr="")
+        with patch("runner.namespace.subprocess.run", return_value=completed):
+            backend.start(
+                instance_id, config, 60, source_ip="198.51.100.10",
+                smithproxy_binary="/bin/true", egress_driver="on-a-stick",
+            )
+        rendered = [" ".join(command) for command in commands]
+        self.assertFalse(any("do0" in command or "czo" in command for command in rendered))
+        self.assertTrue(any("route add default" in command and "dev di0" in command
+                            for command in rendered))
+        allocation = backend.allocation(instance_id)
+        self.assertEqual("on-a-stick", allocation.topology)
+        self.assertEqual("di0", allocation.guest_if)
+
+    def test_tuntom_via_uses_adapter_owned_tuns_without_host_veth(self):
+        settings = NetworkSettings(
+            Path(self.temp.name, "via-network.json"),
+            Path(self.temp.name, "via-allocations.json"),
+        )
+        backend = NamespaceBackend("/bin/true", network_settings=settings)
+        backend._live_subnets = lambda: set()
+        commands = []
+        backend._run = lambda command, **_kwargs: commands.append(command)
+        backend._setup_fabric_link = lambda allocation, switch_ip: commands.append(
+            ["fabric-link", allocation.fabric_if, switch_ip]
+        )
+        relay_socket = Path(self.temp.name, "relay.sock")
+        relay_calls = []
+        backend._start_tuntom_relay = lambda *args, **kwargs: (
+            relay_calls.append(args) or backend.tuntom_relay_unit_name(args[0]), relay_socket
+        )
+        backend._start_tuntom_adapter = lambda *args, **kwargs: (
+            commands.append(["tuntom-adapter", args[0], args[1]])
+            or backend.tuntom_unit_name(args[0])
+        )
+        instance_id = str(uuid.uuid4())
+        workspace = Path(self.temp.name, "via-runtime", instance_id)
+        workspace.mkdir(parents=True)
+        config = workspace / "smithproxy.cfg"
+        config.write_text("settings = {};", encoding="utf-8")
+        completed = SimpleNamespace(returncode=0, stdout="", stderr="")
+        with patch("runner.namespace.subprocess.run", return_value=completed):
+            backend.start(
+                instance_id, config, 60, source_ip="198.51.100.10",
+                smithproxy_binary="/bin/true", egress_driver="tuntom-via",
+                egress_mode="routed", tuntom_switch_ip="192.0.2.10",
+                tuntom_secret="a" * 32, tuntom_tunnel_id=77,
+            )
+        rendered = [" ".join(command) for command in commands]
+        self.assertTrue(any(command.startswith("tuntom-adapter") for command in rendered))
+        self.assertFalse(any("type veth" in command for command in rendered))
+        self.assertTrue(any("route add default dev do0" in command for command in rendered))
+        self.assertTrue(any("198.51.100.10/32 dev di0" in command for command in rendered))
+        self.assertEqual("tuntom-via", backend.allocation(instance_id).topology)
+        self.assertEqual(77, backend.allocation(instance_id).tuntom_tunnel_id)
+        self.assertEqual(77, relay_calls[0][5])
+
+    def test_tuntom_adapter_unit_uses_via_identity_and_unique_attachments(self):
+        backend = NamespaceBackend()
+        adapter = Path(self.temp.name, "tuntom-divert-adapter")
+        adapter.write_text("#!/bin/sh\n", encoding="utf-8")
+        adapter.chmod(0o700)
+        socket_path = Path(self.temp.name, "via.sock")
+        commands = []
+        backend._run = lambda command, **_kwargs: commands.append(command)
+        completed = SimpleNamespace(returncode=0, stdout="active\n", stderr="")
+        instance_id = "12345678-1234-1234-1234-123456789abc"
+        with patch("runner.namespace.subprocess.run", return_value=completed), \
+                patch("runner.namespace.Path.is_socket", return_value=True):
+            unit = backend._start_tuntom_adapter(
+                instance_id, "cz-12345678", str(adapter), str(socket_path),
+                "proxy-in-", "proxy-out-", "immediate", 1400, 120,
+                Path(self.temp.name, "via-run"),
+            )
+        command = commands[0]
+        self.assertEqual("capture-zone-tuntom-adapter-12345678-1234-1234-1234-123456789abc.service", unit)
+        self.assertIn("sas#12345678", command)
+        self.assertIn("proxy-in-12345678", command)
+        self.assertIn("proxy-out-12345678", command)
+        self.assertIn("--property=NetworkNamespacePath=/run/netns/cz-12345678", command)
+        self.assertIn(
+            "--slice=capture-zone-slice-12345678-1234-1234-1234-123456789abc.slice",
+            command,
+        )
+
+    def test_tuntom_relay_uses_credential_not_secret_argv(self):
+        backend = NamespaceBackend()
+        binary = Path(self.temp.name, "tuntom")
+        binary.write_text("#!/bin/sh\n", encoding="utf-8")
+        binary.chmod(0o700)
+        via_run = Path(self.temp.name, "relay-run")
+        commands = []
+        backend._run = lambda command, **_kwargs: commands.append(command)
+        instance_id = "12345678-1234-1234-1234-123456789abc"
+        with patch("runner.namespace.Path.is_socket", return_value=True):
+            unit, socket_path = backend._start_tuntom_relay(
+                instance_id, "cz-12345678", str(binary), "192.0.2.10",
+                "a" * 32, 42, 1400, 120, via_run,
+            )
+        command = commands[0]
+        rendered = " ".join(command)
+        self.assertEqual(backend.tuntom_relay_unit_name(instance_id), unit)
+        self.assertEqual(via_run / "relay.sock", socket_path)
+        self.assertNotIn("a" * 32, rendered)
+        self.assertIn("LoadCredential=tuntom-secret:", rendered)
+        self.assertIn("192.0.2.10", command)
+        self.assertIn("42", command)
+        self.assertEqual(
+            "a" * 32,
+            (via_run.parent / ".credentials" / "tuntom-secret").read_text().strip(),
+        )
 
     def test_arbitrary_declared_placeholder_is_required_and_rendered(self):
         self.template.write_text('settings={ target="{{TARGET_HOST}}"; };')
@@ -1356,6 +1492,60 @@ starttls_signatures = (
         })
         self.assertTrue(ingress["implemented"])
         self.assertTrue(egress["implemented"])
+        stick = library.create({
+            "kind": "egress", "name": "Return on ingress link",
+            "address_family": "dual", "driver": "on-a-stick",
+            "mode": "routed", "interface_name": "di0",
+        })
+        self.assertTrue(stick["implemented"])
+        self.assertEqual("di0", stick["interface_name"])
+        tuntom = library.create({
+            "kind": "egress", "name": "VIA service link",
+            "address_family": "dual", "driver": "tuntom-via",
+            "mode": "routed", "interface_name": "do0",
+            "tuntom_socket": "/run/tuntom/via.sock",
+            "tuntom_build_id": "a" * 40 + "-release",
+            "tuntom_in_prefix": "proxy-in-", "tuntom_out_prefix": "proxy-out-",
+            "tuntom_admission": "immediate", "tuntom_mtu": 1400,
+        })
+        self.assertTrue(tuntom["implemented"])
+        self.assertEqual(1400, tuntom["tuntom_mtu"])
+        self.assertEqual(["ingress", "egress"], tuntom["consumes"])
+        self.assertEqual(
+            ["headless_endpoint_id"], tuntom["start_parameters"]
+        )
+        self.assertEqual(
+            tuntom["network_profile_id"],
+            library.get(tuntom["network_profile_id"], "ingress")["network_profile_id"],
+        )
+        tuntom_in = library.create({
+            "kind": "ingress", "name": "Encrypted ingress",
+            "address_family": "dual", "driver": "tuntom",
+            "selector": "source", "require_authorization": True,
+            "interface_name": "di0", "destination_cidrs": [],
+            "tuntom_build_id": "b" * 40 + "-release", "tuntom_mtu": 1400,
+        })
+        tuntom_out = library.create({
+            "kind": "egress", "name": "Encrypted egress",
+            "address_family": "dual", "driver": "tuntom",
+            "mode": "routed", "interface_name": "do0",
+            "tuntom_build_id": "b" * 40 + "-release", "tuntom_mtu": 1400,
+        })
+        self.assertEqual(["ingress"], tuntom_in["consumes"])
+        self.assertEqual(["egress"], tuntom_out["consumes"])
+        self.assertEqual(
+            ["tuntom_local_ip", "tuntom_peer_ip", "tuntom_peer_host", "tuntom_secret"],
+            tuntom_in["start_parameters"],
+        )
+        self.assertFalse(tuntom_in["implemented"])
+        self.assertFalse(tuntom_out["implemented"])
+        blackbox = library.create({
+            "kind": "egress", "name": "Blackbox return link",
+            "address_family": "dual", "driver": "blackbox-link",
+            "mode": "routed", "interface_name": "do0",
+        })
+        self.assertFalse(blackbox["implemented"])
+        self.assertEqual("blackbox-link", blackbox["driver"])
         design = library.create({
             "kind": "ingress", "name": "Destination design",
             "driver": "split-veth", "selector": "destination",
@@ -1378,11 +1568,46 @@ starttls_signatures = (
             })
         document = json.loads(Path(self.temp.name, "network-profiles.json").read_text())
         self.assertEqual(1, document["schema"])
-        self.assertEqual(3, len(document["profiles"]))
+        self.assertEqual(8, len(document["profiles"]))
         self.assertEqual(
             ingress["network_profile_id"],
             library.delete(ingress["network_profile_id"])["network_profile_id"],
         )
+
+    def test_headless_endpoint_package_is_atomic_and_single_owner(self):
+        library = HeadlessEndpointLibrary(Path(self.temp.name, "headless-endpoints.json"))
+        package_id = str(uuid.uuid4())
+        item = library.create({
+            "package_id": package_id, "kind": "tuntom-via", "name": "port 17",
+            "fabric_port_id": "fabric-a/proxy-17", "switch_ip": "2001:db8::10",
+            "tunnel_id": 17, "secret": "ab" * 16,
+        })
+        self.assertEqual("available", item["state"])
+        self.assertNotIn("secret", item)
+        reserved = library.reserve(package_id, "spawn-one")
+        self.assertEqual("ab" * 16, reserved["secret"])
+        with self.assertRaisesRegex(BackendError, "already owned"):
+            library.reserve(package_id, "spawn-two")
+        bound = library.bind(package_id, "spawn-one", str(uuid.uuid4()))
+        self.assertEqual("bound", bound["state"])
+        with self.assertRaisesRegex(BackendError, "cannot be deleted"):
+            library.delete(package_id)
+
+    def test_headless_endpoint_identity_cannot_be_imported_twice(self):
+        library = HeadlessEndpointLibrary(Path(self.temp.name, "headless-endpoints.json"))
+        base = {
+            "package_id": str(uuid.uuid4()), "kind": "tuntom-via", "name": "one",
+            "fabric_port_id": "fabric-a/proxy-17", "switch_ip": "192.0.2.10",
+            "tunnel_id": 17, "secret": "cd" * 16,
+        }
+        library.create(base)
+        with self.assertRaisesRegex(BackendError, "Fabric port"):
+            library.create({**base, "package_id": str(uuid.uuid4()), "name": "two"})
+        with self.assertRaisesRegex(BackendError, "tunnel ID"):
+            library.create({
+                **base, "package_id": str(uuid.uuid4()), "name": "three",
+                "fabric_port_id": "fabric-a/proxy-18",
+            })
 
     def test_firewall_renders_scoped_input_and_instance_forward_allowlists(self):
         applied = []
@@ -1408,6 +1633,24 @@ starttls_signatures = (
             "system": "capture-portal", "label": "IPv6 session", "ttl_seconds": 300,
         }, "10.200.0.0/16", ["198.51.100.10"])
         self.assertIn("2001:db8::40/128", applied[-1])
+        selected = firewall.add({
+            "source": "203.0.113.41", "chains": ["input", "forward"],
+            "system": "capture-portal", "protocol": "tcp",
+            "destination": "10.20.30.40", "ports": "443, 8000-8010",
+        }, "10.200.0.0/16", ["198.51.100.10"])
+        self.assertEqual(["443", "8000-8010"], selected["ports"])
+        self.assertIn("ip saddr 203.0.113.41/32 ip daddr 10.20.30.40/32 tcp dport { 443, 8000-8010 }", applied[-1])
+        self.assertIn('oifname "czi*" ip saddr 203.0.113.41/32', applied[-1])
+        with self.assertRaises(ConfigError):
+            firewall.add({
+                "source": "203.0.113.42", "chains": ["forward"],
+                "system": "capture-portal", "protocol": "any", "ports": "443",
+            }, "10.200.0.0/16", [])
+        with self.assertRaises(ConfigError):
+            firewall.add({
+                "source": "203.0.113.42", "chains": ["forward"],
+                "system": "capture-portal", "destination": "2001:db8::1",
+            }, "10.200.0.0/16", [])
         self.assertTrue(firewall.view("10.200.0.0/16", ["198.51.100.10"])[
             "authorizations"
         ][0]["active"])
@@ -1417,7 +1660,7 @@ starttls_signatures = (
         }, "10.200.0.0/16", ["198.51.100.10"])
         self.assertEqual(item["authorization_id"], refreshed["authorization_id"])
         self.assertEqual("refreshed session", refreshed["label"])
-        self.assertEqual(2, len(firewall.load()["authorizations"]))
+        self.assertEqual(3, len(firewall.load()["authorizations"]))
         previous_expiry = datetime.fromisoformat(refreshed["expires_at"])
         extended = firewall.extend(
             item["authorization_id"], 300,
@@ -1432,6 +1675,9 @@ starttls_signatures = (
         )["authorization_id"])
         firewall.delete(
             ipv6_item["authorization_id"], "10.200.0.0/16", ["198.51.100.10"],
+        )
+        firewall.delete(
+            selected["authorization_id"], "10.200.0.0/16", ["198.51.100.10"],
         )
         self.assertEqual([], firewall.load()["authorizations"])
 

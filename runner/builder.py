@@ -24,7 +24,7 @@ BUILD_ID_RE = re.compile(r"^([0-9a-f]{40,64})-(release|debug)$")
 READELF_NEEDED_RE = re.compile(r"\(NEEDED\).*Shared library: \[([^]]+)]")
 READELF_INTERPRETER_RE = re.compile(r"Requesting program interpreter: ([^]]+)")
 LDCONFIG_RE = re.compile(r"^\s*(\S+)\s+\([^)]*\)\s+=>\s+(/\S+)\s*$")
-ROOTFS_SCHEMA = 2
+ROOTFS_SCHEMA = 3
 
 
 @dataclass
@@ -343,6 +343,8 @@ class SmithproxyBuilder:
                 and metadata.get("build_id") == build_id
                 and metadata.get("binary_sha256") == wanted
                 and (root / "usr/bin/smithproxy").is_file()
+                and (root / "bin/sh").is_file()
+                and (root / "opt/sas/bin").is_dir()
             )
             return {
                 "rootfs_ready": bool(ready),
@@ -463,7 +465,7 @@ class SmithproxyBuilder:
             shutil.rmtree(temporary, ignore_errors=True)
             shutil.rmtree(previous, ignore_errors=True)
             for relative in (
-                "usr/bin", "etc", "etc/ssl/certs", "run", "tmp", "work",
+                "usr/bin", "bin", "opt/sas/bin", "etc", "etc/ssl/certs", "run", "tmp", "work",
                 "var/tmp", "var/smithproxy/data", "proc", "sys", "dev",
             ):
                 (temporary / relative).mkdir(parents=True, exist_ok=True, mode=0o755)
@@ -479,6 +481,19 @@ class SmithproxyBuilder:
                 self._copy_rootfs_file(dependency, temporary)
             if interpreter:
                 self._copy_rootfs_file(interpreter, temporary)
+            # VIA components load their systemd credential through a tiny
+            # shell wrapper. Keep the shell and its ELF closure in the base
+            # image; the selected immutable Tuntom binaries are mounted RO by
+            # their individual units.
+            shell = Path("/bin/sh").resolve()
+            if not shell.is_file():
+                raise BackendError("rootfs shell is unavailable on this host")
+            self._copy_rootfs_file(shell, temporary, Path("/bin/sh"))
+            shell_dependencies, shell_interpreter = self._resolve_elf_closure(shell)
+            for dependency in sorted(shell_dependencies, key=str):
+                self._copy_rootfs_file(dependency, temporary)
+            if shell_interpreter:
+                self._copy_rootfs_file(shell_interpreter, temporary)
             for name in ("nsswitch.conf", "hosts", "resolv.conf", "services", "protocols"):
                 source = Path("/etc") / name
                 if source.is_file():

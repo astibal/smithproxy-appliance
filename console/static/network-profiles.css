@@ -1,6 +1,9 @@
 /* Composable ingress / egress policy catalogue. */
 .network-profile-compose{display:grid;grid-template-columns:1fr 1fr;gap:14px;align-items:start}
 .network-profile-compose>.panel{margin:0}
+.network-profile-side-locked{position:relative;border-color:#9b7b3e!important;background:linear-gradient(135deg,#15150c,#091510)!important;box-shadow:inset 4px 0 0 #c79b50}
+.network-profile-side-locked:after{content:"VIA OWNS IN + OUT";position:absolute;top:12px;right:14px;padding:3px 7px;border:1px solid #8e6f34;background:#3a2c12;color:#f1cf82;font:700 8px "Cascadia Mono","JetBrains Mono",Consolas,monospace;letter-spacing:.8px}
+.network-profile-side-locked select:disabled,.network-profile-side-locked input:disabled,.network-profile-side-locked textarea:disabled{opacity:.8;cursor:not-allowed}
 .network-profile-compose .section-head code{color:#72d9b2}
 .network-profile-fields{display:grid;grid-template-columns:1fr 1fr;gap:11px}
 .network-cidrs{min-height:105px}
@@ -14,6 +17,12 @@
 .network-binding{padding:10px 12px;border-left:3px solid #3f9e7a;background:#071a14}
 .network-binding.egress{border-left-color:#7793c9}
 .network-binding small{display:block;margin-top:5px;color:var(--muted);font:10px "Cascadia Mono","JetBrains Mono",Consolas,monospace}
+.network-binding-consumed{opacity:.78;border-left-color:#c79b50!important}
+.network-binding-consumed select{cursor:not-allowed;background-image:repeating-linear-gradient(135deg,transparent 0,transparent 7px,rgba(199,155,80,.08) 7px,rgba(199,155,80,.08) 14px)}
+.network-binding-owner{border-left-color:#59dcb0!important;box-shadow:inset 0 0 0 1px rgba(89,220,176,.14)}
+.network-start-contract{align-self:end;min-height:42px;padding:8px 10px;border:1px dashed #2d6d58;background:#051611}
+.network-start-contract b,.network-start-contract small{display:block}
+.network-start-contract code{display:block;margin:3px 0;color:#65e6b4}
 .runtime-binding-line{display:flex;flex-wrap:wrap;align-items:center;gap:7px;margin:10px 0 8px;padding:8px 10px;border:1px solid var(--line);background:#04110e;font:11px "Cascadia Mono","JetBrains Mono",Consolas,monospace}
 .runtime-binding-line span{padding:2px 5px;background:#153f32;color:#94efd0;font-size:9px;font-weight:700}
 .runtime-binding-line b{font-size:11px;color:#bde7d7}
@@ -31,21 +40,22 @@
 .network-driver-state.is-design{border-color:#8c6a2f;background:#493918;color:#f0cf85}
 .network-driver-panel{padding:12px}
 .network-driver-panel[hidden]{display:none}
-.network-driver-flow{display:grid;grid-template-columns:minmax(112px,1fr) 54px minmax(132px,1.25fr) 54px minmax(125px,1.1fr);align-items:stretch}
-.network-driver-node{display:grid;align-content:center;min-height:72px;padding:10px 12px;border:1px solid color-mix(in srgb,var(--driver-accent) 55%,#17352c);background:#071812}
+.network-driver-flow{display:flex;align-items:stretch;min-width:0}
+.network-driver-node{display:grid;align-content:center;flex:1 1 0;min-width:0;min-height:78px;padding:12px 14px;border:1px solid color-mix(in srgb,var(--driver-accent) 55%,#17352c);background:#071812}
 .network-driver-guide-egress .network-driver-node{background:#08161a}
 .network-driver-node small{color:#6fa58f;font:700 8px "Cascadia Mono","JetBrains Mono",Consolas,monospace;letter-spacing:1px}
 .network-driver-node strong{margin:4px 0;color:#d9f4e9;font-size:13px}
 .network-driver-node span{color:#7ea393;font-size:10px}
 .network-driver-node code{color:var(--driver-accent)}
 .network-driver-node.policy,.network-driver-node.ingress-port,.network-driver-node.egress-port{border-color:var(--driver-accent);box-shadow:inset 3px 0 0 color-mix(in srgb,var(--driver-accent) 65%,transparent)}
-.network-driver-arrow{position:relative;display:flex;align-items:center;justify-content:center;color:#6ba78f;font:8px "Cascadia Mono","JetBrains Mono",Consolas,monospace;font-style:normal;text-transform:uppercase}
+.network-driver-arrow{position:relative;display:flex;flex:0 0 54px;align-items:center;justify-content:center;color:#6ba78f;font:8px "Cascadia Mono","JetBrains Mono",Consolas,monospace;font-style:normal;text-transform:uppercase}
 .network-driver-arrow:before{content:"";position:absolute;left:5px;right:10px;top:50%;border-top:1px solid var(--driver-accent)}
 .network-driver-arrow:after{content:"";position:absolute;right:5px;top:calc(50% - 4px);border-left:7px solid var(--driver-accent);border-top:4px solid transparent;border-bottom:4px solid transparent}
 .network-driver-arrow span{position:relative;top:-12px;padding:1px 4px;background:#061510;z-index:1}
 .network-driver-guide-egress .network-driver-arrow span{background:#08161a}
 .network-driver-panel>p{margin:10px 0 0;color:#8faea2;font-size:11px;line-height:1.45}
 .network-driver-panel>p b{color:var(--driver-accent)}
+.blackbox-driver-panel{background:#09151d}.blackbox-node{border-color:#a879d6;background:#181121}.network-blackbox-return{margin-top:8px;padding:6px 10px;border:1px dashed #8f69b5;background:#17101f;color:#d5b5f1;text-align:center;font:700 9px "Cascadia Mono","JetBrains Mono",Consolas,monospace;letter-spacing:.8px}
 .network-selector-guide{margin:0 12px 12px;border:1px solid #1c493a;background:#04100d}
 .network-selector-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:9px 11px;border-bottom:1px solid #153a2e}
 .network-selector-head>div{display:grid;gap:2px}.network-selector-head b{font-size:12px}.network-selector-head .eyebrow{font-size:8px}
@@ -62,4 +72,4 @@
 .network-selector-rule.compound{border-color:#cfaa61;box-shadow:inset 3px 0 0 #b98c3c;background:#28200f}
 .network-selector-rule small{color:#6fa58f;font:700 8px "Cascadia Mono","JetBrains Mono",Consolas,monospace;letter-spacing:1px}.network-selector-rule strong{margin:4px 0;color:#d9f4e9;font-size:12px}.network-selector-rule span{color:#7ea393;font-size:10px}
 .network-selector-panel>p{margin:9px 0 0;color:#829e93;font-size:10px;line-height:1.45}
-@media(max-width:900px){.network-profile-compose{grid-template-columns:1fr}.network-profile-fields{grid-template-columns:1fr}.network-profile-row{grid-template-columns:1fr}.network-profile-row>.actions{justify-content:flex-start}.runtime-binding-line{align-items:flex-start;flex-direction:column}.network-driver-flow,.network-selector-flow{grid-template-columns:1fr}.network-driver-arrow{min-height:30px}.network-driver-arrow:before{left:50%;right:auto;top:4px;bottom:9px;border-top:0;border-left:1px solid var(--driver-accent)}.network-driver-arrow:after{right:auto;left:calc(50% - 4px);top:auto;bottom:3px;border-left:4px solid transparent;border-right:4px solid transparent;border-top:7px solid var(--driver-accent);border-bottom:0}.network-driver-arrow span{top:0;left:30px}}
+@media(max-width:900px){.network-profile-compose{grid-template-columns:1fr}.network-profile-fields{grid-template-columns:1fr}.network-profile-row{grid-template-columns:1fr}.network-profile-row>.actions{justify-content:flex-start}.runtime-binding-line{align-items:flex-start;flex-direction:column}.network-driver-flow{flex-direction:column}.network-selector-flow{grid-template-columns:1fr}.network-driver-arrow{flex:0 0 30px;min-height:30px}.network-driver-arrow:before{left:50%;right:auto;top:4px;bottom:9px;border-top:0;border-left:1px solid var(--driver-accent)}.network-driver-arrow:after{right:auto;left:calc(50% - 4px);top:auto;bottom:3px;border-left:4px solid transparent;border-right:4px solid transparent;border-top:7px solid var(--driver-accent);border-bottom:0}.network-driver-arrow span{top:0;left:30px}}

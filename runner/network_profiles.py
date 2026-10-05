@@ -14,6 +14,8 @@ from .systemd import BackendError
 
 
 SAFE_INTERFACE = re.compile(r"[A-Za-z0-9_.-]{1,15}")
+SAFE_ATTACHMENT = re.compile(r"[A-Za-z0-9_.-]{1,32}")
+TUNTOM_BUILD_ID = re.compile(r"^[0-9a-f]{40,64}-(?:release|debug)$")
 
 
 class NetworkProfileLibrary:
@@ -93,8 +95,8 @@ class NetworkProfileLibrary:
             item = cls._base(payload, kind)
             driver = str(payload.get("driver", "split-veth"))
             selector = str(payload.get("selector", "source"))
-            if driver != "split-veth":
-                raise BackendError("ingress driver must be split-veth")
+            if driver not in {"split-veth", "tuntom"}:
+                raise BackendError("ingress driver must be split-veth or tuntom")
             if selector not in {"source", "destination", "source-destination"}:
                 raise BackendError("unsupported ingress selector")
             authorization = payload.get("require_authorization", True)
@@ -102,7 +104,16 @@ class NetworkProfileLibrary:
                 raise BackendError("require_authorization must be boolean")
             interface = cls._interface(payload.get("interface_name"), "di0")
             if interface != "di0":
-                raise BackendError("split-veth ingress interface must be di0")
+                raise BackendError(f"{driver} ingress interface must be di0")
+            tuntom_build_id = str(payload.get("tuntom_build_id", "")).strip()
+            if driver == "tuntom" and not TUNTOM_BUILD_ID.fullmatch(tuntom_build_id):
+                raise BackendError("tuntom ingress requires an archived tuntom build")
+            try:
+                tuntom_mtu = int(payload.get("tuntom_mtu", 1500))
+            except (TypeError, ValueError) as exc:
+                raise BackendError("tuntom MTU must be an integer") from exc
+            if not 576 <= tuntom_mtu <= 9000:
+                raise BackendError("tuntom MTU must be between 576 and 9000")
             cidrs = cls._cidrs(payload.get("destination_cidrs", []))
             if selector != "source" and not cidrs:
                 raise BackendError("destination selector requires at least one destination CIDR")
@@ -110,8 +121,16 @@ class NetworkProfileLibrary:
                 "driver": driver, "selector": selector,
                 "require_authorization": authorization,
                 "interface_name": interface, "destination_cidrs": cidrs,
+                "tuntom_build_id": tuntom_build_id,
+                "tuntom_mtu": tuntom_mtu,
+                "consumes": ["ingress"],
+                "start_parameters": (
+                    ["tuntom_local_ip", "tuntom_peer_ip", "tuntom_peer_host", "tuntom_secret"]
+                    if driver == "tuntom" else []
+                ),
                 "implemented": (
-                    selector == "source" and interface == "di0" and authorization
+                    driver == "split-veth" and selector == "source"
+                    and interface == "di0" and authorization
                     and item["address_family"] == "dual"
                 ),
             })
@@ -120,21 +139,70 @@ class NetworkProfileLibrary:
             item = cls._base(payload, kind)
             driver = str(payload.get("driver", "split-veth"))
             mode = str(payload.get("mode", "masquerade"))
-            if driver != "split-veth":
-                raise BackendError("egress driver must be split-veth")
+            if driver not in {
+                "split-veth", "on-a-stick", "tuntom", "tuntom-via", "blackbox-link"
+            }:
+                raise BackendError(
+                    "egress driver must be split-veth, on-a-stick, tuntom, "
+                    "tuntom-via, or blackbox-link"
+                )
             if mode not in {"masquerade", "routed"}:
                 raise BackendError("egress mode must be masquerade or routed")
-            interface = cls._interface(payload.get("interface_name"), "do0")
-            if interface != "do0":
-                raise BackendError("split-veth egress interface must be do0")
+            if driver in {"tuntom", "tuntom-via"} and mode != "routed":
+                raise BackendError(f"{driver} egress mode must be routed")
+            expected_interface = "di0" if driver == "on-a-stick" else "do0"
+            interface = cls._interface(payload.get("interface_name"), expected_interface)
+            if interface != expected_interface:
+                raise BackendError(
+                    f"{driver} egress interface must be {expected_interface}"
+                )
             host_interface = str(payload.get("host_interface", "")).strip()
             if host_interface and not SAFE_INTERFACE.fullmatch(host_interface):
                 raise BackendError("egress host interface is invalid")
+            tuntom_socket = str(payload.get("tuntom_socket", "/run/tuntom/via.sock")).strip()
+            if driver == "tuntom-via":
+                candidate = Path(tuntom_socket)
+                if not candidate.is_absolute() or ".." in candidate.parts:
+                    raise BackendError("tuntom socket must be an absolute normalized path")
+            tuntom_build_id = str(payload.get("tuntom_build_id", "")).strip()
+            if driver in {"tuntom", "tuntom-via"} and not TUNTOM_BUILD_ID.fullmatch(tuntom_build_id):
+                raise BackendError(f"{driver} requires an archived tuntom build")
+            in_prefix = str(payload.get("tuntom_in_prefix", "proxy-in-")).strip()
+            out_prefix = str(payload.get("tuntom_out_prefix", "proxy-out-")).strip()
+            if driver == "tuntom-via" and (
+                not SAFE_ATTACHMENT.fullmatch(in_prefix)
+                or not SAFE_ATTACHMENT.fullmatch(out_prefix)
+            ):
+                raise BackendError("tuntom attachment prefixes are invalid")
+            admission = str(payload.get("tuntom_admission", "immediate"))
+            if admission not in {"immediate", "warmup"}:
+                raise BackendError("tuntom admission must be immediate or warmup")
+            try:
+                mtu = int(payload.get("tuntom_mtu", 1500))
+            except (TypeError, ValueError) as exc:
+                raise BackendError("tuntom MTU must be an integer") from exc
+            if not 576 <= mtu <= 9000:
+                raise BackendError("tuntom MTU must be between 576 and 9000")
             item.update({
                 "driver": driver, "mode": mode, "interface_name": interface,
                 "host_interface": host_interface,
+                "tuntom_socket": tuntom_socket, "tuntom_build_id": tuntom_build_id,
+                "tuntom_in_prefix": in_prefix, "tuntom_out_prefix": out_prefix,
+                "tuntom_admission": admission, "tuntom_mtu": mtu,
+                "consumes": (
+                    ["ingress", "egress"] if driver == "tuntom-via"
+                    else ["egress"]
+                ),
+                "start_parameters": (
+                    ["headless_endpoint_id"]
+                    if driver == "tuntom-via" else
+                    ["tuntom_local_ip", "tuntom_peer_ip", "tuntom_peer_host", "tuntom_secret"]
+                    if driver == "tuntom" else []
+                ),
                 "implemented": (
-                    interface == "do0" and item["address_family"] == "dual"
+                    driver in {"split-veth", "on-a-stick", "tuntom-via"}
+                    and interface == expected_interface
+                    and item["address_family"] == "dual"
                 ),
             })
             return item
@@ -155,7 +223,7 @@ class NetworkProfileLibrary:
                         item["updated_at"] = str(raw["updated_at"])
                 except (ValueError, BackendError):
                     continue
-                if not kind or item["kind"] == kind:
+                if not kind or kind in item.get("consumes", [item["kind"]]):
                     result.append(item)
             return sorted(result, key=lambda item: (item["kind"], item["name"].lower()))
 

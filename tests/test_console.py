@@ -4,6 +4,7 @@ import json
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -11,7 +12,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 CONSOLE_DIR = Path(__file__).resolve().parents[1] / "console"
 sys.path.insert(0, str(CONSOLE_DIR))
-from app import create_app  # noqa: E402
+from app import create_app, partition_branches  # noqa: E402
 
 
 class ConsoleAccountTests(unittest.TestCase):
@@ -82,6 +83,34 @@ class ConsoleAccountTests(unittest.TestCase):
             "email": "admin@example.test", "password": "new-password-456",
         })
         self.assertEqual(302, new.status_code)
+
+    def test_authenticated_navigation_is_grouped_for_operator_workflow(self):
+        self.login()
+        response = self.client.get("/")
+        self.assertEqual(200, response.status_code)
+        page = response.data.decode("utf-8")
+        self.assertIn(">Knihovny<span", page)
+        self.assertIn(">Síť<span", page)
+        self.assertIn("QEMU obrazy", page)
+        self.assertIn("admin@example.test", page)
+        self.assertLess(page.index("Runtime"), page.index("Test Drives"))
+        self.assertLess(page.index("Test Drives"), page.index("Profily"))
+
+    def test_branches_with_builds_sort_first_then_by_commit_time(self):
+        branches = [
+            {"name": "new-no-build", "commit_at": "2026-10-03T12:00:00+00:00", "has_build": False},
+            {"name": "old-built", "commit_at": "2026-09-01T12:00:00+00:00", "has_build": True},
+            {"name": "new-built", "commit_at": "2026-10-02T12:00:00+00:00", "has_build": True},
+            {"name": "older-no-build", "commit_at": "2026-10-01T12:00:00+00:00", "has_build": False},
+        ]
+        active, attic = partition_branches(
+            branches, now=datetime(2026, 10, 4, tzinfo=timezone.utc),
+        )
+        self.assertEqual([], attic)
+        self.assertEqual(
+            ["new-built", "old-built", "new-no-build", "older-no-build"],
+            [item["name"] for item in active],
+        )
 
 
 if __name__ == "__main__":

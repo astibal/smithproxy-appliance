@@ -22,8 +22,9 @@ from .output import emit
 
 INSTANCE_COLUMNS = [
     ("id", "ID"), ("state", "STATE"), ("source_ip", "SOURCE"),
-    ("user_id", "USER"), ("profile", "CONFIG PROFILE"), ("pid", "PID"),
-    ("rss_bytes", "RSS"), ("deadline", "DEADLINE"),
+    ("user_id", "USER"), ("profile", "CONFIG PROFILE"),
+    ("slice_unit", "SLICE"), ("slice_rss_bytes", "SLICE RSS"),
+    ("deadline", "DEADLINE"),
 ]
 TASK_COLUMNS = [
     ("task_id", "ID"), ("state", "STATE"), ("kind", "KIND"),
@@ -44,6 +45,10 @@ BUNDLE_COLUMNS = [
 BUILD_COLUMNS = [
     ("build_id", "ID"), ("ref", "REF"), ("build_type", "TYPE"),
     ("commit_id", "COMMIT"), ("built_at", "BUILT"),
+]
+EXPORT_COLUMNS = [
+    ("export_id", "ID"), ("name", "NAME"), ("filesystem_mode", "MODE"),
+    ("ref", "REF"), ("commit_id", "COMMIT"), ("size_bytes", "SIZE"),
 ]
 
 
@@ -222,6 +227,17 @@ def build_parser() -> argparse.ArgumentParser:
     spawn.add_argument("--plaintext-port", type=int, default=50080)
     spawn.add_argument("--tls-port", type=int, default=50443)
     spawn.add_argument("--cli-port", type=int, default=50000)
+    spawn.add_argument("--tuntom-local-ip")
+    spawn.add_argument("--tuntom-peer-ip")
+    spawn.add_argument("--tuntom-peer-host")
+    spawn.add_argument(
+        "--headless-endpoint",
+        help="unique Fabric endpoint package UUID (required by tuntom-via profiles)",
+    )
+    spawn.add_argument(
+        "--tuntom-secret-file", type=Path,
+        help="read the ephemeral 32-hex secret from a file (not from argv)",
+    )
     for name in ("stop", "restart", "delete", "debug-start", "debug-stop"):
         item = instance_sub.add_parser(name)
         item.add_argument("instance")
@@ -277,6 +293,18 @@ def build_parser() -> argparse.ArgumentParser:
         item.add_argument("build")
         if name == "delete":
             item.add_argument("--yes", action="store_true")
+
+    tuntom = groups.add_parser("tuntom", help="Tuntom adapter builds")
+    tuntom_sub = tuntom.add_subparsers(dest="command", required=True)
+    tuntom_sub.add_parser("status")
+    tuntom_sub.add_parser("list")
+    tuntom_sub.add_parser("refs-refresh")
+    tuntom_start = tuntom_sub.add_parser("build")
+    tuntom_start.add_argument("ref")
+    tuntom_start.add_argument("--type", choices=("Release", "Debug"), default="Release")
+    tuntom_delete = tuntom_sub.add_parser("delete")
+    tuntom_delete.add_argument("build")
+    tuntom_delete.add_argument("--yes", action="store_true")
 
     config = groups.add_parser("config", help="native configuration library")
     config_sub = config.add_subparsers(dest="command", required=True)
@@ -338,6 +366,47 @@ def build_parser() -> argparse.ArgumentParser:
     network_sub.add_parser("show")
     update = network_sub.add_parser("update")
     update.add_argument("--file", type=Path, required=True, help="complete networking JSON document")
+
+    network_profile = groups.add_parser("network-profile", help="ingress and egress profiles")
+    network_profile_sub = network_profile.add_subparsers(dest="command", required=True)
+    network_profile_sub.add_parser("list")
+    network_profile_show = network_profile_sub.add_parser("show")
+    network_profile_show.add_argument("profile")
+    network_profile_create = network_profile_sub.add_parser("create")
+    network_profile_create.add_argument("--file", type=Path, required=True)
+    network_profile_update = network_profile_sub.add_parser("update")
+    network_profile_update.add_argument("profile")
+    network_profile_update.add_argument("--file", type=Path, required=True)
+    network_profile_delete = network_profile_sub.add_parser("delete")
+    network_profile_delete.add_argument("profile")
+    network_profile_delete.add_argument("--yes", action="store_true")
+
+    endpoint = groups.add_parser("endpoint", help="unique headless Fabric packages")
+    endpoint_sub = endpoint.add_subparsers(dest="command", required=True)
+    endpoint_sub.add_parser("list")
+    endpoint_show = endpoint_sub.add_parser("show")
+    endpoint_show.add_argument("package")
+    endpoint_import = endpoint_sub.add_parser("import")
+    endpoint_import.add_argument("--file", type=Path, required=True)
+    endpoint_delete = endpoint_sub.add_parser("delete")
+    endpoint_delete.add_argument("package")
+    endpoint_delete.add_argument("--yes", action="store_true")
+
+    appliance_export = groups.add_parser("appliance-export", help="portable appliance archives")
+    export_sub = appliance_export.add_subparsers(dest="command", required=True)
+    export_sub.add_parser("list")
+    export_create = export_sub.add_parser("create")
+    export_create.add_argument("--name", required=True)
+    export_create.add_argument("--build", required=True)
+    export_create.add_argument("--config-id", required=True)
+    export_create.add_argument("--mode", choices=("plain", "rootfs"), default="plain")
+    export_create.add_argument("--set", action="append", default=[], metavar="NAME=VALUE")
+    export_download = export_sub.add_parser("download")
+    export_download.add_argument("export")
+    export_download.add_argument("--file", type=Path)
+    export_delete = export_sub.add_parser("delete")
+    export_delete.add_argument("export")
+    export_delete.add_argument("--yes", action="store_true")
     return parser
 
 
@@ -353,6 +422,15 @@ def _id(client: RunnerClient, kind: str, value: str) -> str:
     if kind == "build":
         artifacts = client.get("/v1/build").get("artifacts", [])
         return resolve(artifacts, value, "build_id", "ref").get("build_id")
+    if kind == "tuntom-build":
+        artifacts = client.get("/v1/tuntom/build").get("artifacts", [])
+        return resolve(artifacts, value, "build_id", "ref").get("build_id")
+    if kind == "network-profile":
+        profiles = client.get("/v1/network-profiles").get("profiles", [])
+        return resolve(profiles, value, "network_profile_id")["network_profile_id"]
+    if kind == "endpoint":
+        packages = client.get("/v1/headless-endpoints").get("packages", [])
+        return resolve(packages, value, "package_id", "name")["package_id"]
     raise ValueError(kind)
 
 
@@ -370,6 +448,9 @@ def _instance(client: RunnerClient, args: argparse.Namespace) -> tuple[Any, Any]
         terminal(client, instance_id, command)
         return None, None
     if command == "spawn":
+        tuntom_secret = os.environ.get("SAS_TUNTOM_SECRET", "")
+        if args.tuntom_secret_file:
+            tuntom_secret = args.tuntom_secret_file.read_text(encoding="ascii").strip()
         payload: dict[str, Any] = {
             "source_ip": args.source_ip, "user_id": args.user,
             "runtime_seconds": args.ttl, "config_mode": args.config_mode,
@@ -380,6 +461,17 @@ def _instance(client: RunnerClient, args: argparse.Namespace) -> tuple[Any, Any]
                 "plaintext_port": args.plaintext_port, "tls_port": args.tls_port,
                 "cli_port": args.cli_port,
             },
+        }
+        payload["network_runtime"] = {
+            name: value
+            for name, value in (
+                ("tuntom_local_ip", args.tuntom_local_ip),
+                ("tuntom_peer_ip", args.tuntom_peer_ip),
+                ("tuntom_peer_host", args.tuntom_peer_host),
+                ("tuntom_secret", tuntom_secret),
+                ("headless_endpoint_id", args.headless_endpoint),
+            )
+            if value
         }
         if args.profile:
             payload["runtime_profile_id"] = _id(client, "profile", args.profile)
@@ -476,6 +568,75 @@ def _build(client: RunnerClient, args: argparse.Namespace) -> tuple[Any, Any]:
     return complete(client, value, args), None
 
 
+def _tuntom(client: RunnerClient, args: argparse.Namespace) -> tuple[Any, Any]:
+    status = client.get("/v1/tuntom/build")
+    if args.command == "status":
+        return status, None
+    if args.command == "list":
+        return status.get("artifacts", []), BUILD_COLUMNS
+    if args.command == "build":
+        value = client.post("/v1/tuntom/build", {
+            "ref": args.ref, "build_type": args.type,
+        })
+        return complete(client, value, args), None
+    if args.command == "refs-refresh":
+        return complete(client, client.post("/v1/tuntom/refs/refresh", {}), args), None
+    build_id = _id(client, "tuntom-build", args.build)
+    confirm(args, "delete the archived Tuntom build")
+    value = client.enqueue(
+        "DELETE", f"/v1/tuntom/builds/{build_id}", None,
+        f"Delete Tuntom build {build_id[:12]}", "tuntom-build-delete",
+    )
+    return complete(client, value, args), None
+
+
+def _network_profile(client: RunnerClient, args: argparse.Namespace) -> tuple[Any, Any]:
+    if args.command == "list":
+        return client.get("/v1/network-profiles")["profiles"], [
+            ("network_profile_id", "ID"), ("kind", "KIND"),
+            ("name", "NAME"), ("driver", "DRIVER"),
+            ("address_family", "FAMILY"), ("implemented", "READY"),
+        ]
+    profile_id = _id(client, "network-profile", args.profile) \
+        if hasattr(args, "profile") else ""
+    if args.command == "show":
+        return client.get(f"/v1/network-profiles/{profile_id}"), None
+    if args.command == "delete":
+        confirm(args, "delete the network profile")
+        value = client.enqueue(
+            "DELETE", f"/v1/network-profiles/{profile_id}", None,
+            f"Delete network profile {profile_id[:12]}", "network-profile-delete",
+        )
+        return complete(client, value, args), None
+    payload = json.loads(args.file.read_text(encoding="utf-8"))
+    method = "POST" if args.command == "create" else "PUT"
+    path = "/v1/network-profiles" if args.command == "create" \
+        else f"/v1/network-profiles/{profile_id}"
+    value = client.enqueue(
+        method, path, payload,
+        f"{args.command.title()} network profile", f"network-profile-{args.command}",
+    )
+    return complete(client, value, args), None
+
+
+def _endpoint(client: RunnerClient, args: argparse.Namespace) -> tuple[Any, Any]:
+    if args.command == "list":
+        return client.get("/v1/headless-endpoints")["packages"], [
+            ("package_id", "ID"), ("state", "STATE"), ("name", "NAME"),
+            ("fabric_port_id", "FABRIC PORT"), ("switch_ip", "SWITCH"),
+            ("tunnel_id", "TUNNEL"), ("bound_instance_id", "INSTANCE"),
+        ]
+    package_id = _id(client, "endpoint", args.package) \
+        if hasattr(args, "package") else ""
+    if args.command == "show":
+        return client.get(f"/v1/headless-endpoints/{package_id}"), None
+    if args.command == "delete":
+        confirm(args, "delete the available headless endpoint package")
+        return client.delete(f"/v1/headless-endpoints/{package_id}"), None
+    payload = json.loads(args.file.read_text(encoding="utf-8"))
+    return client.post("/v1/headless-endpoints", payload), None
+
+
 def _config(client: RunnerClient, args: argparse.Namespace) -> tuple[Any, Any]:
     if args.command == "list": return client.get("/v1/configs")["configs"], CONFIG_COLUMNS
     if args.command == "commit":
@@ -559,8 +720,38 @@ def dispatch(client: RunnerClient, args: argparse.Namespace) -> tuple[Any, Any]:
     if args.group == "instance": return _instance(client, args)
     if args.group == "profile": return _profile(client, args)
     if args.group == "build": return _build(client, args)
+    if args.group == "tuntom": return _tuntom(client, args)
+    if args.group == "network-profile": return _network_profile(client, args)
+    if args.group == "endpoint": return _endpoint(client, args)
     if args.group == "config": return _config(client, args)
     if args.group == "cert": return _cert(client, args)
+    if args.group == "appliance-export":
+        values = client.get("/v1/appliance-exports")["exports"]
+        if args.command == "list": return values, EXPORT_COLUMNS
+        export_id = ""
+        if args.command in {"download", "delete"}:
+            export_id = resolve(values, args.export, "export_id")["export_id"]
+        if args.command == "download":
+            item = resolve(values, args.export, "export_id")
+            destination = args.file or Path(item.get("archive_name", f"{export_id}.tar.gz"))
+            return {"file": client.download(
+                f"/v1/appliance-exports/{export_id}/download", str(destination)
+            )}, None
+        if args.command == "delete":
+            confirm(args, "delete the appliance export")
+            value = client.enqueue("DELETE", f"/v1/appliance-exports/{export_id}", None,
+                                   f"Delete appliance export {export_id[:12]}",
+                                   "appliance-export-delete")
+            return complete(client, value, args), None
+        builds = client.get("/v1/build").get("artifacts", [])
+        configs = client.get("/v1/configs").get("configs", [])
+        build_id = resolve(builds, args.build, "build_id", "ref")["build_id"]
+        config_id = resolve(configs, args.config_id, "config_id")["config_id"]
+        value = client.enqueue("POST", "/v1/appliance-exports", {
+            "name": args.name, "build_id": build_id, "config_id": config_id,
+            "filesystem_mode": args.mode, "parameters": assignments(args.set),
+        }, f"Export appliance {args.name}", "appliance-export")
+        return complete(client, value, args), None
     if args.group == "network":
         if args.command == "show": return client.get("/v1/settings/networking"), None
         payload = json.loads(args.file.read_text(encoding="utf-8"))

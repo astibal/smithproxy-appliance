@@ -1,0 +1,24 @@
+{% extends "base.html" %}{% block content %}
+{% if error %}<div class="flash error">{{ error }}</div>{% endif %}
+<div class="headline"><div><div class="eyebrow">PORTABLE APPLIANCE</div><h1>{{ _('exports.title') }}</h1><p>{{ _('exports.intro') }}</p></div></div>
+<section class="panel export-builder">
+  <div class="section-head"><div><h2>{{ _('exports.new') }}</h2><p class="hint">{{ _('exports.help') }}</p></div></div>
+  <form method="post" action="{{ url_for('create_appliance_export') }}" id="appliance-export-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label>{{ _('exports.name') }}<input name="name" required maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}" placeholder="proxy-lab-01"></label>
+    <label>{{ _('exports.build') }}<select name="build_id" required><option value="">{{ _('exports.choose_build') }}</option>{% for item in artifacts %}{% set build_id=item.build_id|default(item.commit_id) %}<option value="{{ build_id }}" {{ 'selected' if selected_build == build_id else '' }}>{{ item.choice_label|default(item.ref ~ ' · ' ~ item.build_type ~ ' · ' ~ item.commit_id[:12]) }}</option>{% endfor %}</select></label>
+    <label>{{ _('exports.config') }}<select name="config_id" id="export-config" required><option value="">{{ _('exports.choose_config') }}</option>{% for item in configs if item.native %}<option value="{{ item.config_id }}" data-placeholders='{{ item.placeholders|default([])|tojson|forceescape }}' {{ 'selected' if selected_config == item.config_id else '' }}>{{ item.name }} · {{ item.config_id[:8] }}</option>{% endfor %}</select></label>
+    <fieldset class="export-mode"><legend>{{ _('exports.mode') }}</legend><label><input type="radio" name="filesystem_mode" value="plain" checked><span><b>Plain</b><small>{{ _('exports.plain_help') }}</small></span></label><label><input type="radio" name="filesystem_mode" value="rootfs"><span><b>RootFS</b><small>{{ _('exports.rootfs_help') }}</small></span></label></fieldset>
+    <div id="export-parameters" class="export-parameters" hidden><h3>{{ _('exports.parameters') }}</h3><div></div></div>
+    <div class="export-network-note"><b>di0 ↔ Smithproxy ↔ do0</b><span>{{ _('exports.network_help') }}</span></div>
+    <button>{{ _('exports.create') }}</button>
+  </form>
+</section>
+<section class="panel">
+  <div class="section-head"><div><h2>{{ _('exports.library') }}</h2><p class="hint">{{ _('exports.library_help') }}</p></div><b>{{ exports|length }}</b></div>
+  <div class="export-list">
+    <div class="export-row export-head"><span>{{ _('exports.name') }}</span><span>Build</span><span>{{ _('exports.mode') }}</span><span>SHA-256 / size</span><span>{{ _('exports.actions') }}</span></div>
+    {% for item in exports %}<div class="export-row"><span><b>{{ item.name }}</b><small>{{ item.created_at }}</small></span><span><code>{{ item.ref }} · {{ item.commit_id[:12] }}</code><small>{{ item.profile }}</small></span><span><b>{{ item.filesystem_mode|upper }}</b><small>schema {{ item.schema }}</small></span><span><code title="{{ item.sha256 }}">{{ item.sha256[:16] }}…</code><small>{{ '%.1f MiB'|format(item.size_bytes / 1048576) }}</small></span><span class="actions"><a class="button-link secondary compact" href="{{ url_for('download_appliance_export',export_id=item.export_id) }}">{{ _('exports.download') }}</a><form method="post" action="{{ url_for('delete_appliance_export',export_id=item.export_id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="danger compact">{{ _('exports.delete') }}</button></form></span></div>{% else %}<p class="empty">{{ _('exports.none') }}</p>{% endfor %}
+  </div>
+</section>
+{% endblock %}{% block scripts %}<script src="{{ url_for('static',filename='appliance-exports.js',v='1') }}" defer></script>{% endblock %}

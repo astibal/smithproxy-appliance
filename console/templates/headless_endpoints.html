@@ -1,0 +1,22 @@
+{% extends 'base.html' %}{% block content %}
+<div class="headline"><div><div class="eyebrow">HEADLESS ENDPOINT LIBRARY</div><h1>Fabric endpoint packages</h1><p>Jedna importovaná identita Fabric portu patří právě jednomu Slice. Profil ji pouze vyžaduje; konkrétní package se vybírá až při spuštění.</p></div></div>
+{% if error %}<div class="flash error">{{ error }}</div>{% endif %}
+<section class="panel">
+  <div class="section-head"><div><h2>Import endpointu</h2><p class="hint">Dočasný ruční import stejného manifestu, který později dodá Fabric UI.</p></div><code>AVAILABLE → RESERVED → BOUND</code></div>
+  <form method="post" class="config-editor-meta">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label>Název<input name="name" maxlength="128" required placeholder="Fabric port · proxy 01"></label>
+    <label>Package UUID<input name="package_id" required pattern="[0-9a-f-]{36}" placeholder="00000000-0000-0000-0000-000000000000"></label>
+    <label>Fabric port ID<input name="fabric_port_id" maxlength="160" required placeholder="switch-a/proxy-in-17"></label>
+    <label>Switch IP<input name="switch_ip" required placeholder="2001:db8::10"></label>
+    <label>Tunnel ID<input name="tunnel_id" type="number" min="1" max="255" required></label>
+    <label>Secret<input name="secret" type="password" pattern="[0-9a-fA-F]{32}" maxlength="32" required autocomplete="new-password"></label>
+    <button>Importovat unikátní package</button>
+  </form>
+</section>
+<section class="panel"><div class="section-head"><div><h2>Knihovna</h2><p class="hint">Secret se nikdy nevrací z list API. BOUND package zůstává vlastnictvím stejné instance i po stopu.</p></div><b>{{ packages|length }}</b></div>
+  <div class="network-profile-list">
+  {% for package in packages %}<article class="network-profile-row"><div class="network-profile-kind">{{ package.state|upper }}</div><div><b>{{ package.name }}</b><small>port <code>{{ package.fabric_port_id }}</code></small><small>switch <code class="copy-value">{{ package.switch_ip }}</code> · tunnel <code>{{ package.tunnel_id }}</code></small>{% if package.bound_instance_id %}<small>Slice / instance <code>{{ package.bound_instance_id }}</code></small>{% endif %}</div><div class="actions"><form method="post" action="{{ url_for('delete_headless_endpoint',package_id=package.package_id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="danger compact" {{ 'disabled' if package.state != 'available' }}>Smazat</button></form></div></article>{% else %}<p class="empty">Zatím žádný Fabric endpoint package.</p>{% endfor %}
+  </div>
+</section>
+{% endblock %}

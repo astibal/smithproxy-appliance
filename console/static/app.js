@@ -3,9 +3,9 @@
   const text = (selector, value) => { const node = q(selector); if (node) node.textContent = value; };
   const locale = ['cs', 'en', 'fr'].includes(document.documentElement.lang) ? document.documentElement.lang : 'en';
   const messages = {
-    cs: {unlimited:'bez limitu', enqueuing:'Zařazuji…', queueing:'Předávám požadavek do fronty…', queued:'Spuštění zařazeno', enqueueStart:'Zařadit spuštění', selected:'Vybráno', running:'běží', pending:'čeká', idle:'nic neběží', noTasks:'Zatím žádné úlohy.', openResult:'Otevřít výsledek →', noMatch:'Filtru neodpovídá žádná instance.', noInstances:'Žádné instance.', loading:'Načítám…', noLogs:'Žádné logy.', logsFailed:'Logy nelze načíst', checking:'ověřuji…', updating:'aktualizuji…', checked:'ověřeno', error:'chyba', profile:'profil', manual:'ruční výběr', noDeadline:'bez deadline', copy:'Kliknutím zkopírovat', copied:'Zkopírováno', copyFailed:'Kopírování selhalo'},
-    en: {unlimited:'unlimited', enqueuing:'Enqueuing…', queueing:'Submitting request to the queue…', queued:'Start enqueued', enqueueStart:'Enqueue start', selected:'Selected', running:'running', pending:'pending', idle:'nothing running', noTasks:'No tasks yet.', openResult:'Open result →', noMatch:'No instance matches the filter.', noInstances:'No instances.', loading:'Loading…', noLogs:'No logs.', logsFailed:'Cannot load logs', checking:'checking…', updating:'updating…', checked:'checked', error:'error', profile:'profile', manual:'manual selection', noDeadline:'no deadline', copy:'Click to copy', copied:'Copied', copyFailed:'Copy failed'},
-    fr: {unlimited:'sans limite', enqueuing:'Planification…', queueing:'Envoi de la demande dans la file…', queued:'Démarrage planifié', enqueueStart:'Planifier le démarrage', selected:'Sélectionné', running:'actives', pending:'en attente', idle:'aucune tâche active', noTasks:'Aucune tâche.', openResult:'Ouvrir le résultat →', noMatch:'Aucune instance ne correspond au filtre.', noInstances:'Aucune instance.', loading:'Chargement…', noLogs:'Aucun journal.', logsFailed:'Impossible de charger les journaux', checking:'vérification…', updating:'actualisation…', checked:'vérifié', error:'erreur', profile:'profil', manual:'sélection manuelle', noDeadline:'sans échéance', copy:'Cliquer pour copier', copied:'Copié', copyFailed:'Échec de la copie'}
+    cs: {unlimited:'bez limitu', enqueuing:'Zařazuji…', queueing:'Předávám požadavek do fronty…', queued:'Spuštění zařazeno', enqueueStart:'Zařadit spuštění', selected:'Vybráno', running:'běží', pending:'čeká', idle:'nic neběží', noTasks:'Zatím žádné úlohy.', openResult:'Otevřít výsledek →', noMatch:'Filtru neodpovídá žádná instance.', noInstances:'Žádné instance.', loading:'Načítám…', noLogs:'Žádné logy.', logsFailed:'Logy nelze načíst', checking:'ověřuji…', updating:'aktualizuji…', checked:'ověřeno', error:'chyba', profile:'profil', manual:'ruční výběr', noDeadline:'bez deadline', copy:'Kliknutím zkopírovat', copied:'Zkopírováno', copyFailed:'Kopírování selhalo', expired:'expirováno', topologyEmpty:'Žádné autorizované source IP ani živé instance.', source:'SOURCE', hostServices:'služby na appliance', blocked:'BLOKOVÁNO', inputPolicy:'globální INPUT policy', forwardPolicy:'globální FORWARD policy', noRoute:'BEZ ŽIVÉ ROUTY', spawnFree:'spawn slot je volný', noInstance:'žádná odpovídající instance', attachSource:'Připojit source k další živé instanci', buildQueue:'Build se zařazuje…', ingressPath:'SOURCE → runner policy → di0', egressPath:'namespace → uplink / route', viaLocksSide:'Zamčeno profilem VIA: vlastní společně di0 i do0.'},
+    en: {unlimited:'unlimited', enqueuing:'Enqueuing…', queueing:'Submitting request to the queue…', queued:'Start enqueued', enqueueStart:'Enqueue start', selected:'Selected', running:'running', pending:'pending', idle:'nothing running', noTasks:'No tasks yet.', openResult:'Open result →', noMatch:'No instance matches the filter.', noInstances:'No instances.', loading:'Loading…', noLogs:'No logs.', logsFailed:'Cannot load logs', checking:'checking…', updating:'updating…', checked:'checked', error:'error', profile:'profile', manual:'manual selection', noDeadline:'no deadline', copy:'Click to copy', copied:'Copied', copyFailed:'Copy failed', expired:'expired', topologyEmpty:'No authorized source IP or live instance.', source:'SOURCE', hostServices:'appliance services', blocked:'BLOCKED', inputPolicy:'global INPUT policy', forwardPolicy:'global FORWARD policy', noRoute:'NO LIVE ROUTE', spawnFree:'spawn slot available', noInstance:'no matching instance', attachSource:'Attach source to another live instance', buildQueue:'Build is being enqueued…', ingressPath:'SOURCE → runner policy → di0', egressPath:'namespace → uplink / route', viaLocksSide:'Locked by the VIA profile: it owns both di0 and do0.'},
+    fr: {unlimited:'sans limite', enqueuing:'Planification…', queueing:'Envoi de la demande dans la file…', queued:'Démarrage planifié', enqueueStart:'Planifier le démarrage', selected:'Sélectionné', running:'actives', pending:'en attente', idle:'aucune tâche active', noTasks:'Aucune tâche.', openResult:'Ouvrir le résultat →', noMatch:'Aucune instance ne correspond au filtre.', noInstances:'Aucune instance.', loading:'Chargement…', noLogs:'Aucun journal.', logsFailed:'Impossible de charger les journaux', checking:'vérification…', updating:'actualisation…', checked:'vérifié', error:'erreur', profile:'profil', manual:'sélection manuelle', noDeadline:'sans échéance', copy:'Cliquer pour copier', copied:'Copié', copyFailed:'Échec de la copie', expired:'expiré', topologyEmpty:'Aucune IP source autorisée ni instance active.', source:'SOURCE', hostServices:'services de l’appliance', blocked:'BLOQUÉ', inputPolicy:'politique INPUT globale', forwardPolicy:'politique FORWARD globale', noRoute:'AUCUNE ROUTE ACTIVE', spawnFree:'slot de lancement disponible', noInstance:'aucune instance correspondante', attachSource:'Associer la source à une autre instance active', buildQueue:'Mise en file du build…', ingressPath:'SOURCE → politique runner → di0', egressPath:'namespace → uplink / route', viaLocksSide:'Verrouillé par le profil VIA : il possède di0 et do0.'}
   };
   const tr = key => messages[locale]?.[key] || messages.en[key] || key;
   const formatBytes = bytes => bytes ? `${(bytes / 1048576).toFixed(1)} MiB` : '0 MiB';
@@ -20,6 +20,23 @@
     return `${Math.floor(seconds / 3600)} h ${Math.floor((seconds % 3600) / 60)} min`;
   };
 
+  function setupNavigation() {
+    const menus = [...document.querySelectorAll('header details.nav-menu')];
+    if (!menus.length) return;
+    menus.forEach(menu => menu.addEventListener('toggle', () => {
+      if (!menu.open) return;
+      menus.forEach(other => { if (other !== menu) other.open = false; });
+    }));
+    document.addEventListener('click', event => {
+      if (event.target.closest?.('header details.nav-menu')) return;
+      menus.forEach(menu => { menu.open = false; });
+    });
+    document.addEventListener('keydown', event => {
+      if (event.key !== 'Escape') return;
+      menus.forEach(menu => { menu.open = false; });
+    });
+  }
+
   function setupSpawnForm() {
     const configSelect = q('#instance-config');
     const runtimeSelection = q('#runtime-selection');
@@ -27,6 +44,7 @@
     const profilePanel = q('#profile-selection');
     const manualPanel = q('#manual-selection');
     const placeholderFields = q('#placeholder-fields');
+    const networkRuntimeFields = q('#network-runtime-fields');
     if (configSelect && runtimeSelection && profileSelect && placeholderFields) {
       const updatePlaceholderFields = () => {
         const source = runtimeSelection.value === 'profile' ? profileSelect : configSelect;
@@ -40,6 +58,46 @@
           input.required = true;
           input.maxLength = 512;
           input.autocomplete = 'off';
+          label.appendChild(input);
+          return label;
+        }));
+        const networkParameters = runtimeSelection.value === 'profile'
+          ? (profileSelect.selectedOptions[0]?.dataset.networkParameters || '')
+            .split(',').map(value => value.trim()).filter(Boolean)
+          : [];
+        const labels = {
+          tuntom_local_ip: 'Tuntom local IP', tuntom_peer_ip: 'Tuntom peer IP',
+          tuntom_peer_host: 'Tuntom peer host',
+          tuntom_secret: 'Tuntom secret (32 hex)',
+        };
+        networkRuntimeFields?.replaceChildren(...networkParameters.map(name => {
+          const label = document.createElement('label');
+          label.textContent = name === 'headless_endpoint_id'
+            ? 'Fabric endpoint package · exclusive Slice binding'
+            : labels[name] || name;
+          let input;
+          if (name === 'headless_endpoint_id') {
+            input = document.createElement('select');
+            const empty = document.createElement('option');
+            empty.value = '';
+            empty.textContent = 'Choose one available package…';
+            input.appendChild(empty);
+            const template = document.querySelector('#headless-endpoint-options');
+            if (template) input.appendChild(template.content.cloneNode(true));
+          } else {
+            input = document.createElement('input');
+          }
+          input.name = `network__${name}`;
+          input.required = true;
+          input.autocomplete = 'off';
+          input.spellcheck = false;
+          if (name === 'tuntom_secret') {
+            input.type = 'password';
+            input.pattern = '[0-9a-fA-F]{32}';
+            input.maxLength = 32;
+          } else if (name !== 'headless_endpoint_id') {
+            input.maxLength = 255;
+          }
           label.appendChild(input);
           return label;
         }));
@@ -95,6 +153,57 @@
       } finally {
         if (submit) { submit.disabled = false; submit.textContent = tr('enqueueStart'); }
       }
+    });
+  }
+
+  function setupRuntimeProfileNetworkBindings() {
+    document.querySelectorAll('form').forEach(form => {
+      const ingress = form.querySelector('select[name="ingress_network_profile_id"]');
+      const egress = form.querySelector('select[name="egress_network_profile_id"]');
+      if (!ingress || !egress) return;
+      const controls = {ingress, egress};
+      let owner = null;
+      const isDuplex = select => {
+        const consumes = (select.selectedOptions[0]?.dataset.consumes || '').split(',');
+        return consumes.includes('ingress') && consumes.includes('egress');
+      };
+      const render = () => {
+        for (const [side, select] of Object.entries(controls)) {
+          const locked = Boolean(owner) && side !== owner;
+          select.disabled = locked;
+          select.setAttribute('aria-disabled', String(locked));
+          const label = select.closest('label');
+          label?.classList.toggle('network-binding-consumed', locked);
+          label?.classList.toggle('network-binding-owner', side === owner);
+          const hint = label?.querySelector('small');
+          if (hint) hint.textContent = locked
+            ? tr('viaLocksSide')
+            : tr(side === 'ingress' ? 'ingressPath' : 'egressPath');
+        }
+      };
+      const selectSide = side => {
+        const selected = controls[side];
+        if (isDuplex(selected)) {
+          owner = side;
+          const other = side === 'ingress' ? egress : ingress;
+          other.value = selected.value;
+        } else if (owner === side) {
+          owner = null;
+        }
+        render();
+      };
+      ingress.addEventListener('change', () => selectSide('ingress'));
+      egress.addEventListener('change', () => selectSide('egress'));
+      // Persisted duplex bindings repeat the same ID in both fields. VIA is
+      // currently authored as an egress profile, so retain egress as the
+      // editable owner on initial render; a new selection can originate from
+      // either side.
+      owner = isDuplex(egress) ? 'egress' : isDuplex(ingress) ? 'ingress' : null;
+      if (owner) {
+        const other = owner === 'ingress' ? egress : ingress;
+        other.value = controls[owner].value;
+      }
+      render();
     });
   }
 
@@ -206,9 +315,19 @@
     const attachSource = q('#firewall-attach-source');
     const attachInstance = q('#firewall-attach-instance');
     const authorizationForm = q('.firewall-add-form');
+    const protocolSelect = authorizationForm?.querySelector('[name="protocol"]');
+    const portsInput = authorizationForm?.querySelector('[name="ports"]');
     const existingSelect = authorizationForm?.querySelector('[name="instance_id"]');
     const profileSelect = authorizationForm?.querySelector('[name="runtime_profile_id"]');
     const registerSource = authorizationForm?.querySelector('[name="register_source"]');
+    const updatePortSelector = () => {
+      if (!portsInput || !protocolSelect) return;
+      const enabled = ['tcp', 'udp'].includes(protocolSelect.value);
+      portsInput.disabled = !enabled;
+      if (!enabled) portsInput.value = '';
+    };
+    protocolSelect?.addEventListener('change', updatePortSelector);
+    updatePortSelector();
     existingSelect?.addEventListener('change', () => {
       if (existingSelect.value && profileSelect) profileSelect.value = '';
       if (existingSelect.value && registerSource) registerSource.checked = true;
@@ -245,7 +364,7 @@
         const expiry = Date.parse(element.dataset.expiresAt || '');
         const remaining = (expiry - now) / 1000;
         const elapsed = !Number.isFinite(expiry) || remaining <= 0;
-        element.textContent = elapsed ? 'expired' : topologyDuration(remaining);
+        element.textContent = elapsed ? tr('expired') : topologyDuration(remaining);
         element.classList.toggle('urgent', !elapsed && remaining <= 300);
         element.classList.toggle('elapsed', elapsed);
       });
@@ -260,7 +379,8 @@
       const network = instance.network || {};
       target.append(make('code', '', `${network.guest_ip || 'IP ?'} / ${network.guest_interface || '?'}  ←  ${network.host_interface || '?'}`));
       if (network.guest_ip_v6) target.append(make('code', 'topology-ipv6', `${network.guest_ip_v6} / ${network.guest_interface || '?'}`));
-      target.append(make('small', '', `${instance.profile || 'custom'} · ${instance.user_id || 'user ?'} · PID ${instance.pid || '—'} · ${instance.id.slice(0, 12)}`));
+      const smithproxy = (instance.members || []).find(member => member.role === 'smithproxy');
+      target.append(make('small', '', `${instance.profile || 'custom'} · ${instance.user_id || 'user ?'} · PID ${smithproxy?.pid || '—'} · ${instance.id.slice(0, 12)}`));
       return target;
     };
     const renderLane = (label, effective, mode, targets) => {
@@ -279,14 +399,14 @@
       root.replaceChildren();
       const entries = Array.isArray(payload.topology) ? payload.topology : [];
       if (!entries.length) {
-        root.append(make('p', 'empty', 'Žádné autorizované source IP ani živé instance.'));
+        root.append(make('p', 'empty', tr('topologyEmpty')));
       }
       const sourceGroups = new Map();
       entries.forEach(entry => {
         const inputEffective = !payload.input_enforced || entry.input_allowed;
         const forwardEffective = !payload.forward_enforced || entry.forward_allowed;
         const targetIds = (entry.instances || []).map(instance => instance.id).sort();
-        const signature = JSON.stringify([inputEffective, forwardEffective, targetIds]);
+        const signature = JSON.stringify([inputEffective, forwardEffective, targetIds, entry.selectors || []]);
         if (!sourceGroups.has(signature)) sourceGroups.set(signature, []);
         sourceGroups.get(signature).push(entry);
       });
@@ -296,13 +416,19 @@
         const source = make('div', 'topology-source');
         sourceEntries.forEach((sourceEntry, index) => {
           const sourceItem = make('div', 'topology-source-item');
-          sourceItem.append(make('small', '', sourceEntries.length > 1 ? `SOURCE ${index + 1}/${sourceEntries.length}` : 'SOURCE'));
+          sourceItem.append(make('small', '', sourceEntries.length > 1 ? `${tr('source')} ${index + 1}/${sourceEntries.length}` : tr('source')));
           sourceItem.append(make('code', '', sourceEntry.source));
           const flags = make('div', 'topology-source-flags');
           if (sourceEntry.input_allowed) flags.append(make('span', 'badge ok', 'INPUT'));
           if (sourceEntry.forward_allowed) flags.append(make('span', 'badge ok', 'FORWARD'));
           if (sourceEntry.spawn_allowed) flags.append(make('span', 'badge', 'SPAWN POOL'));
           sourceItem.append(flags);
+          (sourceEntry.selectors || []).forEach(selector => {
+            const destination = selector.destination || '*';
+            const ports = (selector.ports || []).length ? `:${selector.ports.join(',')}` : '';
+            const chains = (selector.chains || []).join('+').toUpperCase();
+            sourceItem.append(make('code', 'topology-selector', `${chains} · ${String(selector.protocol || 'any').toUpperCase()} → ${destination}${ports}`));
+          });
           (sourceEntry.expirations || []).forEach(expiration => {
             const expiry = make('div', 'topology-source-expiry');
             expiry.title = `${(expiration.chains || []).join(' + ').toUpperCase()} · ${expiration.system || 'authorization'} · ${expiration.expires_at}`;
@@ -318,25 +444,27 @@
         });
         const lanes = make('div', 'topology-lanes');
         const inputEffective = !payload.input_enforced || entry.input_allowed;
-        const inputMode = payload.input_enforced ? (entry.input_allowed ? 'INPUT ALLOW' : 'INPUT DROP') : 'INPUT AUDIT';
+        const inputSelected = (entry.selectors || []).some(selector => (selector.chains || []).includes('input'));
+        const inputMode = payload.input_enforced ? (entry.input_allowed ? (inputSelected ? 'INPUT SELECTED' : 'INPUT ALLOW') : 'INPUT DROP') : 'INPUT AUDIT';
         const host = make('div', `topology-target host-target${inputEffective ? '' : ' denied'}`);
-        host.append(make('b', '', inputEffective ? 'SAS HOST' : 'BLOCKED'));
-        host.append(make('small', '', inputEffective ? 'služby na appliance' : 'globální INPUT policy'));
+        host.append(make('b', '', inputEffective ? 'SAS HOST' : tr('blocked')));
+        host.append(make('small', '', inputEffective ? tr('hostServices') : tr('inputPolicy')));
         lanes.append(renderLane('INPUT', inputEffective, inputMode, [host]));
         const forwardEffective = !payload.forward_enforced || entry.forward_allowed;
-        const forwardMode = payload.forward_enforced ? (entry.forward_allowed ? 'FWD ALLOW' : 'FWD DROP') : 'FWD AUDIT';
+        const forwardSelected = (entry.selectors || []).some(selector => (selector.chains || []).includes('forward'));
+        const forwardMode = payload.forward_enforced ? (entry.forward_allowed ? (forwardSelected ? 'FWD SELECTED' : 'FWD ALLOW') : 'FWD DROP') : 'FWD AUDIT';
         let targets = [];
         if (!forwardEffective) {
           const blocked = make('div', 'topology-target denied');
-          blocked.append(make('b', '', 'BLOCKED'));
-          blocked.append(make('small', '', 'globální FORWARD policy'));
+          blocked.append(make('b', '', tr('blocked')));
+          blocked.append(make('small', '', tr('forwardPolicy')));
           targets = [blocked];
         } else if ((entry.instances || []).length) {
           targets = entry.instances.map(renderTarget);
         } else {
           const empty = make('div', 'topology-target empty-route');
-          empty.append(make('b', '', 'NO LIVE ROUTE'));
-          empty.append(make('small', '', sourceEntries.some(item => item.spawn_allowed) ? 'spawn slot je volný' : 'žádná odpovídající instance'));
+          empty.append(make('b', '', tr('noRoute')));
+          empty.append(make('small', '', sourceEntries.some(item => item.spawn_allowed) ? tr('spawnFree') : tr('noInstance')));
           targets = [empty];
         }
         const forwardLane = renderLane('FORWARD', forwardEffective, forwardMode, targets);
@@ -346,7 +474,7 @@
         if (forwardEffective && attachableSources.length && attachableInstances.length && attachDialog) {
           const attach = make('button', 'topology-route-add', '+');
           attach.type = 'button';
-          attach.title = 'Připojit source k další živé instanci';
+          attach.title = tr('attachSource');
           attach.addEventListener('click', () => {
             attachSource.replaceChildren(...attachableSources.map(source => {
               const option = make('option', '', source); option.value = source; return option;
@@ -430,19 +558,23 @@
 
   function setupBuildForm() {
     const form = q('#build-form');
-    const submit = q('#build-submit');
     const state = q('#build-enqueue-state');
     if (!form || !state) return;
     form.addEventListener('submit', async event => {
       event.preventDefault();
+      const submit = event.submitter || q('#build-submit');
+      const buttons = [...form.querySelectorAll('button[type="submit"], button:not([type])')];
       if (submit?.disabled) return;
       const ref = form.elements.ref?.value || 'master';
-      if (submit) { submit.disabled = true; submit.textContent = tr('enqueuing'); }
-      state.textContent = `'${ref}' build task is being enqueued…`;
+      const originalLabels = buttons.map(button => button.textContent);
+      buttons.forEach(button => { button.disabled = true; });
+      if (submit) submit.textContent = tr('enqueuing');
+      state.textContent = `'${ref}' · ${tr('buildQueue')}`;
       state.className = 'build-enqueue-state';
       try {
+        const body = new FormData(form, submit);
         const response = await fetch(form.action, {
-          method: 'POST', body: new FormData(form),
+          method: 'POST', body,
           headers: {'X-Requested-With': 'task-fetch'}, cache: 'no-store',
         });
         const data = await response.json();
@@ -454,7 +586,7 @@
         state.textContent = error.message || String(error);
         state.className = 'build-enqueue-state error';
       } finally {
-        if (submit) { submit.disabled = false; submit.textContent = 'Build / rebuild'; }
+        buttons.forEach((button, index) => { button.disabled = false; button.textContent = originalLabels[index]; });
       }
     });
   }
@@ -490,11 +622,16 @@
         detail.textContent = task.error || `${task.kind} · ${stamp(task.started_at || task.created_at)}`;
         body.append(label, detail);
         const resultId = task.result?.id;
+        const exportId = task.result?.export_id;
         const viewable = task.state === 'succeeded' && [
           'config-preview', 'build-config-preview', 'instance-config-preview', 'config-observer'
         ].includes(task.kind);
         let tail;
-        if (resultId) {
+        if (exportId && task.kind === 'appliance-export') {
+          tail = document.createElement('a');
+          tail.href = `/appliance-exports/${encodeURIComponent(exportId)}/download`;
+          tail.textContent = locale === 'cs' ? 'Stáhnout' : locale === 'fr' ? 'Télécharger' : 'Download';
+        } else if (resultId) {
           tail = document.createElement('a'); tail.href = `/?instance=${encodeURIComponent(resultId)}`; tail.textContent = short(resultId);
         } else if (viewable) {
           tail = document.createElement('a');
@@ -548,6 +685,10 @@
     let logsRequest = 0;
     let diagnosticsRequest = 0;
     if (focusMode) document.body.classList.add('instance-focus-mode');
+    const memberHeading = q('.instance-list-head span:nth-child(5)');
+    if (memberHeading) memberHeading.textContent = 'Slice members';
+    const sliceHeading = q('#detail-pid')?.closest('div')?.querySelector('span');
+    if (sliceHeading) sliceHeading.textContent = 'Slice';
 
     function focusedInstanceUrl(instanceId, view = currentView) {
       const url = new URL('/', location.origin);
@@ -575,7 +716,7 @@
       text('#metric-running', instances.filter(item => ['running', 'starting'].includes(item.state)).length);
       text('#metric-orphaned', instances.filter(item => item.state === 'orphaned').length);
       text('#metric-total', instances.length);
-      text('#metric-rss', formatBytes(instances.reduce((sum, item) => sum + (item.rss_bytes || 0), 0)));
+      text('#metric-rss', formatBytes(instances.reduce((sum, item) => sum + (item.slice_rss_bytes || 0), 0)));
     }
 
     function visibleInstances() {
@@ -605,8 +746,9 @@
       const user = document.createElement('strong'); user.textContent = item.user_id || 'unknown';
       const profile = document.createElement('small'); profile.textContent = `${item.profile || 'custom'}${item.persistent ? ' · persistent' : ''}`;
       owner.append(user, profile);
-      const pid = document.createElement('code'); pid.className = 'instance-cell'; pid.textContent = item.pid || '—';
-      const rss = document.createElement('span'); rss.className = 'instance-cell'; rss.textContent = formatBytes(item.rss_bytes || 0);
+      const memberPids = (item.members || []).filter(member => member.pid).map(member => `${member.role}:${member.pid}`);
+      const pid = document.createElement('code'); pid.className = 'instance-cell'; pid.textContent = memberPids.join(' · ') || '—';
+      const rss = document.createElement('span'); rss.className = 'instance-cell'; rss.textContent = formatBytes(item.slice_rss_bytes || 0);
       const deadline = document.createElement('span'); deadline.className = 'instance-cell instance-cell-ttl'; deadline.textContent = ttl(item.deadline);
       button.append(state, source, identity, owner, pid, rss, deadline);
       button.addEventListener('click', () => selectInstance(item.id));
@@ -649,8 +791,9 @@
       text('#detail-state', item.state);
       q('#detail-state-dot').className = `state-${item.state}`;
       text('#detail-short-id', short(item.id)); text('#detail-full-id', item.id);
-      text('#detail-pid', item.pid ? `PID ${item.pid}` : 'PID —');
-      text('#detail-rss', `RSS ${formatBytes(item.rss_bytes || 0)} · CLI ${item.cli_port ? `:${item.cli_port}` : '—'}`);
+      const members = (item.members || []).filter(member => member.pid);
+      text('#detail-pid', item.slice_unit || 'Slice —');
+      text('#detail-rss', `${members.map(member => `${member.role} PID ${member.pid}`).join(' · ') || 'bez živých členů'} · RSS ${formatBytes(item.slice_rss_bytes || 0)} · CLI ${item.cli_port ? `:${item.cli_port}` : '—'}`);
       text('#detail-source', item.source_ip || '—'); text('#detail-user', item.user_id || 'unknown user');
       text('#detail-namespace', item.namespace || '—'); text('#detail-profile', `${item.profile || 'custom'} · ${item.unit || 'unit unknown'}`);
       text('#detail-ttl', ttl(item.deadline)); text('#detail-deadline', item.deadline ? new Date(item.deadline).toLocaleString() : tr('noDeadline'));
@@ -1171,7 +1314,9 @@
   }
 
   setupWorkspaceWidth();
+  setupNavigation();
   setupCopyableValues();
+  setupRuntimeProfileNetworkBindings();
   setupSpawnForm();
   setupProfileBuildUpgrade();
   setupProfileTtlControls();

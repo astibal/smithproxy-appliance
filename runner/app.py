@@ -30,6 +30,7 @@ from .config import ConfigError, PARAMETERS, TOKEN_RE, render_template, validate
 from .systemd import BackendError
 from .namespace import NamespaceBackend
 from .builder import SmithproxyBuilder
+from .tuntom_builder import TuntomBuilder
 from .config_library import ConfigLibrary
 from .runtime_profiles import RuntimeProfileLibrary
 from .cert_library import CertBundleLibrary
@@ -40,6 +41,9 @@ from .test_drive import TestDriveManager
 from .instance_layout import ensure_type_link, prepare_layout, remove_type_link
 from .firewall import FirewallManager
 from .network_profiles import NetworkProfileLibrary
+from .qemu_images import QemuImageLibrary
+from .appliance_exports import ApplianceExportLibrary
+from .headless_endpoints import HeadlessEndpointLibrary
 
 
 @dataclass
@@ -53,8 +57,9 @@ class Instance:
     result: str = ""
     source_ip: str = ""
     namespace: str = ""
-    pid: int = 0
-    rss_bytes: int = 0
+    slice_unit: str = ""
+    slice_rss_bytes: int = 0
+    members: list[dict[str, Any]] = field(default_factory=list)
     cli_port: int = 0
     resources_cleaned: bool = False
     build_id: str = "active"
@@ -81,8 +86,13 @@ class Instance:
     source_ips: list[str] = field(default_factory=list)
     socks_port: int = 1080
     http_port: int = 3128
+    tls_port: int = 50443
+    plaintext_port: int = 50080
     ingress_network_profile_id: str = ""
     egress_network_profile_id: str = ""
+    network_egress_driver: str = "split-veth"
+    tuntom_build_id: str = ""
+    headless_endpoint_id: str = ""
     filesystem_mode: str = "host"
 
 
@@ -163,15 +173,42 @@ class Manager:
         if not uuid_is_valid(instance_id):
             return None
         try:
-            instance = Instance(**json.loads(self._state_path(instance_id).read_text(encoding="utf-8")))
+            document = json.loads(self._state_path(instance_id).read_text(encoding="utf-8"))
+            # One-way state migration: keep live local units visible through
+            # the first restart after moving from one PID to a Slice model.
+            legacy_pid = int(document.pop("pid", 0) or 0)
+            legacy_rss = int(document.pop("rss_bytes", 0) or 0)
+            document.pop("processes", None)
+            allowed = Instance.__dataclass_fields__
+            instance = Instance(**{
+                key: value for key, value in document.items() if key in allowed
+            })
+            if legacy_pid and not instance.members:
+                instance.members = [{
+                    "role": "smithproxy", "unit": instance.unit,
+                    "pid": legacy_pid, "state": instance.state,
+                    "rss_bytes": legacy_rss,
+                }]
+                instance.slice_rss_bytes = legacy_rss
             if not instance.source_ips and instance.source_ip:
                 instance.source_ips = [instance.source_ip]
             return instance
         except (OSError, ValueError, TypeError):
             return None
 
+    @staticmethod
+    def _member_pid(instance: Instance, role: str = "smithproxy") -> int:
+        return next((
+            int(item.get("pid", 0)) for item in instance.members
+            if item.get("role") == role
+        ), 0)
+
     def _reconcile(self, instance: Instance) -> Instance:
         status = self.backend.status(instance.unit)
+        previous_smithproxy_pid = next((
+            int(item.get("pid", 0)) for item in instance.members
+            if item.get("role") == "smithproxy"
+        ), 0)
         deadline = datetime.fromisoformat(instance.deadline) if instance.deadline else None
         if (status.active_state in {"active", "activating", "reloading"}
                 and deadline and datetime.now(timezone.utc) >= deadline):
@@ -185,8 +222,8 @@ class Manager:
             self._remove_runtime(instance.id)
             instance.state = "expired"
             instance.stopped_at = datetime.now(timezone.utc).isoformat()
-            instance.pid = 0
-            instance.rss_bytes = 0
+            instance.members = []
+            instance.slice_rss_bytes = 0
             instance.result = "ttl-expired"
             instance.resources_cleaned = True
             self._save(instance)
@@ -194,13 +231,27 @@ class Manager:
         if status.active_state in {"active", "activating", "reloading"}:
             instance.state = "orphaned" if instance.state == "orphaned" else "running"
             instance.stopped_at = ""
-            instance.pid = status.main_pid
-            instance.rss_bytes = self.backend.rss_bytes(status.main_pid) if status.main_pid else 0
+            instance.slice_unit = getattr(
+                self.backend, "slice_name", lambda value: f"capture-zone-slice-{value}.slice"
+            )(instance.id)
+            instance.members = getattr(
+                self.backend, "slice_processes",
+                lambda _id, unit: [{
+                    "role": "smithproxy", "unit": unit,
+                    "pid": status.main_pid, "state": status.active_state,
+                    "substate": status.sub_state, "result": status.result,
+                    "rss_bytes": self.backend.rss_bytes(status.main_pid)
+                    if status.main_pid else 0,
+                }],
+            )(instance.id, instance.unit)
+            instance.slice_rss_bytes = sum(
+                int(item.get("rss_bytes", 0)) for item in instance.members
+            )
             instance.resources_cleaned = False
         else:
-            previous_pid = instance.pid
-            instance.pid = 0
-            instance.rss_bytes = 0
+            previous_pid = previous_smithproxy_pid
+            instance.members = []
+            instance.slice_rss_bytes = 0
             failed = status.result not in {"success", ""}
             if failed and previous_pid > 1 and instance.crash_pid != previous_pid:
                 instance.crash_pid = previous_pid
@@ -289,10 +340,25 @@ class Manager:
                 instance = Instance(
                     instance_id, unit, "orphaned", datetime.now(timezone.utc).isoformat(),
                     "", 0, result=status.result,
-                    namespace=getattr(allocation, "namespace", ""), pid=status.main_pid,
-                    rss_bytes=self.backend.rss_bytes(status.main_pid) if status.main_pid else 0,
+                    namespace=getattr(allocation, "namespace", ""),
+                    slice_unit=getattr(
+                        self.backend, "slice_name",
+                        lambda value: f"capture-zone-slice-{value}.slice",
+                    )(instance_id),
+                    members=getattr(
+                        self.backend, "slice_processes",
+                        lambda _id, member_unit: [{
+                            "role": "smithproxy", "unit": member_unit,
+                            "pid": status.main_pid, "state": status.active_state,
+                            "rss_bytes": self.backend.rss_bytes(status.main_pid)
+                            if status.main_pid else 0,
+                        }],
+                    )(instance_id, unit),
                     resources_cleaned=False, build_id="unknown", config_id="unknown",
                     persistent=True,
+                )
+                instance.slice_rss_bytes = sum(
+                    int(member.get("rss_bytes", 0)) for member in instance.members
                 )
                 print(f"orphan instance discovered; tracking without stopping {unit}")
                 self._save(instance)
@@ -338,7 +404,14 @@ class Manager:
             "auto_restart",
             "persistent",
             "ingress_network_profile_id", "egress_network_profile_id",
-            "network_egress_mode", "network_sas_interface",
+            "network_egress_mode", "network_sas_interface", "network_egress_driver",
+            "network_tuntom_socket", "network_tuntom_adapter",
+            "network_tuntom_binary",
+            "network_tuntom_build_id",
+            "network_tuntom_in_prefix", "network_tuntom_out_prefix",
+            "network_tuntom_admission", "network_tuntom_mtu",
+            "network_tuntom_tunnel_id", "headless_endpoint_id",
+            "network_runtime",
             "filesystem_mode",
         }
         unknown = set(payload) - allowed
@@ -354,6 +427,12 @@ class Manager:
         if runtime != 0 and not self.min_runtime <= runtime <= runtime_max:
             raise ConfigError(f"runtime_seconds must be between {self.min_runtime} and {runtime_max}")
         parameters = validate_parameters(payload.get("parameters", {}))
+        network_runtime = payload.get("network_runtime", {})
+        if not isinstance(network_runtime, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in network_runtime.items()
+        ):
+            raise ConfigError("network_runtime must be an object of string values")
         source_ip = str(payload.get("source_ip", "")).strip()
         try:
             source_ip = str(ipaddress.ip_address(source_ip))
@@ -377,9 +456,69 @@ class Manager:
         network_egress_mode = str(payload.get("network_egress_mode", ""))
         if network_egress_mode not in {"", "masquerade", "routed"}:
             raise ConfigError("network_egress_mode must be masquerade or routed")
+        network_egress_driver = str(payload.get("network_egress_driver", "split-veth"))
+        if network_egress_driver not in {"split-veth", "on-a-stick", "tuntom-via"}:
+            raise ConfigError(
+                "network_egress_driver must be split-veth, on-a-stick, or tuntom-via"
+            )
         network_sas_interface = str(payload.get("network_sas_interface", ""))
         if network_sas_interface and not re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", network_sas_interface):
             raise ConfigError("network_sas_interface is invalid")
+        network_tuntom_socket = str(payload.get(
+            "network_tuntom_socket", "/run/tuntom/via.sock"
+        ))
+        network_tuntom_build_id = str(payload.get("network_tuntom_build_id", ""))
+        network_tuntom_adapter = str(payload.get(
+            "network_tuntom_adapter", "/usr/local/bin/tuntom-divert-adapter"
+        ))
+        network_tuntom_binary = str(payload.get(
+            "network_tuntom_binary", "/usr/local/bin/tuntom"
+        ))
+        network_tuntom_in_prefix = str(payload.get(
+            "network_tuntom_in_prefix", "proxy-in-"
+        ))
+        network_tuntom_out_prefix = str(payload.get(
+            "network_tuntom_out_prefix", "proxy-out-"
+        ))
+        network_tuntom_admission = str(payload.get(
+            "network_tuntom_admission", "immediate"
+        ))
+        headless_endpoint_id = str(payload.get("headless_endpoint_id", ""))
+        if headless_endpoint_id and not uuid_is_valid(headless_endpoint_id):
+            raise ConfigError("headless_endpoint_id must be a UUID")
+        try:
+            network_tuntom_tunnel_id = int(payload.get("network_tuntom_tunnel_id", 0))
+        except (TypeError, ValueError) as exc:
+            raise ConfigError("network_tuntom_tunnel_id must be an integer") from exc
+        if network_tuntom_tunnel_id and not 1 <= network_tuntom_tunnel_id <= 255:
+            raise ConfigError("network_tuntom_tunnel_id must be between 1 and 255")
+        try:
+            network_tuntom_mtu = int(payload.get("network_tuntom_mtu", 1500))
+        except (TypeError, ValueError) as exc:
+            raise ConfigError("network_tuntom_mtu must be an integer") from exc
+        if network_egress_driver == "tuntom-via":
+            if not re.fullmatch(r"[0-9a-f]{40,64}-(?:release|debug)", network_tuntom_build_id):
+                raise ConfigError("tuntom-via requires a valid archived tuntom build id")
+            if network_egress_mode not in {"", "routed"}:
+                raise ConfigError("tuntom-via requires routed egress mode")
+            for label, value in (
+                ("network_tuntom_socket", network_tuntom_socket),
+                ("network_tuntom_adapter", network_tuntom_adapter),
+                ("network_tuntom_binary", network_tuntom_binary),
+            ):
+                candidate = Path(value)
+                if not candidate.is_absolute() or ".." in candidate.parts:
+                    raise ConfigError(f"{label} must be an absolute normalized path")
+            if network_tuntom_admission not in {"immediate", "warmup"}:
+                raise ConfigError("network_tuntom_admission is invalid")
+            if not 576 <= network_tuntom_mtu <= 9000:
+                raise ConfigError("network_tuntom_mtu must be between 576 and 9000")
+            for label, value in (
+                ("network_tuntom_in_prefix", network_tuntom_in_prefix),
+                ("network_tuntom_out_prefix", network_tuntom_out_prefix),
+            ):
+                if not re.fullmatch(r"[A-Za-z0-9_.-]{1,32}", value):
+                    raise ConfigError(f"{label} is invalid")
         filesystem_mode = str(payload.get("filesystem_mode", "host"))
         if filesystem_mode not in {"host", "rootfs"}:
             raise ConfigError("filesystem_mode must be host or rootfs")
@@ -545,7 +684,18 @@ class Manager:
                     auto_restart=auto_restart,
                     hard_runtime_seconds=0 if runtime == 0 else self.max_total_runtime,
                     egress_mode=network_egress_mode,
+                    egress_driver=network_egress_driver,
                     sas_interface=network_sas_interface,
+                    tuntom_socket=network_tuntom_socket,
+                    tuntom_binary=network_tuntom_binary,
+                    tuntom_adapter=network_tuntom_adapter,
+                    tuntom_in_prefix=network_tuntom_in_prefix,
+                    tuntom_out_prefix=network_tuntom_out_prefix,
+                    tuntom_admission=network_tuntom_admission,
+                    tuntom_mtu=network_tuntom_mtu,
+                    tuntom_switch_ip=str(network_runtime.get("tuntom_switch_ip", "")),
+                    tuntom_secret=str(network_runtime.get("tuntom_secret", "")),
+                    tuntom_tunnel_id=network_tuntom_tunnel_id,
                     rootfs_path=str(rootfs_path) if rootfs_path else "",
                 )
             except Exception:
@@ -559,6 +709,10 @@ class Manager:
                 (now + timedelta(seconds=runtime)).isoformat() if runtime else "", runtime,
                 source_ip=source_ip,
                 namespace=getattr(allocation, "namespace", ""),
+                slice_unit=getattr(
+                    self.backend, "slice_name",
+                    lambda value: f"capture-zone-slice-{value}.slice",
+                )(instance_id),
                 cli_port=parameters.get("cli_port", 50000),
                 build_id=build_id,
                 config_id=config_id,
@@ -575,8 +729,13 @@ class Manager:
                 source_ips=[source_ip],
                 socks_port=parameters.get("socks_port", 1080),
                 http_port=parameters.get("http_port", 3128),
+                tls_port=parameters.get("tls_port", 50443),
+                plaintext_port=parameters.get("plaintext_port", 50080),
                 ingress_network_profile_id=ingress_network_profile_id,
                 egress_network_profile_id=egress_network_profile_id,
+                network_egress_driver=network_egress_driver,
+                tuntom_build_id=network_tuntom_build_id,
+                headless_endpoint_id=headless_endpoint_id,
                 filesystem_mode=filesystem_mode,
             )
             self._save(instance)
@@ -603,6 +762,7 @@ class Manager:
             self.backend.attach_source(
                 instance.id, source, instance.profile,
                 instance.socks_port, instance.http_port,
+                instance.tls_port, instance.plaintext_port,
             )
             instance.source_ips = [*sources, source]
             instance.result = f"source-attached:{source}"
@@ -760,12 +920,15 @@ class Manager:
     def open_gdb_transport(self, instance_id: str, binary: Path):
         with self.lock:
             instance = self.get(instance_id)
-            if not instance or instance.state != "running" or not instance.pid:
+            if (not instance or instance.state != "running"
+                    or not self._member_pid(instance)):
                 raise ConfigError("instance is not running")
             previous = self.gdb_sessions.pop(instance.id, None)
             if previous:
                 previous.close()
-            unit, address, port = self.backend.start_debug(instance.id, instance.pid)
+            unit, address, port = self.backend.start_debug(
+                instance.id, self._member_pid(instance)
+            )
             instance.debug_unit = unit
             instance.debug_address = address
             instance.debug_port = port
@@ -811,8 +974,8 @@ class Manager:
                 self._snapshot_runtime_config(instance.id)
                 instance.state = "stopped"
                 instance.stopped_at = datetime.now(timezone.utc).isoformat()
-                instance.pid = 0
-                instance.rss_bytes = 0
+                instance.members = []
+                instance.slice_rss_bytes = 0
                 instance.resources_cleaned = True
                 self._save(instance)
                 self._remove_runtime(instance.id)
@@ -846,8 +1009,8 @@ class Manager:
                 (now + timedelta(seconds=instance.runtime_seconds)).isoformat()
                 if instance.runtime_seconds else ""
             )
-            instance.pid = 0
-            instance.rss_bytes = 0
+            instance.members = []
+            instance.slice_rss_bytes = 0
             instance.result = "restarted"
             instance.resources_cleaned = False
             self._save(instance)
@@ -890,9 +1053,11 @@ class Manager:
             instance = self.get(instance_id)
             if not instance:
                 return None
-            if instance.state != "running" or not instance.pid:
+            if instance.state != "running" or not self._member_pid(instance):
                 raise ConfigError("debug attach requires a running instance with a PID")
-            unit, address, port = self.backend.start_debug(instance.id, instance.pid)
+            unit, address, port = self.backend.start_debug(
+                instance.id, self._member_pid(instance)
+            )
             instance.debug_unit = unit
             instance.debug_address = address
             instance.debug_port = port
@@ -921,7 +1086,8 @@ class Manager:
             if not instance:
                 return None
             instance = self._reconcile(instance)
-            if instance.state in {"starting", "running", "orphaned"} or instance.pid:
+            if (instance.state in {"starting", "running", "orphaned"}
+                    or any(int(item.get("pid", 0)) > 0 for item in instance.members)):
                 raise ConfigError("running instance cannot be deleted")
             if not instance.resources_cleaned:
                 raise ConfigError("instance resources are not cleaned up")
@@ -994,7 +1160,8 @@ class Manager:
                     continue
                 if (current - stopped).total_seconds() < self.stopped_retention_seconds:
                     continue
-                if instance.pid or not instance.resources_cleaned:
+                if (any(int(item.get("pid", 0)) > 0 for item in instance.members)
+                        or not instance.resources_cleaned):
                     continue
                 try:
                     archive = self._archive_stopped_config(instance)
@@ -1024,7 +1191,8 @@ class Manager:
                         skipped_persistent.append(instance.id)
                     continue
                 if (instance.state not in {"stopped", "failed", "expired"}
-                        or instance.pid or not instance.resources_cleaned):
+                        or any(int(item.get("pid", 0)) > 0 for item in instance.members)
+                        or not instance.resources_cleaned):
                     continue
                 archive = ""
                 if self._config_path(instance.id).is_file():
@@ -1078,7 +1246,7 @@ def openapi_document() -> dict[str, Any]:
             "/v1/status": {"get": {"summary": "Runner, build and instance summary"}},
             "/v1/build": {
                 "get": {"summary": "Build status and bounded log"},
-                "post": {"summary": "Start an asynchronous source build"},
+                "post": {"summary": "Build a Git ref and optionally adopt its config and rootfs"},
             },
             "/v1/refs/refresh": {
                 "post": {"summary": "Start an asynchronous remote branch fetch"},
@@ -1100,6 +1268,17 @@ def openapi_document() -> dict[str, Any]:
             },
             "/v1/test-drives/{id}/config/preview": {
                 "post": {"summary": "Native-save Test Drive config into an approval preview"},
+            },
+            "/v1/appliance-exports": {
+                "get": {"summary": "List portable appliance archives"},
+                "post": {"summary": "Build a portable appliance archive"},
+            },
+            "/v1/appliance-exports/{id}": {
+                "get": {"summary": "Read portable appliance metadata"},
+                "delete": {"summary": "Delete a portable appliance archive"},
+            },
+            "/v1/appliance-exports/{id}/download": {
+                "get": {"summary": "Stream a portable appliance tar.gz"},
             },
             "/v1/builds/{id}": {
                 "delete": {"summary": "Delete an unused archived binary"},
@@ -1146,6 +1325,32 @@ def openapi_document() -> dict[str, Any]:
                 "get": {"summary": "Read one network profile and its usage"},
                 "put": {"summary": "Update one network profile"},
                 "delete": {"summary": "Delete an unused network profile"},
+            },
+            "/v1/headless-endpoints": {
+                "get": {"summary": "List unique Fabric endpoint packages"},
+                "post": {"summary": "Import one single-owner Fabric endpoint package"},
+            },
+            "/v1/headless-endpoints/{id}": {
+                "get": {"summary": "Read endpoint package metadata without its secret"},
+                "delete": {"summary": "Delete an available, never-bound endpoint package"},
+            },
+            "/v1/tuntom/build": {
+                "get": {"summary": "Read Tuntom adapter build and branch status"},
+                "post": {"summary": "Queue an immutable Tuntom adapter build"},
+            },
+            "/v1/tuntom/refs/refresh": {
+                "post": {"summary": "Queue a Tuntom remote branch refresh"},
+            },
+            "/v1/tuntom/builds/{id}": {
+                "delete": {"summary": "Delete an unused Tuntom adapter build"},
+            },
+            "/v1/qemu-images": {
+                "get": {"summary": "List staged QEMU blackbox manifests"},
+                "post": {"summary": "Import a QEMU manifest with one or more QCOW2 disks and NICs"},
+            },
+            "/v1/qemu-images/{id}": {
+                "get": {"summary": "Read one staged QEMU blackbox manifest"},
+                "delete": {"summary": "Delete a manifest without deleting staged source files"},
             },
             "/v1/runtime-profiles/{id}/work-files": {
                 "put": {"summary": "Add or replace a file copied into new instance /work"},
@@ -1300,7 +1505,11 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     network_settings: NetworkSettings | None = None,
                     test_drives: TestDriveManager | None = None,
                     firewall: FirewallManager | None = None,
-                    network_profiles: NetworkProfileLibrary | None = None):
+                    network_profiles: NetworkProfileLibrary | None = None,
+                    tuntom_builder: TuntomBuilder | None = None,
+                    qemu_images: QemuImageLibrary | None = None,
+                    appliance_exports: ApplianceExportLibrary | None = None,
+                    headless_endpoints: HeadlessEndpointLibrary | None = None):
     def firewall_context(sources: list[str] | None = None) -> tuple[str, list[str]]:
         if not network_settings:
             raise BackendError("network settings are unavailable")
@@ -1340,8 +1549,20 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                 "source": display_source, "source_cidr": key,
                 "input_allowed": False, "forward_allowed": False,
                 "spawn_allowed": False, "active": False, "systems": [], "instances": [],
-                "expirations": [],
+                "expirations": [], "selectors": [],
             })
+
+        def add_selector(entry: dict[str, Any], authorization: dict[str, Any]) -> None:
+            selector = {
+                "authorization_id": str(authorization.get("authorization_id", "")),
+                "protocol": str(authorization.get("protocol", "any")),
+                "destination": str(authorization.get("destination", "")),
+                "ports": list(authorization.get("ports", [])),
+                "chains": list(authorization.get("chains", [])),
+            }
+            if (selector["protocol"] != "any" or selector["destination"] or selector["ports"]):
+                if selector not in entry["selectors"]:
+                    entry["selectors"].append(selector)
 
         def add_expiration(entry: dict[str, Any], authorization: dict[str, Any]) -> None:
             expires_at = str(authorization.get("expires_at", ""))
@@ -1370,6 +1591,7 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
             if system and system not in entry["systems"]:
                 entry["systems"].append(system)
             add_expiration(entry, authorization)
+            add_selector(entry, authorization)
             if authorization.get("active"):
                 entry["active"] = True
                 entry["input_allowed"] |= "input" in authorization.get("chains", [])
@@ -1396,6 +1618,7 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                         continue
                     if address.version == authorized_network.version and address in authorized_network:
                         add_expiration(entry, authorization)
+                        add_selector(entry, authorization)
                         entry["input_allowed"] |= "input" in authorization.get("chains", [])
                         entry["forward_allowed"] |= "forward" in authorization.get("chains", [])
             for instance in instances:
@@ -1435,7 +1658,8 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                 except (AttributeError, BackendError, TypeError):
                     pass
                 entry["instances"].append({
-                    "id": instance.id, "state": instance.state, "pid": instance.pid,
+                    "id": instance.id, "state": instance.state,
+                    "slice_unit": instance.slice_unit, "members": instance.members,
                     "namespace": instance.namespace, "user_id": instance.user_id,
                     "profile": profile_names.get(instance.runtime_profile_id)
                     or instance.profile or "custom",
@@ -1508,15 +1732,42 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
 
     def network_binding(payload: dict, current: dict | None = None) -> tuple[str, str]:
         values = []
+        selected: list[dict | None] = []
         for kind in ("ingress", "egress"):
             field = f"{kind}_network_profile_id"
             value = str(payload.get(field, (current or {}).get(field, "")))
             if value:
                 if not network_profiles:
                     raise ConfigError("network profiles are unavailable")
-                network_profiles.get(value, kind)
+                selected.append(network_profiles.get(value, kind))
+            else:
+                selected.append(None)
             values.append(value)
+        duplex = [
+            item for item in selected
+            if item and item.get("consumes") == ["ingress", "egress"]
+        ]
+        duplex_ids = {str(item["network_profile_id"]) for item in duplex}
+        if len(duplex_ids) > 1:
+            raise ConfigError("runtime profile cannot combine two duplex network profiles")
+        if duplex_ids:
+            # One Tuntom VIA binding owns both di0 and do0. Canonical storage
+            # repeats the same immutable profile ID in both slots so API, CLI
+            # and diagnostics all expose that both sides are consumed.
+            profile_id = duplex_ids.pop()
+            return profile_id, profile_id
         return values[0], values[1]
+
+    def validate_tuntom_network_build(payload: dict) -> None:
+        driver = str(payload.get("driver", ""))
+        if driver not in {"tuntom", "tuntom-via"}:
+            return
+        if not tuntom_builder:
+            raise ConfigError("tuntom build library is unavailable")
+        build_id = str(payload.get("tuntom_build_id", ""))
+        tuntom_builder.resolve_tunnel(build_id)
+        if driver == "tuntom-via":
+            tuntom_builder.resolve_adapter(build_id)
 
     def profile_view(item: dict, *, artifacts: list[dict] | None = None,
                      instances: list[Instance] | None = None) -> dict:
@@ -1612,6 +1863,8 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
             for instance in (instances if instances is not None else manager.snapshot())
             if instance.runtime_profile_id == item.get("profile_id")
         ]}
+        result["network_start_parameters"] = []
+        result["network_drivers"] = {}
         for kind in ("ingress", "egress"):
             field = f"{kind}_network_profile_id"
             network_id = str(item.get(field, ""))
@@ -1622,6 +1875,10 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     selected = network_profiles.get(network_id, kind)
                     result[f"{kind}_network_profile_name"] = selected["name"]
                     result[f"{kind}_network_profile_ready"] = bool(selected["implemented"])
+                    result["network_drivers"][kind] = selected.get("driver", "")
+                    for parameter in selected.get("start_parameters", []):
+                        if parameter not in result["network_start_parameters"]:
+                            result["network_start_parameters"].append(parameter)
                     if not selected["implemented"]:
                         result["available"] = False
                 except BackendError:
@@ -1632,13 +1889,15 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
 
     def network_profile_view(item: dict) -> dict:
         profile_id = str(item.get("network_profile_id", ""))
-        field = f"{item.get('kind')}_network_profile_id"
         usage = []
         if runtime_profiles:
             usage = [
                 {"profile_id": profile["profile_id"], "name": profile["name"]}
                 for profile in runtime_profiles.list()
-                if profile.get(field) == profile_id
+                if profile_id in {
+                    profile.get("ingress_network_profile_id"),
+                    profile.get("egress_network_profile_id"),
+                }
             ]
         return {**item, "usage": {"runtime_profiles": usage}}
 
@@ -1991,6 +2250,7 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
         if not builder:
             return manager.create(payload)
         effective_payload = dict(payload)
+        required_network_runtime: list[str] = []
         runtime_profile_id = str(payload.get("runtime_profile_id", ""))
         if runtime_profile_id:
             if not runtime_profiles:
@@ -2012,6 +2272,9 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                 if not network_profiles:
                     raise ConfigError("network profiles are unavailable")
                 selected_network = network_profiles.get(network_id, kind)
+                for parameter in selected_network.get("start_parameters", []):
+                    if parameter not in required_network_runtime:
+                        required_network_runtime.append(parameter)
                 if not selected_network.get("implemented"):
                     raise ConfigError(
                         f"{kind} network profile uses a driver/selector not implemented by this runner"
@@ -2019,8 +2282,64 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                 if kind == "egress":
                     effective_payload["network_egress_mode"] = selected_network["mode"]
                     effective_payload["network_sas_interface"] = selected_network["host_interface"]
+                    effective_payload["network_egress_driver"] = selected_network["driver"]
+                    for field in (
+                        "socket", "build_id", "in_prefix", "out_prefix", "admission", "mtu",
+                    ):
+                        effective_payload[f"network_tuntom_{field}"] = selected_network[
+                            f"tuntom_{field}"
+                        ]
+                    if selected_network["driver"] == "tuntom-via":
+                        if not tuntom_builder:
+                            raise ConfigError("tuntom build library is unavailable")
+                        effective_payload["network_tuntom_adapter"] = str(
+                            tuntom_builder.resolve_adapter(selected_network["tuntom_build_id"])
+                        )
+                        effective_payload["network_tuntom_binary"] = str(
+                            tuntom_builder.resolve_tunnel(selected_network["tuntom_build_id"])
+                        )
             profile_ttl = binding.get("ttl_seconds", 1800)
             effective_payload["runtime_seconds"] = 0 if profile_ttl is None else profile_ttl
+        network_runtime = effective_payload.get("network_runtime", {})
+        if not isinstance(network_runtime, dict):
+            raise ConfigError("network_runtime must be an object")
+        unexpected = sorted(set(network_runtime) - set(required_network_runtime))
+        missing = [name for name in required_network_runtime if not network_runtime.get(name)]
+        if unexpected:
+            raise ConfigError(
+                "unexpected network runtime parameters: " + ", ".join(unexpected)
+            )
+        if missing:
+            raise ConfigError("missing network runtime parameters: " + ", ".join(missing))
+        headless_endpoint_id = str(network_runtime.get("headless_endpoint_id", ""))
+        if headless_endpoint_id and not uuid_is_valid(headless_endpoint_id):
+            raise ConfigError("headless_endpoint_id must be a UUID")
+        if "tuntom_secret" in network_runtime and not re.fullmatch(
+            r"[0-9a-fA-F]{32}", str(network_runtime["tuntom_secret"])
+        ):
+            raise ConfigError("tuntom_secret must contain exactly 32 hex characters")
+        for name in (
+            "tuntom_local_ip", "tuntom_peer_ip", "tuntom_peer_host", "tuntom_switch_ip",
+        ):
+            if name in network_runtime:
+                try:
+                    network_runtime[name] = str(ipaddress.ip_address(str(network_runtime[name])))
+                except ValueError as exc:
+                    raise ConfigError(f"{name} must be an IPv4 or IPv6 address") from exc
+        effective_payload["network_runtime"] = network_runtime
+        if str(effective_payload.get("network_egress_driver", "split-veth")) == "tuntom-via":
+            if not tuntom_builder:
+                raise ConfigError("tuntom build library is unavailable")
+            effective_payload["network_tuntom_adapter"] = str(
+                tuntom_builder.resolve_adapter(
+                    str(effective_payload.get("network_tuntom_build_id", ""))
+                )
+            )
+            effective_payload["network_tuntom_binary"] = str(
+                tuntom_builder.resolve_tunnel(
+                    str(effective_payload.get("network_tuntom_build_id", ""))
+                )
+            )
         requested_build = str(effective_payload.get("build_id", "active"))
         requested_config = str(effective_payload.get("config_id", "active"))
         binary = builder.resolve_binary(requested_build)
@@ -2050,16 +2369,44 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
         certs = cert_library.resolve(cert_bundle_id) if cert_bundle_id and cert_library else None
         if cert_bundle_id and not cert_library:
             raise BackendError("certificate bundles are unavailable")
-        return manager.create(
-            effective_payload, binary, config, assets_dir=assets,
-            cert_bundle_dir=certs,
-            work_installer=(
-                lambda destination: runtime_profiles.install_work_files(
-                    runtime_profile_id, destination,
-                )
-            ) if runtime_profile_id and runtime_profiles else None,
-            rootfs_path=rootfs,
-        )
+        reservation_id = "spawn-" + str(uuid.uuid4())
+        reserved_endpoint: dict[str, Any] | None = None
+        if headless_endpoint_id:
+            if not headless_endpoints:
+                raise ConfigError("headless endpoint package library is unavailable")
+            reserved_endpoint = headless_endpoints.reserve(
+                headless_endpoint_id, reservation_id,
+            )
+            effective_payload["headless_endpoint_id"] = headless_endpoint_id
+            effective_payload["network_tuntom_tunnel_id"] = int(
+                reserved_endpoint["tunnel_id"]
+            )
+            effective_payload["network_runtime"] = {
+                "tuntom_switch_ip": str(reserved_endpoint["switch_ip"]),
+                "tuntom_secret": str(reserved_endpoint["secret"]),
+            }
+        try:
+            item = manager.create(
+                effective_payload, binary, config, assets_dir=assets,
+                cert_bundle_dir=certs,
+                work_installer=(
+                    lambda destination: runtime_profiles.install_work_files(
+                        runtime_profile_id, destination,
+                    )
+                ) if runtime_profile_id and runtime_profiles else None,
+                rootfs_path=rootfs,
+            )
+            if reserved_endpoint and headless_endpoints:
+                try:
+                    headless_endpoints.bind(headless_endpoint_id, reservation_id, item.id)
+                except Exception:
+                    manager.stop(item.id)
+                    raise
+            return item
+        except Exception:
+            if reserved_endpoint and headless_endpoints:
+                headless_endpoints.cancel(headless_endpoint_id, reservation_id)
+            raise
 
     def wait_for_build() -> dict:
         if not builder:
@@ -2085,6 +2432,30 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                 return state
             time.sleep(0.25)
 
+    def wait_for_tuntom_build() -> dict:
+        if not tuntom_builder:
+            raise BackendError("tuntom builder is unavailable")
+        while True:
+            with tuntom_builder.lock:
+                state = asdict(tuntom_builder.state)
+            if state.get("state") != "running":
+                if state.get("state") == "failed":
+                    raise BackendError(str(state.get("error") or "tuntom build failed"))
+                return state
+            time.sleep(0.5)
+
+    def wait_for_tuntom_refs() -> dict:
+        if not tuntom_builder:
+            raise BackendError("tuntom builder is unavailable")
+        while True:
+            with tuntom_builder.refs_lock:
+                state = json.loads(json.dumps(tuntom_builder.refs_state))
+            if state.get("state") != "running":
+                if state.get("state") == "failed":
+                    raise BackendError(str(state.get("error") or "tuntom ref refresh failed"))
+                return state
+            time.sleep(0.25)
+
     action_routes = {
         "POST": (
             r"/v1/builds/[A-Za-z0-9._-]+/config/preview",
@@ -2098,6 +2469,7 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
             r"/v1/runtime-profiles",
             r"/v1/network-profiles",
             r"/v1/test-drives",
+            r"/v1/appliance-exports",
             r"/v1/test-drives/[0-9a-f-]+/upgrade",
             r"/v1/test-drives/[0-9a-f-]+/(?:extend|restart|config-mode|config/preview)",
             r"/v1/instances/cleanup",
@@ -2113,6 +2485,7 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
         ),
         "DELETE": (
             r"/v1/builds/[A-Za-z0-9._-]+",
+            r"/v1/tuntom/builds/[A-Za-z0-9._-]+",
             r"/v1/configs/previews/[0-9a-f-]+",
             r"/v1/instances/[0-9a-f-]+/debug",
             r"/v1/runtime-profiles/[0-9a-f-]+",
@@ -2122,6 +2495,7 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
             r"/v1/instances/[0-9a-f-]+/record",
             r"/v1/instances/[0-9a-f-]+",
             r"/v1/test-drives/[0-9a-f-]+",
+            r"/v1/appliance-exports/[0-9a-f-]+",
             r"/v1/firewall/authorizations/[0-9a-f-]+",
         ),
     }
@@ -2136,6 +2510,8 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
             return f"test-drive:{match.group(1)}"
         if path == "/v1/test-drives":
             return "test-drives"
+        if path == "/v1/appliance-exports":
+            return "appliance-exports"
         match = re.fullmatch(r"/v1/instances/([0-9a-f-]+)(?:/.*)?", path)
         if match:
             return f"instance:{match.group(1)}"
@@ -2162,6 +2538,20 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                 # Browsers and reverse proxies routinely cancel superseded
                 # polling requests.  The requested operation has already
                 # completed, so there is nothing to retry or report here.
+                self.close_connection = True
+
+        def _download(self, path: Path, filename: str) -> None:
+            try:
+                size = path.stat().st_size
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "application/gzip")
+                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+                self.send_header("Content-Length", str(size))
+                self.send_header("Cache-Control", "private, no-store")
+                self.end_headers()
+                with path.open("rb") as source:
+                    shutil.copyfileobj(source, self.wfile, length=1024 * 1024)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 self.close_connection = True
 
         def _authorized(self) -> bool:
@@ -2232,6 +2622,21 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                 self._json(HTTPStatus.OK, asdict(item)) if item else self._json(
                     HTTPStatus.NOT_FOUND, {"error": "test drive not found"}
                 )
+            elif parts == ["v1", "appliance-exports"] and appliance_exports:
+                self._json(HTTPStatus.OK, {"exports": appliance_exports.list()})
+            elif (len(parts) == 3 and parts[:2] == ["v1", "appliance-exports"]
+                  and appliance_exports):
+                try:
+                    self._json(HTTPStatus.OK, appliance_exports.get(parts[2]))
+                except BackendError as exc:
+                    self._json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+            elif (len(parts) == 4 and parts[:2] == ["v1", "appliance-exports"]
+                  and parts[3] == "download" and appliance_exports):
+                try:
+                    item, archive = appliance_exports.archive(parts[2])
+                    self._download(archive, str(item["archive_name"]))
+                except (BackendError, OSError) as exc:
+                    self._json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
             elif (len(parts) == 4 and parts[:2] == ["v1", "test-drives"]
                   and parts[3] == "logs" and test_drives):
                 try:
@@ -2278,6 +2683,8 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
             elif parts == ["v1", "build"] and builder:
                 self._json(HTTPStatus.OK, build_status_view())
+            elif parts == ["v1", "tuntom", "build"] and tuntom_builder:
+                self._json(HTTPStatus.OK, tuntom_builder.status())
             elif parts == ["v1", "configs"] and config_library:
                 self._json(HTTPStatus.OK, {
                     "configs": builder.configs() if builder else config_library.list()
@@ -2303,6 +2710,21 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     })
                 except BackendError as exc:
                     self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
+            elif parts == ["v1", "headless-endpoints"] and headless_endpoints:
+                self._json(HTTPStatus.OK, {"packages": headless_endpoints.list()})
+            elif (len(parts) == 3 and parts[:2] == ["v1", "headless-endpoints"]
+                  and headless_endpoints):
+                try:
+                    self._json(HTTPStatus.OK, headless_endpoints.get(parts[2]))
+                except BackendError as exc:
+                    self._json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+            elif parts == ["v1", "qemu-images"] and qemu_images:
+                self._json(HTTPStatus.OK, {"images": qemu_images.list()})
+            elif len(parts) == 3 and parts[:2] == ["v1", "qemu-images"] and qemu_images:
+                try:
+                    self._json(HTTPStatus.OK, qemu_images.get(parts[2]))
+                except BackendError as exc:
+                    self._json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
             elif (len(parts) == 3 and parts[:2] == ["v1", "network-profiles"]
                   and network_profiles):
                 try:
@@ -2389,7 +2811,10 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     self._json(HTTPStatus.OK, {
                         "instance": asdict(item),
                         "execution": {
-                            "model": "systemd transient unit + network namespace",
+                            "model": "systemd Slice + transient members + network namespace",
+                            "slice_unit": item.slice_unit,
+                            "slice_rss_bytes": item.slice_rss_bytes,
+                            "members": item.members,
                             "unit": item.unit,
                             "rootfs": rootfs_path,
                             "rootfs_mode": rootfs_mode,
@@ -2403,6 +2828,10 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                             "build_type": build_type,
                             "network": network,
                             "network_profiles": network_bindings,
+                            "headless_endpoint": (
+                                headless_endpoints.get(item.headless_endpoint_id)
+                                if item.headless_endpoint_id and headless_endpoints else None
+                            ),
                             "debug": {
                                 "unit": item.debug_unit,
                                 "address": item.debug_address,
@@ -2509,6 +2938,10 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     ingress_network_v6 = ipaddress.ip_network(
                         validated_settings["ingress_cidr_v6"]
                     )
+                    fabric_network = ipaddress.ip_network(validated_settings["fabric_cidr"])
+                    fabric_network_v6 = ipaddress.ip_network(
+                        validated_settings["fabric_cidr_v6"]
+                    )
                     sources = []
                     for raw_source in raw_sources:
                         try:
@@ -2520,7 +2953,13 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                         own_ingress_network = (
                             ingress_network_v6 if address.version == 6 else ingress_network
                         )
-                        if address in own_network or address in own_ingress_network:
+                        own_fabric_network = (
+                            fabric_network_v6 if address.version == 6 else fabric_network
+                        )
+                        if (
+                            address in own_network or address in own_ingress_network
+                            or address in own_fabric_network
+                        ):
                             raise ConfigError(
                                 f"authorized source IP overlaps ingress/egress CIDR: {source}"
                             )
@@ -2607,6 +3046,9 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     payload = json.loads(self.rfile.read(length))
                     if not isinstance(payload, dict):
                         raise ConfigError("network profile must be an object")
+                    validate_tuntom_network_build({
+                        **network_profiles.get(parts[2]), **payload,
+                    })
                     item = network_profiles.update(parts[2], payload)
                     self._json(HTTPStatus.OK, network_profile_view(item))
                 except (ConfigError, BackendError, ValueError, TypeError,
@@ -2888,6 +3330,48 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     self._json(HTTPStatus.CREATED, asdict(item))
                 except (ConfigError, BackendError, OSError, ValueError,
                         TypeError, json.JSONDecodeError) as exc:
+                    self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            if (parts == ["v1", "appliance-exports"] and appliance_exports
+                    and builder and config_library):
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if length <= 0 or length > max_config_body:
+                        raise ConfigError("invalid appliance export request size")
+                    payload = json.loads(self.rfile.read(length))
+                    if not isinstance(payload, dict):
+                        raise ConfigError("appliance export request must be an object")
+                    build_id = str(payload.get("build_id", ""))
+                    config_id = str(payload.get("config_id", ""))
+                    mode = str(payload.get("filesystem_mode", "plain"))
+                    config_meta = config_library.get(config_id)
+                    if not config_meta.get("native"):
+                        raise ConfigError("appliance export requires an approved native config")
+                    raw_parameters = payload.get("parameters", {})
+                    if not isinstance(raw_parameters, dict):
+                        raise ConfigError("parameters must be an object")
+                    parameters = {str(key).upper(): str(value) for key, value in raw_parameters.items()}
+                    missing = sorted(set(config_meta.get("placeholders", [])) - set(parameters))
+                    if missing:
+                        raise ConfigError("missing config parameters: " + ", ".join(missing))
+                    artifact = builder.artifact(build_id)
+                    binary = builder.resolve_binary(build_id)
+                    rootfs = None
+                    if mode == "rootfs":
+                        builder.prepare_rootfs(build_id)
+                        rootfs = builder.resolve_rootfs(build_id)
+                    item = appliance_exports.create(
+                        name=str(payload.get("name", "")), build=artifact, binary=binary,
+                        config=config_library.resolve(config_id),
+                        assets=config_library.resolve_assets(config_id),
+                        filesystem_mode=mode, rootfs=rootfs,
+                        profile=str(config_meta.get("profile", "custom")),
+                        config_id=config_id, config_name=str(config_meta.get("name", "")),
+                        parameters=parameters,
+                    )
+                    self._json(HTTPStatus.CREATED, item)
+                except (ConfigError, BackendError, OSError, ValueError, TypeError,
+                        json.JSONDecodeError) as exc:
                     self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
             if (len(parts) == 4 and parts[:2] == ["v1", "test-drives"]
@@ -3319,8 +3803,32 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     payload = json.loads(self.rfile.read(length))
                     if not isinstance(payload, dict):
                         raise ConfigError("network profile must be an object")
+                    validate_tuntom_network_build(payload)
                     item = network_profiles.create(payload)
                     self._json(HTTPStatus.CREATED, network_profile_view(item))
+                except (ConfigError, BackendError, ValueError, TypeError,
+                        json.JSONDecodeError) as exc:
+                    self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            if parts == ["v1", "headless-endpoints"] and headless_endpoints:
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if length <= 0 or length > max_body:
+                        raise ConfigError("invalid headless endpoint package size")
+                    payload = json.loads(self.rfile.read(length))
+                    self._json(HTTPStatus.CREATED, headless_endpoints.create(payload))
+                except (ConfigError, BackendError, ValueError, TypeError,
+                        json.JSONDecodeError) as exc:
+                    self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            if parts == ["v1", "qemu-images"] and qemu_images:
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if length <= 0 or length > max_body:
+                        raise ConfigError("invalid QEMU image manifest size")
+                    self._json(HTTPStatus.CREATED, qemu_images.create(
+                        json.loads(self.rfile.read(length))
+                    ))
                 except (ConfigError, BackendError, ValueError, TypeError,
                         json.JSONDecodeError) as exc:
                     self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
@@ -3336,10 +3844,15 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     payload = json.loads(self.rfile.read(length)) if length else {}
                     ref = str(payload.get("ref", "master"))
                     build_type = str(payload.get("build_type", "Release"))
+                    adopt = payload.get("adopt", True)
+                    if not isinstance(adopt, bool):
+                        raise ConfigError("adopt must be a boolean")
 
                     def build_task() -> dict:
                         builder.start(ref, build_type)
                         state = wait_for_build()
+                        if not adopt:
+                            return {**state, "adopted": False}
                         revision = str(state.get("revision", ""))
                         artifact = next((
                             item for item in builder.artifacts()
@@ -3355,13 +3868,59 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                             builder, config_library, normalize_native,
                             str(artifact.get("build_id", artifact.get("commit_id", ""))),
                         )
-                        return {**state, "default_config": default_config}
+                        build_id = str(artifact.get("build_id", artifact.get("commit_id", "")))
+                        rootfs = builder.prepare_rootfs(build_id)
+                        return {
+                            **state, "adopted": True, "build_id": build_id,
+                            "default_config": default_config, "rootfs": rootfs,
+                        }
 
                     self._json(HTTPStatus.ACCEPTED, submit_task(
-                        "build", f"Build {ref} ({build_type})",
-                        f"build:{ref}:{build_type}", "build", build_task,
+                        "adopt" if adopt else "build",
+                        f"{'Adopt' if adopt else 'Build'} {ref} ({build_type})",
+                        f"{'adopt' if adopt else 'build'}:{ref}:{build_type}",
+                        "build", build_task,
                     ))
-                except (BackendError, json.JSONDecodeError) as exc:
+                except (ConfigError, BackendError, json.JSONDecodeError) as exc:
+                    self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            if parts == ["v1", "tuntom", "build"] and tuntom_builder:
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    payload = json.loads(self.rfile.read(length)) if length else {}
+                    ref = str(payload.get("ref", "master"))
+                    build_type = str(payload.get("build_type", "Release"))
+
+                    def tuntom_build_task() -> dict:
+                        tuntom_builder.start(ref, build_type)
+                        state = wait_for_tuntom_build()
+                        artifact = next((
+                            item for item in tuntom_builder.artifacts()
+                            if item.get("commit_id") == state.get("revision")
+                            and item.get("ref") == ref
+                            and item.get("build_type") == build_type
+                        ), None)
+                        if not artifact:
+                            raise BackendError("completed tuntom artifact is unavailable")
+                        return {**state, "build_id": artifact["build_id"]}
+
+                    self._json(HTTPStatus.ACCEPTED, submit_task(
+                        "tuntom-build", f"Build Tuntom {ref} ({build_type})",
+                        f"tuntom-build:{ref}:{build_type}", "tuntom-build",
+                        tuntom_build_task,
+                    ))
+                except (ConfigError, BackendError, json.JSONDecodeError) as exc:
+                    self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            if parts == ["v1", "tuntom", "refs", "refresh"] and tuntom_builder:
+                try:
+                    self._json(HTTPStatus.ACCEPTED, submit_task(
+                        "tuntom-fetch", "Fetch Tuntom branches", "tuntom-fetch",
+                        "tuntom-build", lambda: (
+                            tuntom_builder.request_ref_refresh(), wait_for_tuntom_refs()
+                        )[1],
+                    ))
+                except BackendError as exc:
                     self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
             if len(parts) == 4 and parts[:2] == ["v1", "instances"] and parts[3] == "cli":
@@ -3444,6 +4003,19 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                 self._json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
                 return
             parts = self._path()
+            if (len(parts) == 3 and parts[:2] == ["v1", "headless-endpoints"]
+                    and headless_endpoints):
+                try:
+                    self._json(HTTPStatus.OK, headless_endpoints.delete(parts[2]))
+                except BackendError as exc:
+                    self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                return
+            if len(parts) == 3 and parts[:2] == ["v1", "qemu-images"] and qemu_images:
+                try:
+                    self._json(HTTPStatus.OK, qemu_images.delete(parts[2]))
+                except BackendError as exc:
+                    self._json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+                return
             if (len(parts) == 4 and parts[:3] == ["v1", "firewall", "authorizations"]
                     and firewall):
                 try:
@@ -3499,6 +4071,13 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                 except BackendError as exc:
                     self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
                 return
+            if (len(parts) == 3 and parts[:2] == ["v1", "appliance-exports"]
+                    and appliance_exports):
+                try:
+                    self._json(HTTPStatus.OK, appliance_exports.delete(parts[2]))
+                except BackendError as exc:
+                    self._json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+                return
             if len(parts) == 3 and parts[:2] == ["v1", "builds"] and builder:
                 build_id = parts[2]
                 usage = build_usage(build_id)
@@ -3510,6 +4089,36 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     return
                 try:
                     item = builder.delete_artifact(build_id)
+                    self._json(HTTPStatus.OK, item) if item else self._json(
+                        HTTPStatus.NOT_FOUND, {"error": "not found"}
+                    )
+                except BackendError as exc:
+                    self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                return
+            if (len(parts) == 4 and parts[:3] == ["v1", "tuntom", "builds"]
+                    and tuntom_builder):
+                build_id = parts[3]
+                usage = [
+                    {"network_profile_id": item.get("network_profile_id", ""),
+                     "name": item.get("name", "")}
+                    for item in (network_profiles.list("egress") if network_profiles else [])
+                    if item.get("tuntom_build_id") == build_id
+                ]
+                active_instances = [
+                    {"instance_id": item.id, "state": item.state}
+                    for item in manager.snapshot()
+                    if item.tuntom_build_id == build_id
+                    and item.state in {"starting", "running", "orphaned"}
+                ]
+                if usage or active_instances:
+                    self._json(HTTPStatus.CONFLICT, {
+                        "error": "tuntom build is referenced by a network profile or active Slice",
+                        "network_profiles": usage,
+                        "instances": active_instances,
+                    })
+                    return
+                try:
+                    item = tuntom_builder.delete_artifact(build_id)
                     self._json(HTTPStatus.OK, item) if item else self._json(
                         HTTPStatus.NOT_FOUND, {"error": "not found"}
                     )
@@ -3550,9 +4159,12 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     and network_profiles):
                 try:
                     item = network_profiles.get(parts[2])
-                    field = f"{item['kind']}_network_profile_id"
                     if runtime_profiles and any(
-                        profile.get(field) == parts[2] for profile in runtime_profiles.list()
+                        parts[2] in {
+                            profile.get("ingress_network_profile_id"),
+                            profile.get("egress_network_profile_id"),
+                        }
+                        for profile in runtime_profiles.list()
                     ):
                         self._json(HTTPStatus.CONFLICT, {
                             "error": "network profile is referenced by a runtime profile",
@@ -3801,11 +4413,22 @@ def main() -> None:
     network_profiles = NetworkProfileLibrary(Path(os.environ.get(
         "CZ_RUNNER_NETWORK_PROFILES", "/var/lib/capture-zone-runner/network-profiles.json"
     )))
+    headless_endpoints = HeadlessEndpointLibrary(Path(os.environ.get(
+        "CZ_RUNNER_HEADLESS_ENDPOINTS",
+        "/var/lib/capture-zone-runner/headless-endpoints.json",
+    )))
+    qemu_images = QemuImageLibrary(
+        Path(os.environ.get("CZ_RUNNER_QEMU_IMAGES", "/var/lib/capture-zone-runner/qemu-images")),
+        Path(os.environ.get("CZ_RUNNER_QEMU_IMPORT", "/var/lib/capture-zone-runner/import/qemu")),
+    )
     cert_library = CertBundleLibrary(Path(os.environ.get(
         "CZ_RUNNER_CERT_LIBRARY", "/var/lib/capture-zone-runner/cert-library"
     )))
     config_previews = ConfigPreviewLibrary(Path(os.environ.get(
         "CZ_RUNNER_CONFIG_PREVIEWS", "/var/lib/capture-zone-runner/config-previews"
+    )))
+    appliance_exports = ApplianceExportLibrary(Path(os.environ.get(
+        "CZ_RUNNER_APPLIANCE_EXPORTS", "/var/lib/capture-zone-runner/appliance-exports"
     )))
     builder = SmithproxyBuilder(
         Path(os.environ.get("CZ_RUNNER_SOURCE_DIR", "/var/lib/capture-zone-runner/smithproxy-src")),
@@ -3818,6 +4441,22 @@ def main() -> None:
         )),
     )
     builder.start_ref_refresh(int(os.environ.get("CZ_RUNNER_REF_REFRESH_SECONDS", "300")))
+    tuntom_builder = TuntomBuilder(
+        Path(os.environ.get(
+            "CZ_RUNNER_TUNTOM_SOURCE_DIR", "/var/lib/capture-zone-runner/tuntom-src"
+        )),
+        Path(os.environ.get(
+            "CZ_RUNNER_TUNTOM_BUILDS", "/var/lib/capture-zone-runner/tuntom-builds"
+        )),
+        os.environ.get(
+            "CZ_RUNNER_TUNTOM_REPOSITORY", "https://github.com/astibal/tuntom.git"
+        ),
+        int(os.environ["CZ_RUNNER_BUILD_JOBS"])
+        if os.environ.get("CZ_RUNNER_BUILD_JOBS") else None,
+    )
+    tuntom_builder.start_ref_refresh(
+        int(os.environ.get("CZ_RUNNER_REF_REFRESH_SECONDS", "300"))
+    )
     tasks = TaskQueue(
         Path(os.environ.get(
             "CZ_RUNNER_TASK_STATE", "/var/lib/capture-zone-runner/tasks.json"
@@ -3863,6 +4502,10 @@ def main() -> None:
         test_drives=test_drives,
         firewall=firewall,
         network_profiles=network_profiles,
+        tuntom_builder=tuntom_builder,
+        qemu_images=qemu_images,
+        appliance_exports=appliance_exports,
+        headless_endpoints=headless_endpoints,
     ))
     ws_server = serve(
         websocket_handler_factory(manager, token, builder, test_drives), host, ws_port,

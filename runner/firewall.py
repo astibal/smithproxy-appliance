@@ -61,6 +61,52 @@ class FirewallManager:
         return chains
 
     @staticmethod
+    def _protocol(value: object) -> str:
+        protocol = str(value or "any").strip().lower()
+        if protocol not in {"any", "tcp", "udp"}:
+            raise ConfigError("protocol must be any, tcp, or udp")
+        return protocol
+
+    @staticmethod
+    def _destination(value: object, source: str) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        try:
+            destination = ipaddress.ip_network(raw, strict=False)
+        except ValueError as exc:
+            raise ConfigError(
+                f"destination must be an IPv4/IPv6 address or CIDR: {exc}"
+            ) from exc
+        if destination.version != ipaddress.ip_network(source).version:
+            raise ConfigError("source and destination must use the same IP family")
+        return str(destination)
+
+    @staticmethod
+    def _ports(value: object, protocol: str) -> list[str]:
+        if value in (None, "", []):
+            return []
+        raw_values = value if isinstance(value, list) else str(value).split(",")
+        ports: set[tuple[int, int]] = set()
+        for raw in raw_values:
+            token = str(raw).strip()
+            if not token:
+                continue
+            parts = token.split("-", 1)
+            try:
+                start = int(parts[0])
+                end = int(parts[1]) if len(parts) == 2 else start
+            except ValueError as exc:
+                raise ConfigError("ports must contain numbers or ranges such as 443,8000-8010") from exc
+            if not 1 <= start <= end <= 65535:
+                raise ConfigError("ports must be between 1 and 65535")
+            ports.add((start, end))
+        if ports and protocol not in {"tcp", "udp"}:
+            raise ConfigError("ports require tcp or udp protocol")
+        return [str(start) if start == end else f"{start}-{end}"
+                for start, end in sorted(ports)]
+
+    @staticmethod
     def _expiry(payload: dict[str, Any]) -> str:
         raw_ttl = payload.get("ttl_seconds")
         raw_expiry = str(payload.get("expires_at", "")).strip()
@@ -127,9 +173,12 @@ class FirewallManager:
     def render(self, document: dict[str, Any], namespace_cidr: str,
                inherited_forward_sources: list[str]) -> str:
         active = [item for item in document["authorizations"] if self._active(item)]
-        input_sources = [item["source"] for item in active if "input" in item["chains"]]
+        broad = [item for item in active if item.get("protocol", "any") == "any"
+                 and not item.get("destination") and not item.get("ports")]
+        selected = [item for item in active if item not in broad]
+        input_sources = [item["source"] for item in broad if "input" in item["chains"]]
         forward_sources = inherited_forward_sources + [
-            item["source"] for item in active if "forward" in item["chains"]
+            item["source"] for item in broad if "forward" in item["chains"]
         ]
         def family(values: list[str], version: int) -> list[str]:
             return [value for value in values if ipaddress.ip_network(value, strict=False).version == version]
@@ -138,6 +187,30 @@ class FirewallManager:
         def elements(values: list[str]) -> str:
             rendered = self._elements(values)
             return f"    elements = {{ {rendered} }}\n" if rendered else ""
+        def selector_rule(item: dict[str, Any], chain: str) -> str:
+            source = ipaddress.ip_network(item["source"], strict=False)
+            family_name = "ip" if source.version == 4 else "ip6"
+            pieces = [f"{family_name} saddr {source}"]
+            destination = str(item.get("destination", ""))
+            if destination:
+                pieces.append(f"{family_name} daddr {destination}")
+            protocol = str(item.get("protocol", "any"))
+            ports = list(item.get("ports", []))
+            if ports:
+                rendered_ports = ports[0] if len(ports) == 1 else "{ " + ", ".join(ports) + " }"
+                pieces.append(f"{protocol} dport {rendered_ports}")
+            elif protocol != "any":
+                pieces.append(f"meta l4proto {protocol}")
+            if chain == "forward":
+                pieces.insert(0, 'oifname "czi*"')
+            short_id = str(item.get("authorization_id", ""))[:8]
+            return "    " + " ".join(pieces) + f' counter accept comment "SAS auth {short_id}"\n'
+        selected_input = "".join(
+            selector_rule(item, "input") for item in selected if "input" in item["chains"]
+        )
+        selected_forward = "".join(
+            selector_rule(item, "forward") for item in selected if "forward" in item["chains"]
+        )
         input_rules = ""
         if document.get("input_enforced"):
             input_rules = (
@@ -145,6 +218,7 @@ class FirewallManager:
                 "    iifname \"lo\" accept\n"
                 "    ip saddr @input_sources_v4 accept\n"
                 "    ip6 saddr @input_sources_v6 accept\n"
+                f"{selected_input}"
                 "    counter drop comment \"SAS INPUT deny\"\n"
             )
         forward_rules = ""
@@ -157,6 +231,7 @@ class FirewallManager:
                 "comment \"instance IPv6 egress\"\n"
                 "    oifname \"czi*\" ip saddr @forward_sources_v4 accept\n"
                 "    oifname \"czi*\" ip6 saddr @forward_sources_v6 accept\n"
+                f"{selected_forward}"
                 "    oifname \"czi*\" counter drop comment \"SAS instance ingress deny\"\n"
             )
         return (
@@ -215,6 +290,9 @@ class FirewallManager:
             items = []
             for source in document["authorizations"]:
                 item = dict(source)
+                item.setdefault("protocol", "any")
+                item.setdefault("destination", "")
+                item.setdefault("ports", [])
                 item["active"] = self._active(item, now)
                 items.append(item)
             return {
@@ -244,6 +322,9 @@ class FirewallManager:
             inherited_sources: list[str], registered_source: bool = False) -> dict[str, Any]:
         source = self._source(payload.get("source", ""))
         chains = self._chains(payload.get("chains", ["forward"]))
+        protocol = self._protocol(payload.get("protocol", "any"))
+        destination = self._destination(payload.get("destination", ""), source)
+        ports = self._ports(payload.get("ports", []), protocol)
         label = str(payload.get("label", "")).strip()[:128]
         system = str(payload.get("system", "capture-zone")).strip()[:64]
         if not system or any(ord(character) < 32 for character in system + label):
@@ -251,6 +332,7 @@ class FirewallManager:
         item = {
             "authorization_id": str(uuid.uuid4()), "source": source,
             "chains": chains, "label": label, "system": system,
+            "protocol": protocol, "destination": destination, "ports": ports,
             "expires_at": self._expiry(payload), "registered_source": registered_source,
             "created_at": _now().isoformat(),
         }
@@ -259,7 +341,10 @@ class FirewallManager:
             duplicate = next((current for current in reversed(document["authorizations"])
                               if current.get("source") == source
                               and current.get("chains") == chains
-                              and current.get("system") == system), None)
+                              and current.get("system") == system
+                              and current.get("protocol", "any") == protocol
+                              and current.get("destination", "") == destination
+                              and current.get("ports", []) == ports), None)
             if duplicate:
                 item.update({
                     "authorization_id": duplicate["authorization_id"],

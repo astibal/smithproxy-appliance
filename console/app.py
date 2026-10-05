@@ -14,7 +14,7 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 import click
-from flask import Flask, Response, abort, flash, g, jsonify, redirect, render_template, request, send_file, session, url_for
+from flask import Flask, Response, abort, flash, g, jsonify, redirect, render_template, request, send_file, session, stream_with_context, url_for
 from flask_sock import Sock
 from websockets.sync.client import connect as websocket_connect
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -26,19 +26,30 @@ except ImportError:  # Flask's ``--app /absolute/path/app.py`` loader.
 
 
 def partition_branches(branches, *, now=None, attic_days=365):
-    """Keep old remote refs available without crowding the active catalogue."""
+    """Keep old refs in the attic; show built and recently committed refs first."""
     current = now or datetime.now(timezone.utc)
     active, attic = [], []
     for source in branches:
         item = dict(source)
+        sort_timestamp = float("-inf")
         try:
             committed = datetime.fromisoformat(str(item.get("commit_at", "")).replace("Z", "+00:00"))
             if committed.tzinfo is None:
                 committed = committed.replace(tzinfo=timezone.utc)
             item["age_days"] = max(0, int((current - committed).total_seconds() // 86400))
+            sort_timestamp = committed.timestamp()
         except (TypeError, ValueError):
             item["age_days"] = None
+        item["sort_timestamp"] = sort_timestamp
         (attic if item["age_days"] is not None and item["age_days"] > attic_days else active).append(item)
+    def sort_key(item):
+        return (
+            0 if item.get("has_build") else 1,
+            -float(item.pop("sort_timestamp", float("-inf"))),
+            str(item.get("name", "")),
+        )
+    active.sort(key=sort_key)
+    attic.sort(key=sort_key)
     return active, attic
 
 
@@ -136,6 +147,25 @@ def create_app(test_config=None):
             "method": method, "path": path, "payload": payload,
             "label": label, "kind": kind,
         })
+
+    def runner_download(path):
+        token = app.config["RUNNER_TOKEN"]
+        if not token:
+            raise RuntimeError("CZ_RUNNER_TOKEN is not configured")
+        req = Request(
+            app.config["RUNNER_URL"].rstrip("/") + path, method="GET",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/gzip"},
+        )
+        try:
+            return urlopen(req, timeout=max(90, app.config["RUNNER_TIMEOUT"]))
+        except HTTPError as exc:
+            try:
+                message = json.load(exc).get("error", str(exc))
+            except Exception:
+                message = str(exc)
+            raise RuntimeError(message) from exc
+        except (URLError, OSError, TimeoutError) as exc:
+            raise RuntimeError(f"runner unavailable: {exc}") from exc
 
     def flash_queued(result, message="Akce zařazena"):
         prefix = "Stejná akce už ve frontě je" if result.get("deduplicated") else message
@@ -350,15 +380,17 @@ def create_app(test_config=None):
             instances = api("GET", "/v1/instances")["instances"]
             sources = api("GET", "/v1/sources")["sources"]
             runtime_profiles = api("GET", "/v1/runtime-profiles")["profiles"]
+            headless_endpoints = api("GET", "/v1/headless-endpoints")["packages"]
         except RuntimeError as exc:
-            status, instances, sources, runtime_profiles, error = {
+            status, instances, sources, runtime_profiles, headless_endpoints, error = {
                 "status": "unavailable",
                 "build": {"state": "unavailable", "revision": "", "log": ""},
                 "instances": {"running": 0},
-            }, [], [], [], str(exc)
+            }, [], [], [], [], str(exc)
         return render_template(
             "console.html", status=status, instances=instances, sources=sources,
-            runtime_profiles=runtime_profiles, error=error,
+            runtime_profiles=runtime_profiles, headless_endpoints=headless_endpoints,
+            error=error,
         )
 
     @app.get("/binaries")
@@ -377,16 +409,179 @@ def create_app(test_config=None):
                 error=str(exc),
             )
 
+    @app.get("/tuntom-binaries")
+    @login_required
+    def tuntom_binaries():
+        try:
+            build = api("GET", "/v1/tuntom/build")
+            build["artifacts"] = artifact_library_view(build.get("artifacts", []))
+            refs = build.setdefault("refs", {})
+            active, attic = partition_branches(refs.get("branches", []))
+            refs["active_branches"], refs["attic_branches"] = active, attic
+            return render_template("tuntom_binaries.html", build=build, error=None)
+        except RuntimeError as exc:
+            return render_template(
+                "tuntom_binaries.html",
+                build={"state": "unavailable", "artifacts": [], "refs": {}},
+                error=str(exc),
+            )
+
+    @app.route("/qemu-images", methods=["GET", "POST"])
+    @login_required
+    def qemu_images():
+        if request.method == "POST":
+            try:
+                disks = []
+                sources = request.form.getlist("disk_source")
+                targets = request.form.getlist("disk_target")
+                buses = request.form.getlist("disk_bus")
+                roles = request.form.getlist("disk_role")
+                for index, source in enumerate(sources):
+                    if source.strip():
+                        disks.append({
+                            "source": source.strip(),
+                            "target": targets[index] if index < len(targets) else "",
+                            "bus": buses[index] if index < len(buses) else "virtio",
+                            "role": roles[index] if index < len(roles) else "data",
+                        })
+                nics = []
+                purposes = request.form.getlist("nic_purpose")
+                models = request.form.getlist("nic_model")
+                for index, purpose in enumerate(purposes):
+                    nics.append({"purpose": purpose,
+                                 "model": models[index] if index < len(models) else "virtio-net-pci"})
+                item = api("POST", "/v1/qemu-images", {
+                    "name": request.form.get("name", ""),
+                    "description": request.form.get("description", ""),
+                    "architecture": request.form.get("architecture", "x86_64"),
+                    "machine": request.form.get("machine", "q35"),
+                    "disks": disks, "nics": nics,
+                    "forensic": {
+                        "enabled": request.form.get("forensic_enabled") == "yes",
+                        "hash": request.form.get("forensic_hash", "sha256"),
+                        "artifacts": request.form.getlist("forensic_artifact"),
+                    },
+                })
+                audit("qemu-image.import", item.get("image_id", ""))
+                flash("QEMU blackbox image byl zařazen do knihovny.", "success")
+                return redirect(url_for("qemu_images"))
+            except RuntimeError as exc:
+                flash(str(exc), "error")
+        try:
+            images = api("GET", "/v1/qemu-images")["images"]
+            return render_template("qemu_images.html", images=images, error=None)
+        except RuntimeError as exc:
+            return render_template("qemu_images.html", images=[], error=str(exc)), 503
+
+    @app.post("/qemu-images/<image_id>/delete")
+    @login_required
+    def delete_qemu_image(image_id):
+        try:
+            api("DELETE", f"/v1/qemu-images/{quote(image_id, safe='')}")
+            audit("qemu-image.delete", image_id)
+            flash("QEMU image byl odebrán z knihovny; zdrojové QCOW2 zůstaly zachovány.", "success")
+        except RuntimeError as exc:
+            flash(str(exc), "error")
+        return redirect(url_for("qemu_images"))
+
     @app.get("/test-drives")
     @login_required
     def test_drive_list():
         try:
             drives = api("GET", "/v1/test-drives")["test_drives"]
+            status = api("GET", "/v1/status")
+            artifacts = status.get("build", {}).get("artifacts", [])
             return render_template("test_drives.html", drives=drives, drive=None,
-                                   files=[], logs="", artifacts=[], error=None)
+                                   files=[], logs="", artifacts=artifacts, error=None)
         except RuntimeError as exc:
             return render_template("test_drives.html", drives=[], drive=None,
                                    files=[], logs="", artifacts=[], error=str(exc))
+
+    @app.get("/appliance-exports")
+    @login_required
+    def appliance_export_list():
+        try:
+            exports = api("GET", "/v1/appliance-exports")["exports"]
+            status = api("GET", "/v1/status")
+            artifacts = status.get("build", {}).get("artifacts", [])
+            configs = api("GET", "/v1/configs").get("configs", [])
+            return render_template(
+                "appliance_exports.html", exports=exports, artifacts=artifacts,
+                configs=configs, selected_build=request.args.get("build_id", ""),
+                selected_config=request.args.get("config_id", ""), error=None,
+            )
+        except RuntimeError as exc:
+            return render_template(
+                "appliance_exports.html", exports=[], artifacts=[], configs=[],
+                selected_build="", selected_config="", error=str(exc),
+            ), 503
+
+    @app.post("/appliance-exports")
+    @login_required
+    def create_appliance_export():
+        build_id = request.form.get("build_id", "")
+        payload = {
+            "name": request.form.get("name", ""), "build_id": build_id,
+            "config_id": request.form.get("config_id", ""),
+            "filesystem_mode": request.form.get("filesystem_mode", "plain"),
+            "parameters": {
+                key[6:].upper(): value for key, value in request.form.items()
+                if key.startswith("param_") and value != ""
+            },
+        }
+        try:
+            result = enqueue(
+                "POST", "/v1/appliance-exports", payload,
+                f"Export appliance {payload['name'] or build_id[:12]}", "appliance-export",
+            )
+            audit("appliance-export.create", f"{build_id}:{result.get('task_id', '')}")
+            flash_queued(result, "Appliance export zařazen")
+        except RuntimeError as exc:
+            flash(str(exc), "error")
+        return redirect(url_for("appliance_export_list"))
+
+    @app.get("/appliance-exports/<export_id>/download")
+    @login_required
+    def download_appliance_export(export_id):
+        try:
+            upstream = runner_download(
+                f"/v1/appliance-exports/{quote(export_id, safe='')}/download"
+            )
+        except RuntimeError as exc:
+            flash(str(exc), "error")
+            return redirect(url_for("appliance_export_list"))
+
+        @stream_with_context
+        def generate():
+            try:
+                while chunk := upstream.read(1024 * 1024):
+                    yield chunk
+            finally:
+                upstream.close()
+
+        headers = {
+            "Content-Disposition": upstream.headers.get(
+                "Content-Disposition", f'attachment; filename="{export_id}.tar.gz"'
+            ),
+            "Cache-Control": "private, no-store",
+        }
+        if upstream.headers.get("Content-Length"):
+            headers["Content-Length"] = upstream.headers["Content-Length"]
+        return Response(generate(), mimetype="application/gzip", headers=headers)
+
+    @app.post("/appliance-exports/<export_id>/delete")
+    @login_required
+    def delete_appliance_export(export_id):
+        try:
+            result = enqueue(
+                "DELETE", f"/v1/appliance-exports/{quote(export_id, safe='')}", None,
+                f"Smazat appliance export {export_id[:12]}", "appliance-export-delete",
+            )
+            audit("appliance-export.delete", export_id)
+            flash_queued(result)
+        except RuntimeError as exc:
+            flash(str(exc), "error")
+        return redirect(url_for("appliance_export_list"))
 
     @app.get("/test-drives/<drive_id>")
     @login_required
@@ -419,7 +614,7 @@ def create_app(test_config=None):
             flash_queued(result, "Test Drive zařazen")
         except (RuntimeError, ValueError) as exc:
             flash(str(exc), "error")
-        return redirect(url_for("binaries"))
+        return redirect(url_for("test_drive_list"))
 
     @app.post("/test-drives/<drive_id>/destroy")
     @login_required
@@ -585,6 +780,8 @@ def create_app(test_config=None):
             "address_family": request.form.get("address_family", "dual"),
             "driver": request.form.get("driver", ""),
             "interface_name": request.form.get("interface_name", ""),
+            "tuntom_build_id": request.form.get("tuntom_build_id", ""),
+            "tuntom_mtu": request.form.get("tuntom_mtu", "1500"),
         }
         if kind == "ingress":
             payload.update({
@@ -598,6 +795,15 @@ def create_app(test_config=None):
             payload.update({
                 "mode": request.form.get("mode", "masquerade"),
                 "host_interface": request.form.get("host_interface", ""),
+                # The VIA relay socket is an internal per-instance detail.
+                # Fabric identity and secret come from the uniquely claimed
+                # endpoint package; the profile stores neither.
+                "tuntom_socket": "/run/tuntom/via.sock",
+                "tuntom_build_id": request.form.get("tuntom_build_id", ""),
+                "tuntom_in_prefix": request.form.get("tuntom_in_prefix", "proxy-in-"),
+                "tuntom_out_prefix": request.form.get("tuntom_out_prefix", "proxy-out-"),
+                "tuntom_admission": request.form.get("tuntom_admission", "immediate"),
+                "tuntom_mtu": request.form.get("tuntom_mtu", "1500"),
             })
         return payload
 
@@ -618,15 +824,60 @@ def create_app(test_config=None):
             return redirect(url_for("network_profile_library"))
         try:
             profiles = api("GET", "/v1/network-profiles")["profiles"]
-            return render_template("network_profiles.html", profiles=profiles, error=None)
+            tuntom = api("GET", "/v1/tuntom/build")
+            return render_template(
+                "network_profiles.html", profiles=profiles,
+                tuntom_artifacts=artifact_library_view(tuntom.get("artifacts", [])), error=None,
+            )
         except RuntimeError as exc:
-            return render_template("network_profiles.html", profiles=[], error=str(exc))
+            return render_template(
+                "network_profiles.html", profiles=[], tuntom_artifacts=[], error=str(exc)
+            )
+
+    @app.route("/headless-endpoints", methods=["GET", "POST"])
+    @login_required
+    def headless_endpoint_library():
+        if request.method == "POST":
+            try:
+                item = api("POST", "/v1/headless-endpoints", {
+                    "package_id": request.form.get("package_id", ""),
+                    "kind": "tuntom-via",
+                    "name": request.form.get("name", ""),
+                    "fabric_port_id": request.form.get("fabric_port_id", ""),
+                    "switch_ip": request.form.get("switch_ip", ""),
+                    "tunnel_id": request.form.get("tunnel_id", ""),
+                    "secret": request.form.get("secret", ""),
+                })
+                audit("headless-endpoint.import", item.get("package_id", ""))
+                flash("Fabric endpoint package byl importován.", "success")
+            except RuntimeError as exc:
+                flash(str(exc), "error")
+            return redirect(url_for("headless_endpoint_library"))
+        try:
+            packages = api("GET", "/v1/headless-endpoints")["packages"]
+            return render_template("headless_endpoints.html", packages=packages, error=None)
+        except RuntimeError as exc:
+            return render_template("headless_endpoints.html", packages=[], error=str(exc))
+
+    @app.post("/headless-endpoints/<package_id>/delete")
+    @login_required
+    def delete_headless_endpoint(package_id):
+        try:
+            api("DELETE", f"/v1/headless-endpoints/{quote(package_id, safe='')}", None)
+            audit("headless-endpoint.delete", package_id)
+            flash("Fabric endpoint package byl smazán.", "success")
+        except RuntimeError as exc:
+            flash(str(exc), "error")
+        return redirect(url_for("headless_endpoint_library"))
 
     @app.route("/network-profiles/<profile_id>/edit", methods=["GET", "POST"])
     @login_required
     def edit_network_profile(profile_id):
         try:
             profile = api("GET", f"/v1/network-profiles/{quote(profile_id, safe='')}")
+            tuntom_artifacts = artifact_library_view(
+                api("GET", "/v1/tuntom/build").get("artifacts", [])
+            )
         except RuntimeError as exc:
             flash(str(exc), "error")
             return redirect(url_for("network_profile_library"))
@@ -643,8 +894,14 @@ def create_app(test_config=None):
                 return redirect(url_for("network_profile_library"))
             except RuntimeError as exc:
                 profile = {**profile, **network_profile_payload()}
-                return render_template("network_profile_editor.html", profile=profile, error=str(exc)), 400
-        return render_template("network_profile_editor.html", profile=profile, error=None)
+                return render_template(
+                    "network_profile_editor.html", profile=profile,
+                    tuntom_artifacts=tuntom_artifacts, error=str(exc),
+                ), 400
+        return render_template(
+            "network_profile_editor.html", profile=profile,
+            tuntom_artifacts=tuntom_artifacts, error=None,
+        )
 
     @app.post("/network-profiles/<profile_id>/delete")
     @login_required
@@ -720,6 +977,9 @@ def create_app(test_config=None):
                 "chains": chains,
                 "label": request.form.get("label", ""),
                 "system": request.form.get("system", "admin-console"),
+                "protocol": request.form.get("protocol", "any"),
+                "destination": request.form.get("destination", ""),
+                "ports": request.form.get("ports", ""),
                 "register_source": request.form.get("register_source") == "on",
                 "instance_id": request.form.get("instance_id", ""),
                 "runtime_profile_id": request.form.get("runtime_profile_id", ""),
@@ -799,6 +1059,10 @@ def create_app(test_config=None):
                 "allocation_prefix": 30,
                 "namespace_cidr_v6": request.form.get("namespace_cidr_v6", ""),
                 "allocation_prefix_v6": 126,
+                "fabric_cidr": request.form.get("fabric_cidr", "10.240.0.0/24"),
+                "fabric_cidr_v6": request.form.get("fabric_cidr_v6", "fd42:ca7:240::/120"),
+                "fabric_interface": request.form.get("fabric_interface", ""),
+                "fabric_link_mode": request.form.get("fabric_link_mode", "ipvlan-l3"),
                 "egress_mode": request.form.get("egress_mode", "masquerade"),
                 "sas_route_via": request.form.get("sas_route_via", ""),
                 "sas_route_via_v6": request.form.get("sas_route_via_v6", ""),
@@ -1084,15 +1348,22 @@ def create_app(test_config=None):
         try:
             ref = request.form.get("ref", "master")
             build_type = request.form.get("build_type", "Release")
+            adopt = request.form.get("operation", "adopt") == "adopt"
             result = api("POST", "/v1/build", {
                 "ref": ref,
                 "build_type": build_type,
+                "adopt": adopt,
             }, request_timeout=app.config["RUNNER_TIMEOUT"])
             audit("build.start", result.get("task_id", ""))
+            operation = tr("build.adopt") if adopt else tr("build.compile")
             message = (
-                f"'{ref}' {build_type} build is already enqueued"
+                tr("build.already_queued").format(
+                    operation=operation, ref=ref, build_type=build_type,
+                )
                 if result.get("deduplicated")
-                else f"'{ref}' {build_type} build task enqueued"
+                else tr("build.queued").format(
+                    operation=operation, ref=ref, build_type=build_type,
+                )
             )
             if request.headers.get("X-Requested-With") == "task-fetch":
                 return jsonify({**result, "message": message}), 202
@@ -1102,6 +1373,46 @@ def create_app(test_config=None):
                 return jsonify(error=str(exc)), 400
             flash(str(exc), "error")
         return redirect(url_for("binaries"))
+
+    @app.post("/tuntom-build")
+    @login_required
+    def build_tuntom():
+        try:
+            ref = request.form.get("ref", "master")
+            build_type = request.form.get("build_type", "Release")
+            result = api("POST", "/v1/tuntom/build", {
+                "ref": ref, "build_type": build_type,
+            }, request_timeout=app.config["RUNNER_TIMEOUT"])
+            audit("tuntom.build", result.get("task_id", ""))
+            flash_queued(result, f"Tuntom {ref} ({build_type}) zařazen")
+        except RuntimeError as exc:
+            flash(str(exc), "error")
+        return redirect(url_for("tuntom_binaries"))
+
+    @app.post("/tuntom-binaries/refresh-branches")
+    @login_required
+    def refresh_tuntom_branches():
+        try:
+            result = api("POST", "/v1/tuntom/refs/refresh", {})
+            audit("tuntom.refs.refresh", result.get("task_id", ""))
+            flash_queued(result, "Tuntom Git fetch zařazen")
+        except RuntimeError as exc:
+            flash(str(exc), "error")
+        return redirect(url_for("tuntom_binaries"))
+
+    @app.post("/tuntom-binaries/<build_id>/delete")
+    @login_required
+    def delete_tuntom_binary(build_id):
+        try:
+            result = enqueue(
+                "DELETE", f"/v1/tuntom/builds/{quote(build_id, safe='')}", None,
+                f"Smazat Tuntom build {build_id[:12]}", "tuntom-build-delete",
+            )
+            audit("tuntom.binary.delete", build_id)
+            flash_queued(result)
+        except RuntimeError as exc:
+            flash(str(exc), "error")
+        return redirect(url_for("tuntom_binaries"))
 
     @app.post("/binaries/refresh-branches")
     @login_required
@@ -1169,6 +1480,11 @@ def create_app(test_config=None):
                     key.removeprefix("placeholder__"): value
                     for key, value in request.form.items()
                     if key.startswith("placeholder__")
+                },
+                "network_runtime": {
+                    key.removeprefix("network__"): value
+                    for key, value in request.form.items()
+                    if key.startswith("network__") and value
                 },
                 "config_mode": request.form.get("config_mode", "ro"),
                 "persistent": request.form.get("persistent") == "on",

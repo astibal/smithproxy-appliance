@@ -5,40 +5,61 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Smithproxy Appliance</title>
   <link rel="stylesheet" href="{{ url_for('static',filename='vendor/xterm/xterm.css') }}">
-  <link rel="stylesheet" href="{{ url_for('static',filename='app.css',v='49') }}">
-  <link rel="stylesheet" href="{{ url_for('static',filename='network-profiles.css',v='3') }}">
+  <link rel="stylesheet" href="{{ url_for('static',filename='app.css',v='52') }}">
+  <link rel="stylesheet" href="{{ url_for('static',filename='network-profiles.css',v='5') }}">
   <script src="{{ url_for('static',filename='vendor/xterm/xterm.js') }}" defer></script>
   <script src="{{ url_for('static',filename='vendor/xterm/addon-fit.js') }}" defer></script>
-  <script src="{{ url_for('static',filename='app.js',v='38') }}" defer></script>
+  <script src="{{ url_for('static',filename='app.js',v='43') }}" defer></script>
 </head>
 <body class="page-{{ request.endpoint|default('unknown') }}">
 <header>
   <a class="brand" href="{{ url_for('console') }}"><i></i>Smithproxy Appliance</a>
   {% if g.admin %}
-  <nav>
-    <a class="{{ 'active' if request.endpoint == 'console' else '' }}" href="{{ url_for('console') }}">{{ _('nav.runtime') }}</a>
-    <a class="{{ 'active' if request.endpoint == 'binaries' else '' }}" href="{{ url_for('binaries') }}">{{ _('nav.binaries') }}</a>
-    <a class="{{ 'active' if request.endpoint in ('test_drive_list','test_drive_detail') else '' }}" href="{{ url_for('test_drive_list') }}">{{ _('nav.test_drives') }}</a>
-    <a class="{{ 'active' if request.endpoint in ('configs','edit_config','upload_config','delete_config') else '' }}" href="{{ url_for('configs') }}">{{ _('nav.configs') }}</a>
-    <a class="{{ 'active' if request.endpoint == 'config_observer' else '' }}" href="{{ url_for('config_observer') }}">{{ _('nav.observer') }}</a>
-    <a class="{{ 'active' if request.endpoint in ('runtime_profiles','create_runtime_profile','edit_runtime_profile','delete_runtime_profile') else '' }}" href="{{ url_for('runtime_profiles') }}">{{ _('nav.profiles') }}</a>
-    <a class="{{ 'active' if 'network_profile' in request.endpoint|default('') else '' }}" href="{{ url_for('network_profile_library') }}">{{ _('nav.network_profiles') }}</a>
-    <a class="{{ 'active' if 'cert_bundle' in request.endpoint|default('') or 'bundle_certificate' in request.endpoint|default('') else '' }}" href="{{ url_for('cert_bundles') }}">{{ _('nav.certificates') }}</a>
-    <a class="{{ 'active' if 'firewall' in request.endpoint|default('') else '' }}" href="{{ url_for('firewall') }}">{{ _('nav.firewall') }}</a>
-    <a class="{{ 'active' if request.endpoint in ('settings','update_networking_settings') else '' }}" href="{{ url_for('settings') }}">{{ _('nav.settings') }}</a>
-    <a class="{{ 'active' if request.endpoint == 'preferences' else '' }}" href="{{ url_for('preferences') }}">{{ _('nav.preferences') }}</a>
+  {% set endpoint = request.endpoint|default('') %}
+  {% set profile_active = endpoint in ('runtime_profiles','create_runtime_profile','edit_runtime_profile','delete_runtime_profile') %}
+  {% set library_active = endpoint in ('binaries','tuntom_binaries','build_tuntom','refresh_tuntom_branches','delete_tuntom_binary') or 'qemu_image' in endpoint or endpoint in ('configs','edit_config','upload_config','delete_config','config_observer') or 'cert_bundle' in endpoint or 'bundle_certificate' in endpoint %}
+  {% set network_active = 'network_profile' in endpoint or 'headless_endpoint' in endpoint or 'firewall' in endpoint or endpoint in ('settings','update_networking_settings') %}
+  <nav aria-label="Main navigation">
+    <a class="nav-link {{ 'active' if endpoint == 'console' else '' }}" href="{{ url_for('console') }}">{{ _('nav.runtime') }}</a>
+    <a class="nav-link {{ 'active' if endpoint in ('test_drive_list','test_drive_detail') else '' }}" href="{{ url_for('test_drive_list') }}">{{ _('nav.test_drives') }}</a>
+    <a class="nav-link {{ 'active' if endpoint == 'appliance_export_list' else '' }}" href="{{ url_for('appliance_export_list') }}">{{ _('nav.appliance_exports') }}</a>
+    <a class="nav-link {{ 'active' if profile_active else '' }}" href="{{ url_for('runtime_profiles') }}">{{ _('nav.profiles') }}</a>
+    <details class="nav-menu">
+      <summary class="{{ 'active' if library_active else '' }}">{{ _('nav.library') }}<span aria-hidden="true">⌄</span></summary>
+      <div class="nav-menu-panel">
+        <a class="{{ 'active' if endpoint == 'binaries' else '' }}" href="{{ url_for('binaries') }}">{{ _('nav.binaries') }}</a>
+        <a class="{{ 'active' if endpoint in ('tuntom_binaries','build_tuntom','refresh_tuntom_branches','delete_tuntom_binary') else '' }}" href="{{ url_for('tuntom_binaries') }}">{{ _('nav.tuntom_binaries') }}</a>
+        <a class="{{ 'active' if 'qemu_image' in endpoint else '' }}" href="{{ url_for('qemu_images') }}">{{ _('nav.qemu_images') }}</a>
+        <a class="{{ 'active' if endpoint in ('configs','edit_config','upload_config','delete_config') else '' }}" href="{{ url_for('configs') }}">{{ _('nav.configs') }}</a>
+        <a class="{{ 'active' if 'cert_bundle' in endpoint or 'bundle_certificate' in endpoint else '' }}" href="{{ url_for('cert_bundles') }}">{{ _('nav.certificates') }}</a>
+        <a class="{{ 'active' if endpoint == 'config_observer' else '' }}" href="{{ url_for('config_observer') }}">{{ _('nav.observer') }}</a>
+      </div>
+    </details>
+    <details class="nav-menu">
+      <summary class="{{ 'active' if network_active else '' }}">{{ _('nav.network') }}<span aria-hidden="true">⌄</span></summary>
+      <div class="nav-menu-panel">
+        <a class="{{ 'active' if 'network_profile' in endpoint else '' }}" href="{{ url_for('network_profile_library') }}">{{ _('nav.network_profiles') }}</a>
+        <a class="{{ 'active' if 'headless_endpoint' in endpoint else '' }}" href="{{ url_for('headless_endpoint_library') }}">{{ _('nav.headless_endpoints') }}</a>
+        <a class="{{ 'active' if 'firewall' in endpoint else '' }}" href="{{ url_for('firewall') }}">{{ _('nav.firewall') }}</a>
+        <a class="{{ 'active' if endpoint in ('settings','update_networking_settings') else '' }}" href="{{ url_for('settings') }}">{{ _('nav.settings') }}</a>
+      </div>
+    </details>
   </nav>
-  <span class="admin-email">{{ g.admin.email }}</span>
   {% endif %}
-  <div class="language-switch" aria-label="{{ _('language.label') }}">
-    {% for code,label in languages.items() %}<form method="post" action="{{ url_for('set_language',locale_code=code) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="next" value="{{ request.full_path }}"><button class="{{ 'active' if locale == code else '' }}" title="{{ _('language.label') }}: {{ label }}">{{ label }}</button></form>{% endfor %}
+  <div class="header-actions">
+    <div class="language-switch" aria-label="{{ _('language.label') }}">
+      {% for code,label in languages.items() %}<form method="post" action="{{ url_for('set_language',locale_code=code) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="next" value="{{ request.full_path }}"><button class="{{ 'active' if locale == code else '' }}" title="{{ _('language.label') }}: {{ label }}">{{ label }}</button></form>{% endfor %}
+    </div>
+    {% if g.admin %}
+    <details class="nav-menu account-menu">
+      <summary class="{{ 'active' if endpoint == 'preferences' else '' }}"><span class="admin-email">{{ g.admin.email }}</span><span aria-hidden="true">⌄</span></summary>
+      <div class="nav-menu-panel">
+        <a class="{{ 'active' if endpoint == 'preferences' else '' }}" href="{{ url_for('preferences') }}">{{ _('nav.preferences') }}</a>
+        <form method="post" action="{{ url_for('logout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="nav-menu-action">{{ _('nav.logout') }}</button></form>
+      </div>
+    </details>
+    {% endif %}
   </div>
-  {% if g.admin %}
-  <form method="post" action="{{ url_for('logout') }}">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <button class="link">{{ _('nav.logout') }}</button>
-  </form>
-  {% endif %}
 </header>
 <main>
   {% for category,message in get_flashed_messages(with_categories=true) %}<div class="flash {{ category }}">{{ message }}</div>{% endfor %}

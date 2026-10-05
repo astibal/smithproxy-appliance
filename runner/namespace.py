@@ -5,6 +5,7 @@ import json
 import math
 import os
 import pty
+import pwd
 import re
 import select
 import signal
@@ -152,10 +153,17 @@ class NetworkAllocation:
     guest_ip_v6: str = ""
     role: str = "egress"
     owner_id: str = ""
+    topology: str = "split-veth"
+    fabric_if: str = ""
+    fabric_ip: str = ""
+    fabric_ip_v6: str = ""
+    fabric_parent: str = ""
+    fabric_link_mode: str = ""
+    tuntom_tunnel_id: int = 0
 
 
 class NamespaceBackend:
-    """Root backend: one netns, veth pair and nft table per Smithproxy."""
+    """Root backend: one netns with veth or tuntom VIA links per proxy."""
 
     def __init__(self, smithproxy_binary: str = "/usr/local/lib/capture-zone/smithproxy",
                  network_settings: NetworkSettings | None = None) -> None:
@@ -166,6 +174,18 @@ class NamespaceBackend:
     @staticmethod
     def unit_name(instance_id: str) -> str:
         return f"capture-zone-smithproxy-{instance_id}.service"
+
+    @staticmethod
+    def tuntom_unit_name(instance_id: str) -> str:
+        return f"capture-zone-tuntom-adapter-{instance_id}.service"
+
+    @staticmethod
+    def tuntom_relay_unit_name(instance_id: str) -> str:
+        return f"capture-zone-tuntom-relay-{instance_id}.service"
+
+    @staticmethod
+    def slice_name(instance_id: str) -> str:
+        return f"capture-zone-slice-{instance_id}.slice"
 
     @staticmethod
     def _instance_storage_properties(config_path: Path, private_run: Path,
@@ -349,6 +369,22 @@ class NamespaceBackend:
                 subnet_v6=str(selected_v6), host_ip_v6=str(hosts_v6[0]),
                 guest_ip_v6=str(hosts_v6[1]),
                 role=role, owner_id=owner_id,
+                fabric_if="fabric0" if role == "egress" else "",
+                fabric_ip=(
+                    str(ipaddress.ip_address(
+                        int(ipaddress.ip_network(settings["fabric_cidr"]).network_address)
+                        + index + 1
+                    )) if role == "egress" else ""
+                ),
+                fabric_ip_v6=(
+                    str(ipaddress.ip_address(
+                        int(ipaddress.ip_network(settings["fabric_cidr_v6"]).network_address)
+                        + index + 1
+                    )) if role == "egress" else ""
+                ),
+                fabric_parent=settings["fabric_interface"] if role == "egress" else "",
+                fabric_link_mode=settings["fabric_link_mode"] if role == "egress" else "",
+                tuntom_tunnel_id=(index % 255) + 1 if role == "egress" else 0,
             )
             values[instance_id] = asdict(item)
             self.network_settings.save_allocations(values)
@@ -361,6 +397,13 @@ class NamespaceBackend:
             raise BackendError((completed.stderr or completed.stdout).strip() or f"{command[0]} failed")
 
     def _cleanup_network(self, allocation: NetworkAllocation) -> None:
+        if allocation.topology == "tuntom-via" and allocation.owner_id:
+            self._run([
+                "systemctl", "stop", self.tuntom_unit_name(allocation.owner_id),
+            ], tolerate_missing=True)
+            self._run([
+                "systemctl", "stop", self.tuntom_relay_unit_name(allocation.owner_id),
+            ], tolerate_missing=True)
         self._run(["nft", "delete", "table", "ip", allocation.table], tolerate_missing=True)
         self._run(["nft", "delete", "table", "inet", allocation.table], tolerate_missing=True)
         self._run(["ip", "rule", "delete", "fwmark", hex(allocation.mark),
@@ -408,29 +451,43 @@ class NamespaceBackend:
             subnet = item.subnet or str(ipaddress.ip_network(
                 f"{item.host_ip}/30", strict=False,
             ))
+            via_tuntom = item.topology == "tuntom-via"
             return {
                 "role": item.role, "subnet": subnet,
-                "host_interface": item.host_if, "guest_interface": item.guest_if,
-                "expected_host_address": f"{item.host_ip}/30",
-                "expected_guest_address": f"{item.guest_ip}/30",
+                "host_interface": "" if via_tuntom else item.host_if,
+                "guest_interface": item.guest_if,
+                "expected_host_address": "" if via_tuntom else f"{item.host_ip}/30",
+                "expected_guest_address": (
+                    f"{item.guest_ip}/32" if via_tuntom else f"{item.guest_ip}/30"
+                ),
                 "subnet_v6": item.subnet_v6,
                 "expected_host_address_v6": (
-                    f"{item.host_ip_v6}/126" if item.host_ip_v6 else ""
+                    f"{item.host_ip_v6}/126" if item.host_ip_v6 and not via_tuntom else ""
                 ),
                 "expected_guest_address_v6": (
-                    f"{item.guest_ip_v6}/126" if item.guest_ip_v6 else ""
+                    (f"{item.guest_ip_v6}/128" if via_tuntom else f"{item.guest_ip_v6}/126")
+                    if item.guest_ip_v6 else ""
                 ),
-                "host_interfaces": self._ip_json([
+                "host_interfaces": [] if via_tuntom else self._ip_json([
                     "ip", "-j", "addr", "show", "dev", item.host_if,
                 ]),
             }
         ingress_view = link_view(ingress)
         egress_view = link_view(allocation)
-        return {
-            "present": bool(
+        tuntom_interfaces = {
+            str(item.get("ifname", "")) for item in namespace_interfaces
+            if isinstance(item, dict)
+        }
+        present = (
+            {"di0", "do0"}.issubset(tuntom_interfaces)
+            if allocation.topology == "tuntom-via"
+            else bool(
                 ingress_view["host_interfaces"] and egress_view["host_interfaces"]
                 and namespace_interfaces
-            ),
+            )
+        )
+        return {
+            "present": present,
             "ingress": ingress_view, "egress": egress_view,
             "route_table": ingress.route_table,
             "packet_mark": hex(ingress.mark),
@@ -438,7 +495,242 @@ class NamespaceBackend:
             "namespace_routes": namespace_routes,
             "host_routes": host_routes,
             "host_rules": host_rules,
+            "link_driver": allocation.topology,
+            "fabric": {
+                "interface": allocation.fabric_if,
+                "address": allocation.fabric_ip,
+                "address_v6": allocation.fabric_ip_v6,
+                "parent": allocation.fabric_parent,
+                "mode": allocation.fabric_link_mode,
+                "tunnel_id": allocation.tuntom_tunnel_id,
+                "udp_port": (
+                    40000 + allocation.tuntom_tunnel_id
+                    if allocation.tuntom_tunnel_id else 0
+                ),
+            },
+            "tuntom_unit": (
+                self.tuntom_unit_name(instance_id)
+                if allocation.topology == "tuntom-via" else ""
+            ),
+            "tuntom_relay_unit": (
+                self.tuntom_relay_unit_name(instance_id)
+                if allocation.topology == "tuntom-via" else ""
+            ),
         }
+
+    def _start_tuntom_adapter(
+        self, instance_id: str, namespace: str, adapter: str, relay_socket: str,
+        in_prefix: str, out_prefix: str, admission: str, mtu: int,
+        hard_runtime_seconds: int, via_run: Path, rootfs_path: str = "",
+    ) -> str:
+        adapter_path = Path(adapter)
+        socket_path = Path(relay_socket)
+        if not adapter_path.is_absolute() or not adapter_path.is_file():
+            raise BackendError("tuntom divert adapter is unavailable")
+        if not os.access(adapter_path, os.X_OK):
+            raise BackendError("tuntom divert adapter is not executable")
+        if not socket_path.is_absolute() or not socket_path.is_socket():
+            raise BackendError("tuntom VIA relay socket is unavailable")
+        if admission not in {"immediate", "warmup"}:
+            raise BackendError("invalid tuntom admission mode")
+        if not 576 <= mtu <= 9000:
+            raise BackendError("invalid tuntom MTU")
+        attachment_re = re.compile(r"[A-Za-z0-9_.-]{1,32}")
+        if not attachment_re.fullmatch(in_prefix) or not attachment_re.fullmatch(out_prefix):
+            raise BackendError("invalid tuntom attachment prefix")
+        suffix = instance_id.replace("-", "")[:8]
+        in_port = f"{in_prefix}{suffix}"
+        out_port = f"{out_prefix}{suffix}"
+        if len(in_port) > 48 or len(out_port) > 48:
+            raise BackendError("tuntom attachment name is too long")
+        unit = self.tuntom_unit_name(instance_id)
+        executable = str(adapter_path)
+        command = [
+            "systemd-run", "--quiet", "--collect", f"--unit={unit}",
+            f"--slice={self.slice_name(instance_id)}",
+            "--property=Type=simple", "--property=KillMode=control-group",
+            "--property=TimeoutStopSec=10s", "--property=NoNewPrivileges=yes",
+            "--property=CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW",
+            "--property=AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW",
+            f"--property=NetworkNamespacePath=/run/netns/{namespace}",
+            f"--property=BindPaths={via_run}:/run/sas",
+            f"--property=BindsTo={self.tuntom_relay_unit_name(instance_id)}",
+            f"--property=After={self.tuntom_relay_unit_name(instance_id)}",
+        ]
+        if rootfs_path:
+            rootfs = Path(rootfs_path).resolve()
+            if not rootfs.is_dir() or not (rootfs / "bin/sh").exists():
+                raise BackendError("prepared rootfs cannot execute Tuntom adapter")
+            executable = "/opt/sas/bin/tuntom-divert-adapter"
+            command.extend([
+                f"--property=RootDirectory={rootfs}",
+                "--property=MountAPIVFS=yes",
+                f"--property=BindReadOnlyPaths={adapter_path}:{executable}",
+            ])
+        if hard_runtime_seconds:
+            command.append(f"--property=RuntimeMaxSec={hard_runtime_seconds}s")
+        command.extend([
+            "--", executable, "di0", "do0",
+            "--switch-socket", "/run/sas/relay.sock",
+            "--via-instance", f"sas#{suffix}",
+            "--divert-in-port", in_port,
+            "--divert-out-port", out_port,
+            "--admission", admission, "--mtu", str(mtu),
+        ])
+        self._run(command)
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            ready = all(subprocess.run(
+                ["ip", "-n", namespace, "link", "show", "dev", interface],
+                capture_output=True, text=True, timeout=2, check=False,
+            ).returncode == 0 for interface in ("di0", "do0"))
+            if ready:
+                return unit
+            status = subprocess.run(
+                ["systemctl", "show", unit, "--property=ActiveState", "--value"],
+                capture_output=True, text=True, timeout=2, check=False,
+            )
+            if status.returncode or status.stdout.strip() in {"failed", "inactive"}:
+                break
+            time.sleep(0.1)
+        self._run(["systemctl", "stop", unit], tolerate_missing=True)
+        raise BackendError("tuntom VIA adapter did not create di0/do0")
+
+    def _start_tuntom_relay(
+        self, instance_id: str, namespace: str, binary: str, switch_ip: str,
+        secret: str, tunnel_id: int, mtu: int, hard_runtime_seconds: int,
+        via_run: Path, rootfs_path: str = "",
+    ) -> tuple[str, Path]:
+        binary_path = Path(binary).resolve()
+        if not binary_path.is_file() or not os.access(binary_path, os.X_OK):
+            raise BackendError("tuntom relay binary is unavailable")
+        try:
+            switch = str(ipaddress.ip_address(switch_ip))
+        except ValueError as exc:
+            raise BackendError("Tuntom VIA switch IP is invalid") from exc
+        if not re.fullmatch(r"[0-9a-fA-F]{32}", secret):
+            raise BackendError("Tuntom VIA secret must contain exactly 32 hex characters")
+        if not 1 <= tunnel_id <= 255:
+            raise BackendError("Tuntom VIA tunnel ID is outside 1..255")
+        via_run.mkdir(parents=True, exist_ok=True, mode=0o770)
+        try:
+            account = pwd.getpwnam("tuntom")
+            os.chown(via_run, account.pw_uid, account.pw_gid)
+        except (KeyError, OSError):
+            # Development builds may run without a dedicated account. The
+            # binary reports that condition; do not silently broaden access.
+            os.chmod(via_run, 0o700)
+        relay_socket = via_run / "relay.sock"
+        relay_socket.unlink(missing_ok=True)
+        secret_dir = via_run.parent / ".credentials"
+        secret_dir.mkdir(mode=0o700, exist_ok=True)
+        secret_file = secret_dir / "tuntom-secret"
+        secret_file.write_text(secret.lower() + "\n", encoding="ascii")
+        os.chmod(secret_file, 0o400)
+        unit = self.tuntom_relay_unit_name(instance_id)
+        executable = str(binary_path)
+        command = [
+            "systemd-run", "--quiet", "--collect", f"--unit={unit}",
+            f"--slice={self.slice_name(instance_id)}",
+            "--property=Type=simple", "--property=KillMode=control-group",
+            "--property=TimeoutStopSec=10s", "--property=NoNewPrivileges=yes",
+            f"--property=NetworkNamespacePath=/run/netns/{namespace}",
+            f"--property=BindPaths={via_run}:/run/sas",
+            f"--property=LoadCredential=tuntom-secret:{secret_file}",
+        ]
+        if rootfs_path:
+            rootfs = Path(rootfs_path).resolve()
+            if not rootfs.is_dir() or not (rootfs / "bin/sh").exists():
+                raise BackendError("prepared rootfs cannot execute Tuntom relay")
+            executable = "/opt/sas/bin/tuntom"
+            command.extend([
+                f"--property=RootDirectory={rootfs}",
+                "--property=MountAPIVFS=yes",
+                f"--property=BindReadOnlyPaths={binary_path}:{executable}",
+            ])
+        if hard_runtime_seconds:
+            command.append(f"--property=RuntimeMaxSec={hard_runtime_seconds}s")
+        shell = (
+            'export TUNTOM_SECRET="$(cat "$CREDENTIALS_DIRECTORY/tuntom-secret")"; '
+            'exec "$1" client "$2" - "$3" --relay-listen /run/sas/relay.sock '
+            '--mtu "$4"'
+        )
+        command.extend([
+            "--", "/bin/sh", "-eu", "-c", shell, "sas-tuntom",
+            executable, str(tunnel_id), switch, str(mtu),
+        ])
+        self._run(command)
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            if relay_socket.is_socket():
+                return unit, relay_socket
+            state = self.status(unit)
+            if state.active_state in {"failed", "inactive"}:
+                break
+            time.sleep(0.1)
+        self._run(["systemctl", "stop", unit], tolerate_missing=True)
+        raise BackendError("tuntom VIA relay did not create its local socket")
+
+    def _setup_fabric_link(
+        self, allocation: NetworkAllocation, switch_ip: str,
+    ) -> None:
+        if not allocation.fabric_parent:
+            raise BackendError("Tuntom VIA requires a configured fabric parent interface")
+        if allocation.fabric_link_mode not in {"ipvlan-l3", "ipvlan-l2"}:
+            raise BackendError("Tuntom VIA fabric link mode is invalid")
+        switch = ipaddress.ip_address(switch_ip)
+        local = allocation.fabric_ip_v6 if switch.version == 6 else allocation.fabric_ip
+        if not local or ipaddress.ip_address(local).version != switch.version:
+            raise BackendError("Tuntom VIA fabric pool does not match the switch IP family")
+        parent = subprocess.run(
+            ["ip", "link", "show", "dev", allocation.fabric_parent],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        if parent.returncode:
+            raise BackendError("configured fabric parent interface is unavailable")
+        temporary = f"czf{allocation.owner_id.replace('-', '')[:8]}"
+        mode = allocation.fabric_link_mode.removeprefix("ipvlan-")
+        self._run([
+            "ip", "link", "add", "link", allocation.fabric_parent,
+            "name", temporary, "type", "ipvlan", "mode", mode,
+        ])
+        self._run(["ip", "link", "set", temporary, "netns", allocation.namespace])
+        self._run([
+            "ip", "-n", allocation.namespace, "link", "set", temporary,
+            "name", "fabric0",
+        ])
+        family = ["-6"] if switch.version == 6 else []
+        prefix = 128 if switch.version == 6 else 32
+        self._run([
+            "ip", "-n", allocation.namespace, *family, "addr", "add",
+            f"{local}/{prefix}", "dev", "fabric0",
+        ])
+        self._run(["ip", "-n", allocation.namespace, "link", "set", "fabric0", "up"])
+        self._run([
+            "ip", "-n", allocation.namespace, *family, "route", "replace",
+            f"{switch}/{prefix}", "dev", "fabric0", "src", local,
+        ])
+        protocol = "ip6" if switch.version == 6 else "ip"
+        port = 40000 + allocation.tuntom_tunnel_id
+        rules = (
+            "table inet sas_fabric {\n"
+            " chain input { type filter hook input priority -20; policy accept;\n"
+            f'  iifname "fabric0" {protocol} saddr {switch} udp sport {port} accept\n'
+            '  iifname "fabric0" meta l4proto { icmp, ipv6-icmp } accept\n'
+            '  iifname "fabric0" drop\n'
+            " }\n"
+            " chain output { type filter hook output priority -20; policy accept;\n"
+            f'  oifname "fabric0" {protocol} daddr {switch} udp dport {port} accept\n'
+            '  oifname "fabric0" meta l4proto { icmp, ipv6-icmp } accept\n'
+            '  oifname "fabric0" drop\n'
+            " }\n}"
+        )
+        completed = subprocess.run(
+            ["ip", "netns", "exec", allocation.namespace, "nft", "-f", "/dev/stdin"],
+            input=rules, capture_output=True, text=True, timeout=10, check=False,
+        )
+        if completed.returncode:
+            raise BackendError(completed.stderr.strip() or "fabric namespace nft failed")
 
     def start(self, instance_id: str, config_path: Path, runtime_seconds: int,
               source_ip: str = "", tls_port: int = 10443,
@@ -447,7 +739,18 @@ class NamespaceBackend:
               profile: str = "custom", config_mode: str = "ro",
               assets_path: str = "", auto_restart: bool = False,
               hard_runtime_seconds: int = 86400, egress_mode: str = "",
-              sas_interface: str = "", rootfs_path: str = "") -> str:
+              egress_driver: str = "split-veth", sas_interface: str = "",
+              tuntom_socket: str = "/run/tuntom/via.sock",
+              tuntom_binary: str = "/usr/local/bin/tuntom",
+              tuntom_adapter: str = "/usr/local/bin/tuntom-divert-adapter",
+              tuntom_in_prefix: str = "proxy-in-",
+              tuntom_out_prefix: str = "proxy-out-",
+              tuntom_admission: str = "immediate", tuntom_mtu: int = 1500,
+              tuntom_switch_ip: str = "", tuntom_secret: str = "",
+              tuntom_tunnel_id: int = 0,
+              rootfs_path: str = "") -> str:
+        if egress_driver not in {"split-veth", "on-a-stick", "tuntom-via"}:
+            raise BackendError("unsupported egress network driver")
         try:
             source = str(ipaddress.ip_address(source_ip))
         except ValueError as exc:
@@ -460,11 +763,60 @@ class NamespaceBackend:
             if self.network_settings:
                 self.network_settings.release(instance_id)
             raise
+        if egress_driver == "on-a-stick":
+            # Keep both allocation IDs for lifecycle compatibility, but make
+            # the egress record an explicit alias of the single physical di0
+            # link. No do0/czo* interface is created or retained.
+            if self.network_settings:
+                values = self.network_settings.allocations()
+                values.pop(instance_id, None)
+                allocation = replace(
+                    ingress, role="egress", owner_id=instance_id,
+                    topology="on-a-stick",
+                )
+                values[instance_id] = asdict(allocation)
+                self.network_settings.save_allocations(values)
+            else:
+                allocation = replace(
+                    ingress, role="egress", owner_id=instance_id,
+                    topology="on-a-stick",
+                )
+        elif egress_driver == "tuntom-via":
+            if self.network_settings and not allocation.fabric_ip:
+                settings = self.network_settings.get()
+                egress_pool = ipaddress.ip_network(settings["namespace_cidr"])
+                lease = ipaddress.ip_network(allocation.subnet)
+                index = (int(lease.network_address) - int(egress_pool.network_address)) // 4
+                allocation = replace(
+                    allocation,
+                    fabric_if="fabric0",
+                    fabric_ip=str(ipaddress.ip_address(
+                        int(ipaddress.ip_network(settings["fabric_cidr"]).network_address)
+                        + index + 1
+                    )),
+                    fabric_ip_v6=str(ipaddress.ip_address(
+                        int(ipaddress.ip_network(settings["fabric_cidr_v6"]).network_address)
+                        + index + 1
+                    )),
+                    fabric_parent=settings["fabric_interface"],
+                    fabric_link_mode=settings["fabric_link_mode"],
+                    tuntom_tunnel_id=(index % 255) + 1,
+                )
+            allocation = replace(allocation, topology="tuntom-via")
+            if tuntom_tunnel_id:
+                allocation = replace(allocation, tuntom_tunnel_id=tuntom_tunnel_id)
+            ingress = replace(ingress, topology="tuntom-via")
+            if self.network_settings:
+                allocations = self.network_settings.allocations()
+                allocations[instance_id] = asdict(allocation)
+                allocations[ingress_id] = asdict(ingress)
+                self.network_settings.save_allocations(allocations)
         if egress_mode or sas_interface:
             allocation = replace(
                 allocation,
                 egress_mode=egress_mode or allocation.egress_mode,
                 sas_interface=sas_interface or allocation.sas_interface,
+                topology=egress_driver,
             )
             if self.network_settings:
                 allocations = self.network_settings.allocations()
@@ -477,58 +829,101 @@ class NamespaceBackend:
         self._cleanup_network(allocation)
         try:
             self._run(["ip", "netns", "add", allocation.namespace])
+            self._run(["ip", "-n", allocation.namespace, "link", "set", "lo", "up"])
+            tuntom_unit = ""
+            if egress_driver == "tuntom-via":
+                self._setup_fabric_link(allocation, tuntom_switch_ip)
+                via_run = config_path.parent / "via-run"
+                _relay_unit, relay_socket = self._start_tuntom_relay(
+                    instance_id, allocation.namespace, tuntom_binary,
+                    tuntom_switch_ip, tuntom_secret, allocation.tuntom_tunnel_id,
+                    tuntom_mtu, hard_runtime_seconds, via_run, rootfs_path,
+                )
+                tuntom_unit = self._start_tuntom_adapter(
+                    instance_id, allocation.namespace, tuntom_adapter, str(relay_socket),
+                    tuntom_in_prefix, tuntom_out_prefix, tuntom_admission,
+                    tuntom_mtu, hard_runtime_seconds, via_run, rootfs_path,
+                )
+                self._run(["ip", "-n", allocation.namespace, "link", "set", "di0", "up"])
+                self._run(["ip", "-n", allocation.namespace, "link", "set", "do0", "up"])
+                # TUN links have no peer address. Give Smithproxy stable local
+                # identities while keeping all remote destinations on-link.
+                self._run(["ip", "-n", allocation.namespace, "addr", "add",
+                           f"{ingress.guest_ip}/32", "dev", "di0"])
+                self._run(["ip", "-n", allocation.namespace, "addr", "add",
+                           f"{allocation.guest_ip}/32", "dev", "do0"])
+                if ingress.guest_ip_v6 and allocation.guest_ip_v6:
+                    self._run(["ip", "-n", allocation.namespace, "-6", "addr", "add",
+                               f"{ingress.guest_ip_v6}/128", "dev", "di0"])
+                    self._run(["ip", "-n", allocation.namespace, "-6", "addr", "add",
+                               f"{allocation.guest_ip_v6}/128", "dev", "do0"])
+                self._run(["ip", "-n", allocation.namespace, "route", "add", "default", "dev", "do0"])
+                self._run(["ip", "-n", allocation.namespace, "-6", "route", "add", "default", "dev", "do0"])
+                source_prefix = "/128" if source_address.version == 6 else "/32"
+                family_flag = ["-6"] if source_address.version == 6 else []
+                self._run([
+                    "ip", "-n", allocation.namespace, *family_flag, "route", "replace",
+                    f"{source}{source_prefix}", "dev", "di0",
+                ])
             # Egress pair: proxy-originated traffic follows the namespace
             # default route through do0.
-            self._run(["ip", "link", "add", allocation.host_if, "type", "veth", "peer", "name", allocation.guest_if])
-            self._run(["ip", "link", "set", allocation.guest_if, "netns", allocation.namespace])
-            self._run(["ip", "addr", "add", f"{allocation.host_ip}/30", "dev", allocation.host_if])
-            if allocation.host_ip_v6:
-                self._run(["ip", "-6", "addr", "add", f"{allocation.host_ip_v6}/126",
-                           "dev", allocation.host_if])
-            self._run(["ip", "link", "set", allocation.host_if, "up"])
-            self._run(["ip", "-n", allocation.namespace, "addr", "add", f"{allocation.guest_ip}/30", "dev", allocation.guest_if])
-            if allocation.guest_ip_v6:
-                self._run(["ip", "-n", allocation.namespace, "-6", "addr", "add",
-                           f"{allocation.guest_ip_v6}/126", "dev", allocation.guest_if])
-            self._run(["ip", "-n", allocation.namespace, "link", "set", "lo", "up"])
-            self._run(["ip", "-n", allocation.namespace, "link", "set", allocation.guest_if, "up"])
-            self._run(["ip", "-n", allocation.namespace, "route", "add", "default", "via", allocation.host_ip])
-            if allocation.host_ip_v6:
-                self._run(["ip", "-n", allocation.namespace, "-6", "route", "add", "default",
-                           "via", allocation.host_ip_v6])
+            if egress_driver == "split-veth":
+                self._run(["ip", "link", "add", allocation.host_if, "type", "veth", "peer", "name", allocation.guest_if])
+                self._run(["ip", "link", "set", allocation.guest_if, "netns", allocation.namespace])
+                self._run(["ip", "addr", "add", f"{allocation.host_ip}/30", "dev", allocation.host_if])
+                if allocation.host_ip_v6:
+                    self._run(["ip", "-6", "addr", "add", f"{allocation.host_ip_v6}/126", "dev", allocation.host_if])
+                self._run(["ip", "link", "set", allocation.host_if, "up"])
+                self._run(["ip", "-n", allocation.namespace, "addr", "add", f"{allocation.guest_ip}/30", "dev", allocation.guest_if])
+                if allocation.guest_ip_v6:
+                    self._run(["ip", "-n", allocation.namespace, "-6", "addr", "add", f"{allocation.guest_ip_v6}/126", "dev", allocation.guest_if])
+                self._run(["ip", "-n", allocation.namespace, "link", "set", allocation.guest_if, "up"])
+                self._run(["ip", "-n", allocation.namespace, "route", "add", "default", "via", allocation.host_ip])
+                if allocation.host_ip_v6:
+                    self._run(["ip", "-n", allocation.namespace, "-6", "route", "add", "default", "via", allocation.host_ip_v6])
 
             # Ingress pair: selected client traffic enters exclusively through
             # di0. A host route keeps replies to that client off do0.
-            self._run(["ip", "link", "add", ingress.host_if, "type", "veth",
-                       "peer", "name", ingress.guest_if])
-            self._run(["ip", "link", "set", ingress.guest_if, "netns", allocation.namespace])
-            self._run(["ip", "addr", "add", f"{ingress.host_ip}/30", "dev", ingress.host_if])
-            if ingress.host_ip_v6:
-                self._run(["ip", "-6", "addr", "add", f"{ingress.host_ip_v6}/126",
-                           "dev", ingress.host_if])
-            self._run(["ip", "link", "set", ingress.host_if, "up"])
-            self._run(["ip", "-n", allocation.namespace, "addr", "add",
-                       f"{ingress.guest_ip}/30", "dev", ingress.guest_if])
-            if ingress.guest_ip_v6:
-                self._run(["ip", "-n", allocation.namespace, "-6", "addr", "add",
-                           f"{ingress.guest_ip_v6}/126", "dev", ingress.guest_if])
-            self._run(["ip", "-n", allocation.namespace, "link", "set", ingress.guest_if, "up"])
-            if source_address.version == 6:
+            if egress_driver != "tuntom-via":
+                self._run(["ip", "link", "add", ingress.host_if, "type", "veth",
+                           "peer", "name", ingress.guest_if])
+                self._run(["ip", "link", "set", ingress.guest_if, "netns", allocation.namespace])
+                self._run(["ip", "addr", "add", f"{ingress.host_ip}/30", "dev", ingress.host_if])
+                if ingress.host_ip_v6:
+                    self._run(["ip", "-6", "addr", "add", f"{ingress.host_ip_v6}/126",
+                               "dev", ingress.host_if])
+                self._run(["ip", "link", "set", ingress.host_if, "up"])
+                self._run(["ip", "-n", allocation.namespace, "addr", "add",
+                           f"{ingress.guest_ip}/30", "dev", ingress.guest_if])
+                if ingress.guest_ip_v6:
+                    self._run(["ip", "-n", allocation.namespace, "-6", "addr", "add",
+                               f"{ingress.guest_ip_v6}/126", "dev", ingress.guest_if])
+                self._run(["ip", "-n", allocation.namespace, "link", "set", ingress.guest_if, "up"])
+            if egress_driver == "on-a-stick":
+                self._run(["ip", "-n", allocation.namespace, "route", "add", "default",
+                           "via", ingress.host_ip, "dev", ingress.guest_if])
+                if ingress.host_ip_v6:
+                    self._run(["ip", "-n", allocation.namespace, "-6", "route", "add", "default",
+                               "via", ingress.host_ip_v6, "dev", ingress.guest_if])
+            if egress_driver == "tuntom-via":
+                pass
+            elif source_address.version == 6:
                 self._run(["ip", "-n", allocation.namespace, "-6", "route", "replace",
                            f"{source}/128", "via", ingress.host_ip_v6, "dev", ingress.guest_if])
             else:
                 self._run(["ip", "-n", allocation.namespace, "route", "replace",
                            f"{source}/32", "via", ingress.host_ip, "dev", ingress.guest_if])
 
-            self._run(["ip", "route", "add", "default", "via", ingress.guest_ip,
-                       "dev", ingress.host_if, "table", str(ingress.route_table)])
-            self._run(["ip", "rule", "add", "fwmark", hex(ingress.mark),
-                       "table", str(ingress.route_table), "priority", "1000"])
-            if ingress.guest_ip_v6:
-                self._run(["ip", "-6", "route", "add", "default", "via", ingress.guest_ip_v6,
+            if egress_driver != "tuntom-via":
+                self._run(["ip", "route", "add", "default", "via", ingress.guest_ip,
                            "dev", ingress.host_if, "table", str(ingress.route_table)])
-                self._run(["ip", "-6", "rule", "add", "fwmark", hex(ingress.mark),
+                self._run(["ip", "rule", "add", "fwmark", hex(ingress.mark),
                            "table", str(ingress.route_table), "priority", "1000"])
+                if ingress.guest_ip_v6:
+                    self._run(["ip", "-6", "route", "add", "default", "via", ingress.guest_ip_v6,
+                               "dev", ingress.host_if, "table", str(ingress.route_table)])
+                    self._run(["ip", "-6", "rule", "add", "fwmark", hex(ingress.mark),
+                               "table", str(ingress.route_table), "priority", "1000"])
             self._run(["ip", "-n", allocation.namespace, "rule", "add", "fwmark", "0x1",
                        "table", "100", "priority", "100"])
             self._run(["ip", "-n", allocation.namespace, "route", "add", "local", "0.0.0.0/0",
@@ -542,37 +937,73 @@ class NamespaceBackend:
             explicit_port = socks_port if profile == "socks" else http_port
             explicit = profile in {"socks", "http-proxy"}
             family = "ip6" if source_address.version == 6 else "ip"
-            destination = ingress.guest_ip_v6 if source_address.version == 6 else ingress.guest_ip
-            match = f"{family} saddr {source} tcp dport {explicit_port}" if explicit else f"{family} saddr {source}"
-            dnat_chain = (
-                " chain proxy_dnat { type nat hook prerouting priority dstnat; policy accept;\n"
-                f"  {family} saddr {source} tcp dport {explicit_port} "
-                f"dnat {'ip6 ' if source_address.version == 6 else ''}to "
-                f"{'[' if source_address.version == 6 else ''}{destination}"
-                f"{']' if source_address.version == 6 else ''}:{explicit_port}\n }}\n"
-                if explicit else ""
-            )
-            snat_rule = ""
-            if allocation.egress_mode == "masquerade":
-                interface_match = (
-                    f'oifname "{allocation.sas_interface}" ' if allocation.sas_interface else ""
+            if egress_driver != "tuntom-via":
+                destination = (
+                    ingress.guest_ip_v6 if source_address.version == 6 else ingress.guest_ip
                 )
-                snat_rule = f"  {interface_match}ip saddr {allocation.guest_ip} masquerade\n"
-                if allocation.guest_ip_v6:
-                    snat_rule += f"  {interface_match}ip6 saddr {allocation.guest_ip_v6} masquerade\n"
-            rules = (
-                f"table inet {allocation.table} {{\n"
-                " chain prerouting { type filter hook prerouting priority mangle; policy accept;\n"
-                f"  {match} meta mark set {hex(ingress.mark)}\n"
-                f" }}\n{dnat_chain} chain postrouting {{ type nat hook postrouting priority srcnat; policy accept;\n"
-                f"{snat_rule} }}\n}}"
-            )
-            completed = subprocess.run(["nft", "-f", "/dev/stdin"], input=rules, capture_output=True,
-                                       text=True, timeout=10, check=False)
-            if completed.returncode:
-                raise BackendError(completed.stderr.strip() or "nft failed")
+                match = (
+                    f"{family} saddr {source} tcp dport {explicit_port}"
+                    if explicit else f"{family} saddr {source}"
+                )
+                dnat_chain = (
+                    " chain proxy_dnat { type nat hook prerouting priority dstnat; policy accept;\n"
+                    f"  {family} saddr {source} tcp dport {explicit_port} "
+                    f"dnat {'ip6 ' if source_address.version == 6 else ''}to "
+                    f"{'[' if source_address.version == 6 else ''}{destination}"
+                    f"{']' if source_address.version == 6 else ''}:{explicit_port}\n }}\n"
+                    if explicit else ""
+                )
+                snat_rule = ""
+                if allocation.egress_mode == "masquerade":
+                    interface_match = (
+                        f'oifname "{allocation.sas_interface}" '
+                        if allocation.sas_interface else ""
+                    )
+                    snat_rule = (
+                        f"  {interface_match}ip saddr {allocation.guest_ip} masquerade\n"
+                    )
+                    if allocation.guest_ip_v6:
+                        snat_rule += (
+                            f"  {interface_match}ip6 saddr {allocation.guest_ip_v6} masquerade\n"
+                        )
+                rules = (
+                    f"table inet {allocation.table} {{\n"
+                    " chain prerouting { type filter hook prerouting priority mangle; policy accept;\n"
+                    f"  {match} meta mark set {hex(ingress.mark)}\n"
+                    f" }}\n{dnat_chain} chain postrouting {{ type nat hook postrouting priority srcnat; policy accept;\n"
+                    f"{snat_rule} }}\n}}"
+                )
+                completed = subprocess.run(
+                    ["nft", "-f", "/dev/stdin"], input=rules, capture_output=True,
+                    text=True, timeout=10, check=False,
+                )
+                if completed.returncode:
+                    raise BackendError(completed.stderr.strip() or "nft failed")
 
-            if not explicit:
+            if egress_driver == "tuntom-via":
+                authorized = f'iifname "di0" {family} saddr {source}'
+                action = (
+                    f"tcp dport {explicit_port} accept"
+                    if explicit else (
+                        f"tcp dport 443 tproxy to :{tls_port} meta mark set 0x1\n"
+                        f"  {authorized} tcp dport != 443 "
+                        f"tproxy to :{plaintext_port} meta mark set 0x1"
+                    )
+                )
+                namespace_rules = (
+                    "table inet capture_zone {\n"
+                    " chain prerouting { type filter hook prerouting priority mangle; policy accept;\n"
+                    f"  {authorized} {action}\n"
+                    '  iifname "di0" drop\n'
+                    " }\n}"
+                )
+                completed = subprocess.run(
+                    ["ip", "netns", "exec", allocation.namespace, "nft", "-f", "/dev/stdin"],
+                    input=namespace_rules, capture_output=True, text=True, timeout=10, check=False,
+                )
+                if completed.returncode:
+                    raise BackendError(completed.stderr.strip() or "tuntom namespace nft failed")
+            elif not explicit:
                 namespace_rules = (
                     "table inet capture_zone {\n"
                     " chain prerouting { type filter hook prerouting priority mangle; policy accept;\n"
@@ -602,6 +1033,7 @@ class NamespaceBackend:
                 )
             command = [
                 "systemd-run", "--quiet", f"--unit={unit}",
+                f"--slice={self.slice_name(instance_id)}",
                 "--property=Type=simple", "--property=KillMode=control-group",
                 "--property=TimeoutStopSec=10s",
                 "--property=MemoryMax=1G", "--property=TasksMax=256",
@@ -611,6 +1043,11 @@ class NamespaceBackend:
                     config_path, private_run, effective_binary,
                 ),
             ]
+            if tuntom_unit:
+                command.extend([
+                    f"--property=BindsTo={tuntom_unit}",
+                    f"--property=After={tuntom_unit}",
+                ])
             if hard_runtime_seconds:
                 command.insert(5, f"--property=RuntimeMaxSec={hard_runtime_seconds}s")
             if auto_restart:
@@ -662,12 +1099,45 @@ class NamespaceBackend:
             self.network_settings.release(ingress_id)
 
     def attach_source(self, instance_id: str, source_ip: str, profile: str,
-                      socks_port: int = 1080, http_port: int = 3128) -> None:
+                      socks_port: int = 1080, http_port: int = 3128,
+                      tls_port: int = 50443, plaintext_port: int = 50080) -> None:
         allocation = self.allocation(instance_id)
         ingress = self.ingress_allocation(instance_id)
         source = ipaddress.ip_address(source_ip)
         if source.version == 6 and not ingress.guest_ip_v6:
             raise BackendError("IPv6 attachment requires a dual-stack instance")
+        if allocation.topology == "tuntom-via":
+            family = "ip6" if source.version == 6 else "ip"
+            explicit_port = socks_port if profile == "socks" else http_port
+            rules = []
+            if profile in {"socks", "http-proxy"}:
+                rules.append(
+                    f'insert rule inet capture_zone prerouting iifname "di0" '
+                    f"{family} saddr {source} tcp dport {explicit_port} accept"
+                )
+            else:
+                rules.extend([
+                    f'insert rule inet capture_zone prerouting iifname "di0" '
+                    f"{family} saddr {source} tcp dport != 443 "
+                    f"tproxy to :{plaintext_port} meta mark set 0x1",
+                    f'insert rule inet capture_zone prerouting iifname "di0" '
+                    f"{family} saddr {source} tcp dport 443 "
+                    f"tproxy to :{tls_port} meta mark set 0x1",
+                ])
+            completed = subprocess.run(
+                ["ip", "netns", "exec", allocation.namespace, "nft", "-f", "/dev/stdin"],
+                input="\n".join(rules) + "\n", capture_output=True, text=True,
+                timeout=10, check=False,
+            )
+            if completed.returncode:
+                raise BackendError(completed.stderr.strip() or "cannot attach tuntom source")
+            prefix = 128 if source.version == 6 else 32
+            family_flag = ["-6"] if source.version == 6 else []
+            self._run([
+                "ip", "-n", allocation.namespace, *family_flag, "route", "replace",
+                f"{source}/{prefix}", "dev", "di0",
+            ])
+            return
         table_family = "inet" if allocation.guest_ip_v6 else "ip"
         address_family = "ip6" if source.version == 6 else "ip"
         destination = ingress.guest_ip_v6 if source.version == 6 else ingress.guest_ip
@@ -1115,6 +1585,26 @@ class NamespaceBackend:
         if completed.returncode:
             return UnitStatus("inactive", "dead", "unknown", 0)
         return parse_unit_status(completed.stdout)
+
+    def slice_processes(self, instance_id: str, smithproxy_unit: str) -> list[dict]:
+        """Return live process members of one logical SAS Slice."""
+        members = [("smithproxy", smithproxy_unit)]
+        try:
+            if self.allocation(instance_id).topology == "tuntom-via":
+                members.append(("tuntom-relay", self.tuntom_relay_unit_name(instance_id)))
+                members.append(("tuntom-adapter", self.tuntom_unit_name(instance_id)))
+        except BackendError:
+            pass
+        result = []
+        for role, unit in members:
+            status = self.status(unit)
+            result.append({
+                "role": role, "unit": unit, "pid": status.main_pid,
+                "state": status.active_state, "substate": status.sub_state,
+                "result": status.result,
+                "rss_bytes": self.rss_bytes(status.main_pid),
+            })
+        return result
 
     @staticmethod
     def rss_bytes(pid: int) -> int:

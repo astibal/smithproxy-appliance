@@ -13,22 +13,20 @@ authorized source
       │
       ▼
  Smithproxy A
-      │  samostatný L3 point-to-point segment
+      │  egress blackbox link
       ▼
  QEMU/KVM blackbox
  qcow2 backing (RO) + per-run overlay (RW)
-      │  volitelný druhý L3 segment
-      ▼
- Smithproxy B (volitelný egress observer)
       │
-      ▼
-  SAS egress
- do0 ↔ czo*
+      └──── return link ────► Smithproxy A ────► SAS egress
 ```
 
 ## Rozhraní a izolace
 
-- Každý hop má vlastní TAP/veth a vlastní malý IPv4 `/30` + IPv6 `/126` pool.
+- Blackbox link je součást egress profilu Smithproxy, nikoli ingress nebo
+  management attachment. Odchozí provoz blackboxu se routuje zpět přes tutéž
+  proxy a teprve potom na SAS egress.
+- Každý link má vlastní TAP/veth a vlastní malý IPv4 `/30` + IPv6 `/126` pool.
 - Fyzický adaptér se do namespace nepřesouvá. SAS drží host konce a routy.
 - Smithproxy i QEMU mají vlastní namespace; řetězení je explicitní route mezi
   segmenty, nikoli policy-routing magie nad jedním sdíleným uplinkem.
@@ -56,6 +54,47 @@ výsledek musí administrátor explicitně exportovat. `/work` lze připojit jak
 omezený virtiofs share nebo samostatný datový disk. Host adresáře se nepřipojují
 do guestu automaticky.
 
+### Reset do původního stavu
+
+Importovaný QCOW2 je vždy immutable base a QEMU jej nikdy neotevírá pro zápis.
+Každý start instance vytvoří pro každý zapisovatelný disk nový per-instance
+QCOW2 overlay. Reset je lifecycle operace nad celou VM, nikoli nad jedním diskem:
+
+```text
+stop VM → zavřít QMP → smazat všechny overlaye → vytvořit čistou sadu → start VM
+```
+
+Původní stav znamená přesně stav všech base disků v okamžiku importu. Operace je
+all-or-nothing: při chybě přípravy kteréhokoli overlaye VM zůstane zastavená a
+nedostane smíšenou kombinaci starých a nových disků. Externí stav (`/work`,
+captures a telemetrie) se resetem nemaže; v UI musí být uveden zvlášť. Uložený
+snapshot je také konzistentní sada overlayů všech zapisovatelných disků.
+
+## Příprava pro forenzní analýzu
+
+Forenzní režim nesmí analyzovat ani měnit originální base image. Před resetem
+nebo destrukcí instance provede `forensic seal` nad požadovanou důkazní sadou:
+
+```text
+evidence/<case-id>/<capture-id>/
+├── manifest.json       identita image, VM konfigurace, UTC časy, operátor
+├── manifest.sha256     hash manifestu
+├── disks/              overlay každého zapisovatelného disku + hash
+├── memory/             volitelný konzistentní RAM dump + hash
+├── network/            PCAP pro každou dataplane NIC + hash
+└── logs/               QEMU/QMP/serial lifecycle log + hash
+```
+
+- Evidence export je immutable; analýza používá samostatnou pracovní kopii.
+- Manifest eviduje hash algoritmus, původní image ID, base disk cesty a hashe,
+  QEMU machine/CPU konfiguraci, pořadí disků/NIC, UTC časy a auditní identitu.
+- Capture se nejprve uzavře, dopíše a synchronizuje; až potom se vypočítají
+  hashe. Neúplný export má stav `failed/unsealed` a nesmí být vydáván za důkaz.
+- Vícediskový snapshot, RAM a síťové capture sdílejí jedno `capture-id`, aby se
+  nezaměnily artefakty z různých okamžiků.
+- Reset s aktivním `seal_before_reset` je odmítnut, dokud evidence seal úspěšně
+  neskončí nebo jej oprávněný operátor explicitně nepřeskočí s auditním důvodem.
+
 ## Management a telemetrie
 
 Výchozí control plane je pouze sada hostových Unix socketů. Pokud instance
@@ -70,8 +109,8 @@ guest telemetry NIC ── firewall allowlist ──► GRE collector / syslog t
 ## Lifecycle kontrakt
 
 1. Task připraví qcow2 overlay, namespaces, linky a routy.
-2. Spustí Smithproxy A, blackbox a případně Smithproxy B jako oddělené
-   transient systemd unity s navázaným failure/cleanup stavem.
+2. Spustí Smithproxy a blackbox jako oddělené transient systemd unity s
+   navázaným failure/cleanup stavem.
 3. Readiness se vyhodnotí po každém hopu; provoz se otevře až po kompletním
    sestavení řetězce.
 4. TTL nebo explicitní stop zavře ingress, uloží požadované artefakty a uklidí
@@ -88,11 +127,11 @@ profil. Budoucí chain profil pouze přidá uspořádané uzly a linky:
 runtime profile
   ingress_profile: authorized-source-dual
   nodes:
-    - smithproxy: inspect-in
+    - smithproxy: inspect-both-directions
     - qemu: malware-lab-image
-    - smithproxy: inspect-out   # optional
-  egress_profile: routed-lab-uplink
+  egress_profile: blackbox-return-link
 ```
 
-První implementační řez má být dvouuzlový `Smithproxy → QEMU`, bez obecného
-grafového editoru. Teprve ověřený datový model má dostat třetí uzel a UI.
+První implementační řez je dvouuzlový `Smithproxy ⇄ QEMU`, bez obecného
+grafového editoru. Egress profil vlastní link do blackboxu i explicitní
+návratovou cestu přes proxy.

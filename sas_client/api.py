@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import ssl
 import time
+import shutil
 from dataclasses import dataclass
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -81,6 +82,27 @@ class RunnerClient:
 
     def delete(self, path: str) -> Any:
         return self.request("DELETE", path)
+
+    def download(self, path: str, destination: str) -> str:
+        request = Request(
+            self.config.url + path, method="GET",
+            headers={"Authorization": f"Bearer {self.config.token}",
+                     "Accept": "application/octet-stream", "User-Agent": "sasctl/0.1"},
+        )
+        try:
+            with urlopen(request, timeout=max(90, self.config.timeout),
+                         context=self.ssl_context) as response, open(destination, "wb") as output:
+                shutil.copyfileobj(response, output, length=1024 * 1024)
+            return destination
+        except HTTPError as exc:
+            try:
+                error_payload = json.loads(exc.read())
+            except (ValueError, json.JSONDecodeError):
+                error_payload = None
+            message = error_payload.get("error", exc.reason) if isinstance(error_payload, dict) else str(exc.reason)
+            raise APIError(str(message), exc.code, error_payload) from exc
+        except (URLError, OSError, TimeoutError) as exc:
+            raise APIError(f"runner unavailable: {exc}") from exc
 
     def enqueue(self, method: str, path: str, payload: dict[str, Any] | None,
                 label: str, kind: str) -> dict[str, Any]:

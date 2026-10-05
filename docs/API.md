@@ -13,7 +13,7 @@ POST /v1/build
 POST /v1/refs/refresh
 Content-Type: application/json
 
-{"ref":"master"}
+{"ref":"master","build_type":"Release","adopt":true}
 ```
 
 Build je asynchronní. Stav je `idle`, `running`, `complete` nebo `failed`.
@@ -25,9 +25,13 @@ prefetchnutými remote branchemi, jejich aktuálními SHA a příznakem
 descriptor a deduplikuje souběžný refresh pod klíčem `refs:refresh`.
 Odpověď obsahuje omezený log a informaci, zda existuje spustitelná binárka.
 Build log se uchovává bounded a admin konzole jej automaticky zobrazí při
-selhání. Archiv buildu obsahuje výchozí config a assets, ale raw výchozí config
-se automaticky nevkládá do uživatelské config knihovny.
-Pole `build_type` přijímá `Release` nebo `Debug`.
+selhání. Pole `build_type` přijímá `Release` nebo `Debug`.
+
+`adopt` je volitelný boolean a pro kompatibilitu API má výchozí hodnotu `true`.
+Adopt po úspěšné kompilaci archivuje binárku, jednou importuje její nativní
+default config a připraví rootfs image. `adopt:false` provede pouze build a
+archivaci. Adopt záměrně nemění runtime profily, cert bundle ani běžící
+instance; tyto zásahy vyžadují samostatné rozhodnutí administrátora.
 
 ## Fronta úloh a rychlý read model
 
@@ -120,6 +124,9 @@ Automatická autorizace z jiného Capture Zone systému:
   "system": "capture-zone-portal",
   "label": "user 4711",
   "ttl_seconds": 1800,
+  "protocol": "tcp",
+  "destination": "10.10.20.0/24",
+  "ports": ["443", "8000-8010"],
   "register_source": true,
   "runtime_profile_id": "profile-uuid",
   "user_id": "4711"
@@ -129,6 +136,10 @@ Automatická autorizace z jiného Capture Zone systému:
 Místo `runtime_profile_id` lze poslat `instance_id` a připojit adresu k živé
 instanci; obě pole současně jsou chyba. Profilový spawn používá pouze uložený
 runtime profil, nikoli volně dodanou dvojici binárka/config.
+
+Volitelné selektory `protocol` (`any`, `tcp`, `udp`), `destination` (IP/CIDR)
+a `ports` (čísla nebo rozsahy) se promítnou do explicitních nft pravidel.
+Source a destination musí být ze stejné IP rodiny; porty vyžadují TCP nebo UDP.
 
 `register_source` u jedné IPv4 nebo IPv6 současně přidá adresu do spawn source poolu.
 CIDR lze autorizovat ve firewallu, ale nelze jej registrovat jako jednu spawn
@@ -155,11 +166,58 @@ PUT    /v1/network-profiles/{id}
 DELETE /v1/network-profiles/{id}
 ```
 
-Jediný driver je `split-veth`: ingress vždy používá `di0`, egress vždy `do0`.
-Pro ingress je nyní realizovaný `selector: source`, povinná autorizace a
-dual-stack. Egress může zvolit `masquerade|routed` a host uplink. Destination
-selektory a single-family položky se ukládají jako návrh s
-`implemented: false`; spawn je bezpečně odmítne.
+Přímý driver `tuntom` je jednostranný a lze jej zvolit nezávisle pro ingress
+i egress. `tuntom-via` je naopak duplexní profil a spotřebuje oba sloty:
+
+```text
+split-veth     di0 → Smithproxy → do0 → SAS uplink
+on-a-stick     di0 → Smithproxy → di0 → SAS host
+tuntom IN      remote peer ⇄ tuntom ⇄ di0 → Smithproxy
+tuntom OUT     Smithproxy → do0 ⇄ tuntom ⇄ remote peer
+tuntom-via     VIA switch ⇄ encrypted relay ⇄ adapter ⇄ di0/Smithproxy/do0
+blackbox-link  di0 → Smithproxy → do0 → blackbox → Smithproxy → SAS egress
+```
+
+Produkčně realizované jsou `split-veth`, `on-a-stick` a duplexní `tuntom-via` s ingress
+`selector: source`, povinnou autorizací a dual-stackem. On-a-stick nevytváří
+`do0/czo*`; proxy-originated provoz používá default route přes `di0` a hostový
+peer ingressu. `blackbox-link` zůstává uložitelný návrhový egress profil s
+`implemented:false`, dokud nebude hotový QEMU/TAP lifecycle. Blackbox není
+management attachment: jeho datový link je součást egressu a návrat se vede
+zpět přes Smithproxy. Egress může zvolit `masquerade|routed` a host uplink.
+
+Oba Tuntom drivery vyžadují `mode: routed`. Přímý `tuntom` zatím zůstává
+uložitelný návrhový jednostranný driver a očekává při startu
+`local_ip`, `peer_ip`, `peer_host` a jednorázový 32hex `secret`; profil je
+neukládá. VIA naopak očekává `headless_endpoint_id`. Unikátní endpoint package
+obsahuje Fabric port, switch IP, tunnel ID a secret; runner jej před vytvořením
+namespace atomicky rezervuje a po startu trvale sváže s ID jediné instance.
+Runner alokuje adresu `fabric0`, relay socket a attachment identity.
+Relay i adapter běží přímo v namespace instance; adapter vytvoří oba TUNy
+`di0/do0`. Secret nesmí být
+součástí profilu, instance JSON, task labelu ani logu.
+
+Transportní `fabric0` je `ipvlan` nad globálně nakonfigurovaným Fabric parent
+interfacem. Namespace firewall povoluje pouze UDP k vybranému switch IP a
+nezbytné ICMP/ICMPv6. V rootfs režimu se immutable Tuntom binárky připojí
+read-only do `/opt/sas/bin`; relay socket je v privátním `/run/sas` a secret
+předává systemd credential.
+
+Smithproxy, relay i adapter jsou členy jedné systemd Slice; API vrací `slice_unit`,
+souhrnné `slice_rss_bytes` a pole `members` s rolí, unitou, PID a RSS každého
+procesu. Stejný model je připravený pro další členy, například QEMU.
+
+Komponenty se nevybírají cestou na hostu. Network profil odkazuje na immutable
+build z Tuntom knihovny. Runner sleduje branche a sestavuje `tuntom` i
+`tuntom-divert-adapter`
+asynchronně přes:
+
+```http
+GET    /v1/tuntom/build
+POST   /v1/tuntom/build
+POST   /v1/tuntom/refs/refresh
+DELETE /v1/tuntom/builds/{id}
+```
 
 ```json
 {
@@ -177,6 +235,54 @@ selektory a single-family položky se ukládají jako návrh s
 ```json
 {
   "kind": "egress",
+  "name": "Tuntom VIA service link",
+  "driver": "tuntom-via",
+  "mode": "routed",
+  "address_family": "dual",
+  "interface_name": "do0",
+  "tuntom_build_id": "0123456789abcdef0123456789abcdef01234567-release",
+  "tuntom_in_prefix": "proxy-in-",
+  "tuntom_out_prefix": "proxy-out-",
+  "tuntom_admission": "immediate",
+  "tuntom_mtu": 1500
+}
+```
+
+Odpověď profilu obsahuje `consumes:["ingress","egress"]` a
+`start_parameters:["headless_endpoint_id"]`. Přímý Tuntom má
+`consumes` pouze pro svou stranu a startovací kontrakt obsahuje lokální IP,
+peer IP, peer host a secret.
+
+### Unikátní headless endpoint packages
+
+```http
+GET    /v1/headless-endpoints
+POST   /v1/headless-endpoints
+GET    /v1/headless-endpoints/{id}
+DELETE /v1/headless-endpoints/{id}
+```
+
+Import kontroluje unikátnost `package_id`, `fabric_port_id` i dvojice
+`switch_ip + tunnel_id`. Stavový automat je `available → reserved → bound`.
+`reserved` chrání souběžné spawn requesty; `bound` zůstává navázaný i po stopu
+instance. List a detail API nikdy nevracejí secret. BOUND package nelze smazat
+ani automaticky recyklovat pro jiný Slice.
+
+```json
+{
+  "package_id": "10ea565a-8c05-41d4-989c-b6927cdf21ac",
+  "kind": "tuntom-via",
+  "name": "Fabric proxy port 17",
+  "fabric_port_id": "switch-a/proxy-17",
+  "switch_ip": "2001:db8::10",
+  "tunnel_id": 17,
+  "secret": "00112233445566778899aabbccddeeff"
+}
+```
+
+```json
+{
+  "kind": "egress",
   "name": "Routed via lab uplink",
   "driver": "split-veth",
   "mode": "routed",
@@ -187,6 +293,8 @@ selektory a single-family položky se ukládají jako návrh s
 ```
 
 Použitý síťový profil nelze smazat, dokud na něj odkazuje runtime profil.
+VIA switch a jeho budoucí Fabric UI jsou host-level subsystem; tato verze
+spravuje build a lifecycle per-Slice adapteru, nikoli samotný switch.
 Změna katalogové položky se týká až nových spawnů; běžící instance drží svůj
 síťový snapshot.
 
@@ -336,6 +444,29 @@ Po dosažení TTL se Test Drive nově nemaže okamžitě. Smithproxy skončí, s
 současně nastaví nový výchozí TTL. U běžícího labu lze
 prodloužit deadline bez restartu. Po recovery lhůtě runner lab definitivně
 odstraní.
+
+## Appliance Export
+
+```http
+GET    /v1/appliance-exports
+POST   /v1/appliance-exports
+GET    /v1/appliance-exports/{id}
+GET    /v1/appliance-exports/{id}/download
+DELETE /v1/appliance-exports/{id}
+```
+
+Vytvoření patří do `/v1/task-actions`; přijímá `name`, `build_id`, `config_id`,
+`filesystem_mode` (`plain` nebo `rootfs`) a mapu `parameters` pro vlastní
+placeholdery konfigurace. Výsledný `.tar.gz` má jediný kořenový adresář a
+obsahuje `start.sh`, `stop.sh`, `status.sh`, `route.sh`, manifest, binárku,
+nativní config a assets. Síťový bootstrap vytvoří dva adresované veth páry s
+`di0`/`do0`; host routing, host firewall, SAS autorizace a NAT záměrně nemění.
+Transparentní TProxy pravidla jsou pouze uvnitř nového namespace.
+
+Součástí je `repack-from-binary.sh`. Z nové ELF binárky přebalí stejnou kostru,
+rekurzivně přidá loader a knihovny dohledatelné pomocí `ldd` a označí manifest
+jako repack. Nejde o reprodukovaný build: samotná binárka nepopisuje build-time
+assets ani moduly načítané dynamicky přes `dlopen()`.
 
 ## Diagnostika
 

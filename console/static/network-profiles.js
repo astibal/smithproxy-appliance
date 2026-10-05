@@ -16,21 +16,47 @@
 
     const render = () => {
       const selected = driver.value;
+      const kind = guide.dataset.networkDriverGuide;
+      if (kind === "egress" && interfaceInput) {
+        interfaceInput.value = selected === "on-a-stick" ? "di0" : "do0";
+      }
+      if (kind === "egress" && ["tuntom", "tuntom-via"].includes(selected) && mode) {
+        mode.value = "routed";
+      }
+      form.querySelectorAll("[data-tuntom-fields]").forEach((fields) => {
+        const tuntomSelected = ["tuntom", "tuntom-via"].includes(selected);
+        fields.hidden = !tuntomSelected;
+        fields.querySelectorAll("input, select, textarea").forEach((control) => {
+          const viaOnly = control.closest("[data-via-only]");
+          control.disabled = !tuntomSelected || (Boolean(viaOnly) && selected !== "tuntom-via");
+        });
+        fields.querySelectorAll("[data-via-only]").forEach((item) => {
+          item.hidden = selected !== "tuntom-via";
+        });
+        fields.querySelectorAll("[data-direct-only]").forEach((item) => {
+          item.hidden = selected !== "tuntom";
+        });
+      });
       guide.querySelectorAll("[data-driver-panel]").forEach((panel) => {
         panel.hidden = panel.dataset.driverPanel !== selected;
       });
-      const kind = guide.dataset.networkDriverGuide;
+      guide.querySelectorAll("[data-selector-guide]").forEach((panel) => {
+        panel.hidden = kind === "ingress" && selected !== "split-veth";
+      });
       const interfaceName = normalize(interfaceInput?.value, "");
       const family = addressFamily?.value || "dual";
       const implemented = kind === "ingress"
         ? selected === "split-veth" && selector?.value === "source"
           && interfaceName === "di0" && Boolean(authorization?.checked) && family === "dual"
-        : selected === "split-veth" && interfaceName === "do0" && family === "dual";
-      state.textContent = implemented ? "READY" : "DESIGN ONLY";
-      state.classList.toggle("is-design", !implemented);
+        : ["split-veth", "on-a-stick", "tuntom-via"].includes(selected)
+          && interfaceName === (selected === "on-a-stick" ? "di0" : "do0")
+          && family === "dual";
+      const viaShadow = kind === "ingress" && selected === "tuntom-via";
+      state.textContent = viaShadow ? "LOCKED BY VIA" : implemented ? "READY" : "DESIGN ONLY";
+      state.classList.toggle("is-design", !implemented && !viaShadow);
 
       const conventionalInterface = guide.dataset.networkDriverGuide === "ingress"
-        ? "di0" : "do0";
+        ? "di0" : selected === "on-a-stick" ? "di0" : "do0";
       guide.querySelectorAll("[data-interface-label]").forEach((label) => {
         label.textContent = normalize(interfaceInput?.value, conventionalInterface);
       });
@@ -72,5 +98,46 @@
       control.addEventListener(control.tagName === "SELECT" ? "change" : "input", render);
     });
     render();
+  });
+
+  document.querySelectorAll("[data-network-profile-compose]").forEach((compose) => {
+    const ingressForm = compose.querySelector('[data-profile-side="ingress"]');
+    const egressForm = compose.querySelector('[data-profile-side="egress"]');
+    const ingressDriver = ingressForm?.querySelector('select[name="driver"]');
+    const egressDriver = egressForm?.querySelector('select[name="driver"]');
+    if (!ingressForm || !egressForm || !ingressDriver || !egressDriver) return;
+    let previousIngressDriver = ingressDriver.value;
+
+    const lockIngress = (locked) => {
+      if (locked) {
+        if (ingressDriver.value !== "tuntom-via") previousIngressDriver = ingressDriver.value;
+        ingressForm.classList.add("network-profile-side-locked");
+        ingressDriver.value = "tuntom-via";
+        ingressDriver.dispatchEvent(new Event("change", {bubbles: true}));
+        ingressForm.querySelectorAll("input,select,textarea,button").forEach((control) => {
+          if (control.matches('[name="csrf_token"],[name="kind"]')) return;
+          control.disabled = true;
+        });
+      } else {
+        ingressForm.classList.remove("network-profile-side-locked");
+        ingressForm.querySelectorAll("input,select,textarea,button").forEach((control) => {
+          control.disabled = false;
+        });
+        if (ingressDriver.value === "tuntom-via") {
+          ingressDriver.value = previousIngressDriver || "split-veth";
+        }
+        ingressDriver.dispatchEvent(new Event("change", {bubbles: true}));
+      }
+      ingressForm.setAttribute("aria-disabled", String(locked));
+      const eyebrow = ingressForm.querySelector(".section-head .eyebrow");
+      if (eyebrow) eyebrow.textContent = locked ? "INGRESS · VIA LOCKED" : "INGRESS";
+    };
+    const sync = () => {
+      const via = egressDriver.value === "tuntom-via";
+      compose.classList.toggle("network-profile-compose-via", via);
+      lockIngress(via);
+    };
+    egressDriver.addEventListener("change", sync);
+    sync();
   });
 })();

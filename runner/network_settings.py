@@ -18,6 +18,10 @@ DEFAULTS = {
     "allocation_prefix": 30,
     "namespace_cidr_v6": "fd42:ca7:200::/64",
     "allocation_prefix_v6": 126,
+    "fabric_cidr": "10.240.0.0/24",
+    "fabric_cidr_v6": "fd42:ca7:240::/120",
+    "fabric_interface": "",
+    "fabric_link_mode": "ipvlan-l3",
     "egress_mode": "masquerade",
     "sas_route_via": "",
     "sas_route_via_v6": "",
@@ -75,6 +79,23 @@ class NetworkSettings:
             raise ConfigError("ingress_cidr_v6 must be IPv6 with prefix length /48 through /120")
         if ingress_network_v6.overlaps(network_v6):
             raise ConfigError("ingress and egress IPv6 pools must not overlap")
+        try:
+            fabric_network = ipaddress.ip_network(
+                str(value.get("fabric_cidr", DEFAULTS["fabric_cidr"])), strict=True,
+            )
+            fabric_network_v6 = ipaddress.ip_network(
+                str(value.get("fabric_cidr_v6", DEFAULTS["fabric_cidr_v6"])), strict=True,
+            )
+        except ValueError as exc:
+            raise ConfigError(f"fabric CIDR must be canonical: {exc}") from exc
+        if fabric_network.version != 4 or not 24 <= fabric_network.prefixlen <= 29:
+            raise ConfigError("fabric_cidr must be IPv4 with prefix length /24 through /29")
+        if fabric_network_v6.version != 6 or not 64 <= fabric_network_v6.prefixlen <= 120:
+            raise ConfigError("fabric_cidr_v6 must be IPv6 with prefix length /64 through /120")
+        if fabric_network.overlaps(network) or fabric_network.overlaps(ingress_network):
+            raise ConfigError("fabric IPv4 pool must not overlap ingress or egress pools")
+        if fabric_network_v6.overlaps(network_v6) or fabric_network_v6.overlaps(ingress_network_v6):
+            raise ConfigError("fabric IPv6 pool must not overlap ingress or egress pools")
         prefix_v6 = int(value.get("allocation_prefix_v6", 126))
         if prefix_v6 != 126:
             raise ConfigError("allocation_prefix_v6 is fixed at /126")
@@ -100,11 +121,20 @@ class NetworkSettings:
             character.isalnum() or character in "_.-" for character in interface
         )):
             raise ConfigError("sas_interface is invalid")
+        fabric_interface = str(value.get("fabric_interface", "")).strip()
+        if fabric_interface and (len(fabric_interface) > 15 or not all(
+            character.isalnum() or character in "_.-" for character in fabric_interface
+        )):
+            raise ConfigError("fabric_interface is invalid")
+        fabric_link_mode = str(value.get("fabric_link_mode", "ipvlan-l3"))
+        if fabric_link_mode not in {"ipvlan-l3", "ipvlan-l2"}:
+            raise ConfigError("fabric_link_mode must be ipvlan-l3 or ipvlan-l2")
         table_start = int(value.get("route_table_start", 60000))
         mark_start = int(value.get("mark_start", 0x10000000))
         capacity = min(
             network.num_addresses // 4, network_v6.num_addresses // 4,
             ingress_network.num_addresses // 4, ingress_network_v6.num_addresses // 4,
+            fabric_network.num_addresses - 2, fabric_network_v6.num_addresses - 1,
         )
         if table_start < 1000 or table_start + (capacity * 2) >= 2**31:
             raise ConfigError("route table range is invalid for this CIDR")
@@ -115,6 +145,10 @@ class NetworkSettings:
             "ingress_cidr_v6": str(ingress_network_v6),
             "namespace_cidr": str(network), "allocation_prefix": 30,
             "namespace_cidr_v6": str(network_v6), "allocation_prefix_v6": 126,
+            "fabric_cidr": str(fabric_network),
+            "fabric_cidr_v6": str(fabric_network_v6),
+            "fabric_interface": fabric_interface,
+            "fabric_link_mode": fabric_link_mode,
             "egress_mode": egress_mode, "sas_route_via": route_via,
             "sas_route_via_v6": route_via_v6,
             "sas_interface": interface, "route_table_start": table_start,
@@ -151,6 +185,8 @@ class NetworkSettings:
                     key for key in (
                         "ingress_cidr", "ingress_cidr_v6", "namespace_cidr",
                         "namespace_cidr_v6", "route_table_start", "mark_start",
+                        "fabric_cidr", "fabric_cidr_v6", "fabric_interface",
+                        "fabric_link_mode",
                     )
                     if validated[key] != current[key]
                 ]
@@ -190,6 +226,8 @@ class NetworkSettings:
             ipaddress.ip_network(settings["namespace_cidr_v6"]).num_addresses // 4,
             ipaddress.ip_network(settings["ingress_cidr"]).num_addresses // 4,
             ipaddress.ip_network(settings["ingress_cidr_v6"]).num_addresses // 4,
+            ipaddress.ip_network(settings["fabric_cidr"]).num_addresses - 2,
+            ipaddress.ip_network(settings["fabric_cidr_v6"]).num_addresses - 1,
         )
         allocated_instances = len({
             str(value.get("owner_id") or allocation_id)
