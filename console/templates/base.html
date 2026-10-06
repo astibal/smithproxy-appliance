@@ -7,9 +7,10 @@
   <link rel="stylesheet" href="{{ url_for('static',filename='vendor/xterm/xterm.css') }}">
   <link rel="stylesheet" href="{{ url_for('static',filename='app.css',v='52') }}">
   <link rel="stylesheet" href="{{ url_for('static',filename='network-profiles.css',v='5') }}">
-  <script src="{{ url_for('static',filename='vendor/xterm/xterm.js') }}" defer></script>
-  <script src="{{ url_for('static',filename='vendor/xterm/addon-fit.js') }}" defer></script>
-  <script src="{{ url_for('static',filename='app.js',v='43') }}" defer></script>
+  <script src="{{ url_for('static',filename='ui-i18n.js',v='i18n-20261005') }}" defer></script>
+  <script src="{{ url_for('static',filename='vendor/xterm/xterm.js',v='i18n-20261005') }}" defer></script>
+  <script src="{{ url_for('static',filename='vendor/xterm/addon-fit.js',v='i18n-20261005') }}" defer></script>
+  <script src="{{ url_for('static',filename='app.js',v='i18n-20261005') }}" defer></script>
 </head>
 <body class="page-{{ request.endpoint|default('unknown') }}">
 <header>

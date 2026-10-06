@@ -59,7 +59,7 @@ function initializeEditor() {
         if (!update.docChanged) return;
         source.value = update.state.doc.toString();
         if (stateLabel) {
-          stateLabel.textContent = source.value === initial ? "Beze změn" : "Neuložené změny";
+          stateLabel.textContent = source.value === initial ? window.sasTr("ui.314b7f35e20f") : window.sasTr("ui.eb98d79c9feb");
           stateLabel.classList.toggle("dirty", source.value !== initial);
         }
       }),

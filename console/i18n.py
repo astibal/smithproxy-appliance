@@ -344,6 +344,13 @@ CATALOGUE = {
 }
 
 
+# Shared literal catalogue for templates and browser controls.
+import json as _json
+from pathlib import Path as _Path
+for _locale, _entries in _json.loads((_Path(__file__).with_name("ui-translations.json")).read_text()).items():
+    CATALOGUE[_locale].update(_entries)
+
+
 def translate(locale: str, key: str) -> str:
     selected = locale if locale in LANGUAGES else "cs"
     return CATALOGUE.get(selected, {}).get(key, CATALOGUE["en"].get(key, key))

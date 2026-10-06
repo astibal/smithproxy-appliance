@@ -275,7 +275,7 @@
         const row = element.closest('.firewall-row');
         row?.classList.toggle('expired', elapsed);
         const extendButton = row?.querySelector('.firewall-extend-button');
-        if (extendButton) extendButton.textContent = elapsed ? 'Oživit' : '+ Čas';
+        if (extendButton) extendButton.textContent = elapsed ? window.sasTr("ui.6d81c50b8e54") : '+ Čas';
       });
     };
     update();
@@ -433,7 +433,7 @@
             const expiry = make('div', 'topology-source-expiry');
             expiry.title = `${(expiration.chains || []).join(' + ').toUpperCase()} · ${expiration.system || 'authorization'} · ${expiration.expires_at}`;
             expiry.append(make('span', 'topology-clock', '⏱'));
-            const countdown = make('b', 'topology-source-countdown', 'počítám…');
+            const countdown = make('b', 'topology-source-countdown', window.sasTr("ui.345ce6f0116e"));
             countdown.dataset.expiresAt = expiration.expires_at || '';
             expiry.append(countdown);
             expiry.append(make('small', '', (expiration.chains || []).join('+').toUpperCase()));
@@ -495,7 +495,7 @@
       if (egressGroups.length) {
         const heading = make('div', 'topology-egress-heading');
         heading.append(make('b', '', 'INSTANCE OUTPUT'));
-        heading.append(make('span', '', 'Instance se stejným výsledným egress efektem jsou sloučené.'));
+        heading.append(make('span', '', window.sasTr("ui.da3e49ee3e4d")));
         root.append(heading);
       }
       egressGroups.forEach(group => {
@@ -514,7 +514,7 @@
         connector.append(make('span', '', `${(group.instances || []).length}×`));
         const output = make('div', `topology-egress-output mode-${group.mode}`);
         const title = group.mode === 'masquerade' ? 'MASQUERADE' : group.mode === 'routed' ? 'ROUTED' : String(group.mode || 'UNKNOWN').toUpperCase();
-        output.title = 'Odvozeno z runtime networking konfigurace; nejde o změřený packet trace.';
+        output.title = window.sasTr("ui.aa51c793d3bb");
         output.append(make('small', 'effect-indication', 'INDICATION ONLY · SHARED EGRESS EFFECT'));
         output.append(make('b', '', title));
         output.append(make('code', '', group.interface || 'interface dle host route'));
@@ -526,7 +526,7 @@
       if (state) {
         const updated = Date.parse(payload.updated_at || '');
         state.textContent = Number.isFinite(updated)
-          ? `živě · ${new Date(updated).toLocaleTimeString()}` : 'živě';
+          ? `${window.sasTr("ui.34bc5c168e50")} · ${new Date(updated).toLocaleTimeString(locale)}` : window.sasTr("ui.34bc5c168e50");
         state.classList.remove('state-failed');
       }
       updateTopologyCountdowns();
@@ -630,7 +630,7 @@
         if (exportId && task.kind === 'appliance-export') {
           tail = document.createElement('a');
           tail.href = `/appliance-exports/${encodeURIComponent(exportId)}/download`;
-          tail.textContent = locale === 'cs' ? 'Stáhnout' : locale === 'fr' ? 'Télécharger' : 'Download';
+          tail.textContent = locale === 'cs' ? window.sasTr("ui.c710338ea02e") : locale === 'fr' ? 'Télécharger' : 'Download';
         } else if (resultId) {
           tail = document.createElement('a'); tail.href = `/?instance=${encodeURIComponent(resultId)}`; tail.textContent = short(resultId);
         } else if (viewable) {
@@ -756,7 +756,7 @@
       popout.className = 'instance-card-popout';
       popout.href = focusedInstanceUrl(item.id, 'overview');
       popout.target = '_blank'; popout.rel = 'noopener';
-      popout.title = `Otevřít ${short(item.id)} v samostatném tabu`;
+      popout.title = window.sasTr("ui.d1736ed66b9e", {id: short(item.id)});
       popout.setAttribute('aria-label', popout.title);
       popout.textContent = '↗';
       const row = document.createElement('div'); row.className = 'instance-row';
@@ -793,7 +793,7 @@
       text('#detail-short-id', short(item.id)); text('#detail-full-id', item.id);
       const members = (item.members || []).filter(member => member.pid);
       text('#detail-pid', item.slice_unit || 'Slice —');
-      text('#detail-rss', `${members.map(member => `${member.role} PID ${member.pid}`).join(' · ') || 'bez živých členů'} · RSS ${formatBytes(item.slice_rss_bytes || 0)} · CLI ${item.cli_port ? `:${item.cli_port}` : '—'}`);
+      text('#detail-rss', `${members.map(member => `${member.role} PID ${member.pid}`).join(' · ') || window.sasTr("ui.c667d4a42895")} · RSS ${formatBytes(item.slice_rss_bytes || 0)} · CLI ${item.cli_port ? `:${item.cli_port}` : '—'}`);
       text('#detail-source', item.source_ip || '—'); text('#detail-user', item.user_id || 'unknown user');
       text('#detail-namespace', item.namespace || '—'); text('#detail-profile', `${item.profile || 'custom'} · ${item.unit || 'unit unknown'}`);
       text('#detail-ttl', ttl(item.deadline)); text('#detail-deadline', item.deadline ? new Date(item.deadline).toLocaleString() : tr('noDeadline'));
@@ -878,7 +878,7 @@
       const copy = document.createElement('div');
       const title = document.createElement('h3'); title.textContent = 'Remote GDB';
       const hint = document.createElement('small');
-      hint.textContent = 'gdbserver sdílí network namespace instance a dostane pouze CAP_SYS_PTRACE.';
+      hint.textContent = window.sasTr("ui.ef96b5f42982");
       copy.append(title, hint); heading.append(copy);
 
       if (execution.build_type === 'Debug' && instance.state === 'running') {
@@ -893,7 +893,7 @@
         form.append(csrf, button); heading.append(form);
         const terminalButton = document.createElement('button');
         terminalButton.type = 'button'; terminalButton.className = 'secondary compact';
-        terminalButton.textContent = 'Otevřít GDB terminal';
+        terminalButton.textContent = window.sasTr("ui.91de12d1a96a");
         terminalButton.addEventListener('click', () => openGdbTerminal(instance.id));
         heading.append(terminalButton);
       }
@@ -901,17 +901,17 @@
 
       if (execution.build_type !== 'Debug') {
         const note = document.createElement('p'); note.className = 'empty';
-        note.textContent = 'Attach je povolen jen pro instanci spuštěnou z archivovaného Debug buildu.';
+        note.textContent = window.sasTr("ui.528183e345de");
         panel.append(note);
       } else if (!debug.unit) {
         const note = document.createElement('p'); note.className = 'empty';
-        note.textContent = instance.state === 'running' ? 'GDB helper není spuštěn.' : 'Instance musí být spuštěná.';
+        note.textContent = instance.state === 'running' ? window.sasTr("ui.b52f009d2aa3") : window.sasTr("ui.bc111e59ea84");
         panel.append(note);
       } else {
         const commands = document.createElement('div'); commands.className = 'diag-grid';
         appendDiagRow(commands, 'Helper unit', debug.unit);
         appendDiagRow(commands, '1. SSH tunel', debug.ssh_tunnel);
-        appendDiagRow(commands, '2. Binárka se symboly', debug.copy_binary);
+        appendDiagRow(commands, window.sasTr("ui.2479467f9e1e"), debug.copy_binary);
         appendDiagRow(commands, '3. GDB', debug.gdb_commands);
         panel.append(commands);
       }
@@ -945,11 +945,11 @@
         const egress = network.egress || {};
         appendDiagRow(grid, 'Ingress pool / subnet', ingress.subnet);
         appendDiagRow(grid, 'Ingress host → namespace', `${ingress.host_interface || '—'} ${ingress.expected_host_address || '—'} → ${ingress.guest_interface || '—'} ${ingress.expected_guest_address || '—'}`);
-        appendDiagRow(grid, 'Ingress interface — skutečnost', formatInterfaces(ingress.host_interfaces));
+        appendDiagRow(grid, window.sasTr("ui.3113f9cbd186"), formatInterfaces(ingress.host_interfaces));
         appendDiagRow(grid, 'Egress pool / subnet', egress.subnet);
         appendDiagRow(grid, 'Egress namespace → host', `${egress.guest_interface || '—'} ${egress.expected_guest_address || '—'} → ${egress.host_interface || '—'} ${egress.expected_host_address || '—'}`);
-        appendDiagRow(grid, 'Egress interface — skutečnost', formatInterfaces(egress.host_interfaces));
-        appendDiagRow(grid, 'Namespace interface — skutečnost', formatInterfaces(network.namespace_interfaces));
+        appendDiagRow(grid, window.sasTr("ui.077293545507"), formatInterfaces(egress.host_interfaces));
+        appendDiagRow(grid, window.sasTr("ui.3ec55ec78625"), formatInterfaces(network.namespace_interfaces));
         appendDiagRow(grid, 'Namespace routy', formatRoutes(network.namespace_routes));
         appendDiagRow(grid, 'Host policy routy', formatRoutes(network.host_routes));
         appendDiagRow(grid, 'Policy routing', `table ${network.route_table || '—'} · fwmark ${network.packet_mark || '—'} · ${network.present ? 'active' : 'not present'}`);
@@ -961,14 +961,14 @@
           instance.id,
           execution.build_type === 'Debug' && instance.state === 'running',
         );
-        appendDiagRow(grid, 'Auto-restart', instance.auto_restart ? `ano · ${instance.restart_count || 0}/5 pokusů` : 'ne');
-        appendDiagRow(grid, 'Poslední restart', instance.last_restart_at || '—');
+        appendDiagRow(grid, 'Auto-restart', instance.auto_restart ? window.sasTr("ui.cccb4e4ad1ba", {count: instance.restart_count || 0}) : window.sasTr("ui.cb58e4600bf0"));
+        appendDiagRow(grid, window.sasTr("ui.e1d2d128701a"), instance.last_restart_at || '—');
         output.replaceChildren(grid);
         if (instance.crash_trace) {
           const crash = document.createElement('section'); crash.className = 'debug-panel';
-          const title = document.createElement('h3'); title.textContent = 'Poslední automatický stack trace';
+          const title = document.createElement('h3'); title.textContent = window.sasTr("ui.6550183db229");
           const meta = document.createElement('p'); meta.className = 'hint';
-          meta.textContent = `PID ${instance.crash_pid || '—'} · ${instance.crash_at || 'čas neznámý'}`;
+          meta.textContent = `PID ${instance.crash_pid || '—'} · ${instance.crash_at || window.sasTr("ui.8c82ddc7c82f")}`;
           const trace = document.createElement('pre'); trace.className = 'runtime-log crash-trace';
           trace.textContent = instance.crash_trace;
           crash.append(title, meta, trace); output.append(crash);

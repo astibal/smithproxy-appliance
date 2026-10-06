@@ -8,25 +8,25 @@
 {% set ingress_profiles = network_profiles|selectattr('kind', 'equalto', 'ingress')|list %}
 {% set egress_profiles = network_profiles|selectattr('kind', 'equalto', 'egress')|list %}
 <section class="panel">
-  <div class="section-head"><div><h2>Nový profil</h2><p class="hint">Runtime profil skládá aplikaci, konfiguraci, certifikáty a obě strany síťové cesty.</p></div><a class="secondary compact button-link" href="{{ url_for('network_profile_library') }}">Síťové profily</a></div>
+  <div class="section-head"><div><h2>{{ _('ui.4922fc8a2947') }}</h2><p class="hint">{{ _('ui.eff4f44cff52') }}</p></div><a class="secondary compact button-link" href="{{ url_for('network_profile_library') }}">{{ _('nav.network_profiles') }}</a></div>
   <form method="post" action="{{ url_for('create_runtime_profile') }}" class="config-editor-meta runtime-profile-compose">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <label>Název<input name="name" maxlength="128" required></label>
-    <label>Archivovaná binárka / image<select name="build_id" required>{% for artifact in status.build.artifacts|default([]) %}<option value="{{ artifact.build_id|default(artifact.commit_id) }}" title="{{ artifact.choice_title }}">{{ artifact.choice_label }}</option>{% else %}<option value="" disabled selected>Nejdřív vytvoř build</option>{% endfor %}</select><small>Buildy s hotovým image/rootfs jsou nahoře; uvnitř skupin rozhoduje čas sestavení. ★ označuje nejnovější build dané větve a varianty.</small></label>
-    <label>Konfigurace<select name="config_id" required>{% for config in status.build.configs|default([]) %}<option value="{{ config.config_id }}" {{ 'disabled' if not config.native else '' }}>{{ config.name }} · {{ config.profile|default('custom') }} · {{ config.sha256[:12] }}{% if not config.native %} · legacy{% endif %}</option>{% else %}<option value="" disabled selected>Nejdřív nahraj konfiguraci</option>{% endfor %}</select></label>
-    <label>CA / Cert bundle<select name="cert_bundle_id"><option value="">Bez vlastního bundle — certifikáty z configu</option>{% for bundle in bundles %}<option value="{{ bundle.bundle_id }}">{{ bundle.name }} · {{ bundle.ca_common_name }}</option>{% endfor %}</select></label>
-    <label>Filesystem izolace<select name="filesystem_mode"><option value="host">Host sandbox · současná varianta</option><option value="rootfs">Izolovaný rootfs · RootDirectory</option></select><small>Rootfs se připraví jako immutable artefakt vybraného buildu.</small></label>
-    <label class="network-binding ingress">Ingress network profil<select name="ingress_network_profile_id"><option value="">Global/default · split-veth / di0</option>{% for item in network_profiles if 'ingress' in item.consumes|default([item.kind]) %}<option value="{{ item.network_profile_id }}" data-consumes="{{ item.consumes|default([item.kind])|join(',') }}">{{ item.name }} · {{ 'READY' if item.implemented else 'DESIGN ONLY' }}{{ ' · DUPLEX' if item.consumes|default([])|length > 1 }}</option>{% endfor %}</select><small>SOURCE → runner policy → di0</small></label>
-    <label class="network-binding egress">Egress network profil<select name="egress_network_profile_id"><option value="">Global/default · globální routing</option>{% for item in network_profiles if 'egress' in item.consumes|default([item.kind]) %}<option value="{{ item.network_profile_id }}" data-consumes="{{ item.consumes|default([item.kind])|join(',') }}">{{ item.name }} · {{ 'READY' if item.implemented else 'DESIGN ONLY' }}{{ ' · DUPLEX' if item.consumes|default([])|length > 1 }}</option>{% endfor %}</select><small>namespace → uplink / route</small></label>
-    <label>TTL (sekundy)<input type="number" name="ttl_seconds" value="1800" min="5" max="86400"></label>
-    <label class="check"><input type="checkbox" name="ttl_unlimited"><span>Unlimited <small>Bez deadline a systemd RuntimeMaxSec.</small></span></label>
-    <label class="check"><input type="checkbox" name="auto_restart"><span>Auto-restart při pádu <small>Max. 5 restartů; TTL zůstává závazné.</small></span></label>
-    <button>Vytvořit profil</button>
+    <label>{{ _('ui.11002cd1dcb7') }}<input name="name" maxlength="128" required></label>
+    <label>{{ _('ui.ef9b8b9ef8e5') }}<select name="build_id" required>{% for artifact in status.build.artifacts|default([]) %}<option value="{{ artifact.build_id|default(artifact.commit_id) }}" title="{{ artifact.choice_title }}">{{ artifact.choice_label }}</option>{% else %}<option value="" disabled selected>{{ _('ui.5e8614158d5b') }}</option>{% endfor %}</select><small>{{ _('ui.b2f048205d61') }}</small></label>
+    <label>{{ _('nav.configs') }}<select name="config_id" required>{% for config in status.build.configs|default([]) %}<option value="{{ config.config_id }}" {{ 'disabled' if not config.native else '' }}>{{ config.name }} · {{ config.profile|default('custom') }} · {{ config.sha256[:12] }}{% if not config.native %} · legacy{% endif %}</option>{% else %}<option value="" disabled selected>{{ _('ui.12d253fdf4b9') }}</option>{% endfor %}</select></label>
+    <label>CA / Cert bundle<select name="cert_bundle_id"><option value="">{{ _('ui.3e27c3992953') }}</option>{% for bundle in bundles %}<option value="{{ bundle.bundle_id }}">{{ bundle.name }} · {{ bundle.ca_common_name }}</option>{% endfor %}</select></label>
+    <label>{{ _('ui.87f99efcf943') }}<select name="filesystem_mode"><option value="host">{{ _('ui.af587f2d545e') }}</option><option value="rootfs">{{ _('ui.fd40d0c84f37') }}</option></select><small>{{ _('ui.f9404e6600fd') }}</small></label>
+    <label class="network-binding ingress">{{ _('ui.5e4833d5d91f') }}<select name="ingress_network_profile_id"><option value="">Global/default · split-veth / di0</option>{% for item in network_profiles if 'ingress' in item.consumes|default([item.kind]) %}<option value="{{ item.network_profile_id }}" data-consumes="{{ item.consumes|default([item.kind])|join(',') }}">{{ item.name }} · {{ 'READY' if item.implemented else 'DESIGN ONLY' }}{{ ' · DUPLEX' if item.consumes|default([])|length > 1 }}</option>{% endfor %}</select><small>SOURCE → runner policy → di0</small></label>
+    <label class="network-binding egress">{{ _('ui.be4c6326e750') }}<select name="egress_network_profile_id"><option value="">{{ _('ui.d3fe661a9b6c') }}</option>{% for item in network_profiles if 'egress' in item.consumes|default([item.kind]) %}<option value="{{ item.network_profile_id }}" data-consumes="{{ item.consumes|default([item.kind])|join(',') }}">{{ item.name }} · {{ 'READY' if item.implemented else 'DESIGN ONLY' }}{{ ' · DUPLEX' if item.consumes|default([])|length > 1 }}</option>{% endfor %}</select><small>namespace → uplink / route</small></label>
+    <label>{{ _('ui.109738a1f94a') }}<input type="number" name="ttl_seconds" value="1800" min="5" max="86400"></label>
+    <label class="check"><input type="checkbox" name="ttl_unlimited"><span>Unlimited <small>{{ _('ui.c6b7a79cc893') }}</small></span></label>
+    <label class="check"><input type="checkbox" name="auto_restart"><span>{{ _('ui.62d3a1874a93') }} <small>{{ _('ui.f134a10f1e0c') }}</small></span></label>
+    <button>{{ _('ui.d64010004e8b') }}</button>
   </form>
 </section>
 
 <section class="panel">
-  <div class="section-head"><h2>Profily</h2><b>{{ profiles|length }}</b></div>
+  <div class="section-head"><h2>{{ _('nav.profiles') }}</h2><b>{{ profiles|length }}</b></div>
   <div class="config-list runtime-profile-list">
   {% for profile in profiles %}
     {% set used_instances = profile.usage.instances|default([]) %}
@@ -37,7 +37,7 @@
         <span class="badge">TTL {{ profile.ttl_seconds ~ ' s' if profile.ttl_seconds is not none else 'unlimited' }}</span>
         {% if profile.auto_restart %}<span class="badge ok">auto-restart</span>{% endif %}
         <span class="badge {{ 'ok' if profile.filesystem_mode == 'rootfs' and profile.rootfs_ready else '' }}">{{ 'rootfs' if profile.filesystem_mode == 'rootfs' else 'host fs' }}</span>
-        {% if profile.newer_build_available %}<span class="badge warning">novější build</span>{% endif %}
+        {% if profile.newer_build_available %}<span class="badge warning">{{ _('ui.48ca62a4b2bb') }}</span>{% endif %}
         <div class="runtime-binding-line">
           <span>IN</span><b class="{{ '' if profile.ingress_network_profile_ready else 'not-ready' }}">{{ profile.ingress_network_profile_name }}</b>
           <i>→</i><code>smithproxy</code><i>→</i>
@@ -45,15 +45,15 @@
         </div>
         {% if profile.network_start_parameters %}<small class="profile-runtime-parameters">Spawn parametry: <code>{{ profile.network_start_parameters|join(' · ') }}</code></small>{% endif %}
         <small>bin {{ profile.build_ref or 'detached' }} · <code>{{ profile.build_id[:12] }}</code></small>
-        {% if profile.newer_build_available %}<small class="profile-warning">Stejná větev a typ mají novější commit <code>{{ profile.newer_commit_id[:12] }}</code>{% if profile.code_behind_days %} (+{{ profile.code_behind_days }} dní kódu){% endif %}.</small>{% endif %}
+        {% if profile.newer_build_available %}<small class="profile-warning">{{ _('ui.3438fb735a03') }} <code>{{ profile.newer_commit_id[:12] }}</code>{% if profile.code_behind_days %} (+{{ profile.code_behind_days }} {{ _('ui.b5352ed5c800') }}{% endif %}.</small>{% endif %}
         <small>cfg {{ profile.config_name }} · {{ profile.config_profile }} · <code>{{ profile.config_id[:12] }}</code></small>
         <small>certs {{ profile.cert_bundle_name or 'z konfigurace' }}{% if profile.cert_bundle_id %} · <code>{{ profile.cert_bundle_id[:12] }}</code>{% endif %}</small>
-        <small>/work: {{ profile.work_files|default([])|length }} souborů</small>
-        {% if used_instances %}<small>Používají instance: {% for item in used_instances %}<code>{{ item.id[:12] }}</code> ({{ item.state }}){% if not loop.last %}, {% endif %}{% endfor %}</small>{% endif %}
+        <small>/work: {{ profile.work_files|default([])|length }} {{ _('ui.3283672f2ae8') }}</small>
+        {% if used_instances %}<small>{{ _('ui.a09fe0ccba6a') }} {% for item in used_instances %}<code>{{ item.id[:12] }}</code> ({{ item.state }}){% if not loop.last %}, {% endif %}{% endfor %}</small>{% endif %}
       </div>
-      <div class="actions"><a class="secondary compact button-link" href="{{ url_for('edit_runtime_profile',profile_id=profile.profile_id) }}">Upravit</a><form method="post" action="{{ url_for('delete_runtime_profile',profile_id=profile.profile_id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="danger compact" {{ 'disabled' if used_instances else '' }}>Smazat</button></form></div>
+      <div class="actions"><a class="secondary compact button-link" href="{{ url_for('edit_runtime_profile',profile_id=profile.profile_id) }}">{{ _('ui.ec3d71143fde') }}</a><form method="post" action="{{ url_for('delete_runtime_profile',profile_id=profile.profile_id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="danger compact" {{ 'disabled' if used_instances else '' }}>{{ _('ui.a1ee22baa5d7') }}</button></form></div>
     </div>
-  {% else %}<p class="empty">Zatím žádný runtime profil.</p>{% endfor %}
+  {% else %}<p class="empty">{{ _('ui.38f752b4f261') }}</p>{% endfor %}
   </div>
 </section>
 {% endblock %}

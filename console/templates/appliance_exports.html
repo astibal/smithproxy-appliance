@@ -17,8 +17,8 @@
 <section class="panel">
   <div class="section-head"><div><h2>{{ _('exports.library') }}</h2><p class="hint">{{ _('exports.library_help') }}</p></div><b>{{ exports|length }}</b></div>
   <div class="export-list">
-    <div class="export-row export-head"><span>{{ _('exports.name') }}</span><span>Build</span><span>{{ _('exports.mode') }}</span><span>SHA-256 / size</span><span>{{ _('exports.actions') }}</span></div>
+    <div class="export-row export-head"><span>{{ _('exports.name') }}</span><span>{{ _('build.compile') }}</span><span>{{ _('exports.mode') }}</span><span>SHA-256 / size</span><span>{{ _('exports.actions') }}</span></div>
     {% for item in exports %}<div class="export-row"><span><b>{{ item.name }}</b><small>{{ item.created_at }}</small></span><span><code>{{ item.ref }} · {{ item.commit_id[:12] }}</code><small>{{ item.profile }}</small></span><span><b>{{ item.filesystem_mode|upper }}</b><small>schema {{ item.schema }}</small></span><span><code title="{{ item.sha256 }}">{{ item.sha256[:16] }}…</code><small>{{ '%.1f MiB'|format(item.size_bytes / 1048576) }}</small></span><span class="actions"><a class="button-link secondary compact" href="{{ url_for('download_appliance_export',export_id=item.export_id) }}">{{ _('exports.download') }}</a><form method="post" action="{{ url_for('delete_appliance_export',export_id=item.export_id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="danger compact">{{ _('exports.delete') }}</button></form></span></div>{% else %}<p class="empty">{{ _('exports.none') }}</p>{% endfor %}
   </div>
 </section>
-{% endblock %}{% block scripts %}<script src="{{ url_for('static',filename='appliance-exports.js',v='1') }}" defer></script>{% endblock %}
+{% endblock %}{% block scripts %}<script src="{{ url_for('static',filename='appliance-exports.js',v='i18n-20261005') }}" defer></script>{% endblock %}

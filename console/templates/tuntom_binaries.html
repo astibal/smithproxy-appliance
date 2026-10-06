@@ -3,56 +3,56 @@
 {% set refs = build.refs|default({}) %}
 <div class="headline">
   <div><div class="eyebrow">TUNTOM BINARY LIBRARY</div><h1>Tuntom Binaries</h1>
-    <p>Archivované buildy <code>tuntom-divert-adapter</code> pro VIA network profily.</p>
+    <p>{{ _('ui.0dae4f95795a') }} <code>tuntom-divert-adapter</code> {{ _('ui.11d79ea725d5') }}</p>
   </div>
 </div>
 {% if error %}<div class="flash error">{{ error }}</div>{% endif %}
 
 <section class="panel" data-state="{{ build.state }}">
-  <div class="section-head"><div><h2>Build</h2>
-    <p class="hint">Build běží asynchronně a používá všechna povolená CPU jádra.</p>
+  <div class="section-head"><div><h2>{{ _('build.compile') }}</h2>
+    <p class="hint">{{ _('ui.a54114ff515c') }}</p>
   </div><span class="badge {{ 'ok' if build.state in ('complete','ready') else '' }}">{{ build.state }}</span></div>
   <form method="post" action="{{ url_for('build_tuntom') }}" class="row">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <label>Git ref<input name="ref" value="master" list="tuntom-branches"></label>
+    <label>{{ _('build.git_ref') }}<input name="ref" value="master" list="tuntom-branches"></label>
     <datalist id="tuntom-branches">{% for branch in refs.active_branches|default(refs.branches|default([])) %}<option value="{{ branch.name }}">{{ branch.commit_id[:12] }}</option>{% endfor %}</datalist>
-    <label>Varianta<select name="build_type"><option>Release</option><option>Debug</option></select></label>
-    <button>Build</button>
+    <label>{{ _('build.variant') }}<select name="build_type"><option>Release</option><option>Debug</option></select></label>
+    <button>{{ _('build.compile') }}</button>
   </form>
   {% if build.state == 'failed' %}<details open><summary>Build log</summary><pre>{{ build.log or build.error }}</pre></details>{% endif %}
 </section>
 
 <section class="panel branch-library">
-  <div class="section-head"><div><h2>Vzdálené branche</h2>
-    <p class="hint">Nejdřív branche s existujícím buildem, potom podle času posledního commitu.</p>
-  </div><form method="post" action="{{ url_for('refresh_tuntom_branches') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="secondary compact">↻ Fetch</button></form></div>
+  <div class="section-head"><div><h2>{{ _('build.remote_branches') }}</h2>
+    <p class="hint">{{ _('ui.1cc9a70869e7') }}</p>
+  </div><form method="post" action="{{ url_for('refresh_tuntom_branches') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="secondary compact">{{ _('build.fetch') }}</button></form></div>
   <div class="branch-table">
-    <div class="branch-row branch-head"><span>Branch</span><span>Commit</span><span>Čas</span><span>Buildy</span><span>Akce</span></div>
+    <div class="branch-row branch-head"><span>{{ _('build.branch') }}</span><span>Commit</span><span>{{ _('ui.db72d846bf73') }}</span><span>{{ _('build.builds') }}</span><span>{{ _('exports.actions') }}</span></div>
     {% for branch in refs.active_branches|default(refs.branches|default([])) %}
     <div class="branch-row {{ 'branch-update' if branch.update_available else '' }}">
       <strong>{{ branch.name }}</strong><code>{{ branch.commit_id[:12] }}</code><span>{{ branch.commit_at }}</span>
-      <span>{% if branch.current_types %}<span class="badge ok">{{ branch.current_types|join(' + ') }}</span>{% elif branch.update_available %}<span class="badge warning">nový commit</span>{% else %}{{ branch.builds|default([])|length }} buildů{% endif %}</span>
-      <span>{% if branch.has_build and branch.update_available and 'Release' not in branch.current_types|default([]) %}<form method="post" action="{{ url_for('build_tuntom') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="ref" value="{{ branch.name }}"><input type="hidden" name="build_type" value="Release"><button class="compact">Build Release</button></form>{% elif 'Release' in branch.current_types|default([]) %}<span class="branch-built">Release ready</span>{% endif %}</span>
+      <span>{% if branch.current_types %}<span class="badge ok">{{ branch.current_types|join(' + ') }}</span>{% elif branch.update_available %}<span class="badge warning">{{ _('build.new_commit') }}</span>{% else %}{{ branch.builds|default([])|length }} {{ _('ui.3f112d34120d') }}{% endif %}</span>
+      <span>{% if branch.has_build and branch.update_available and 'Release' not in branch.current_types|default([]) %}<form method="post" action="{{ url_for('build_tuntom') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="ref" value="{{ branch.name }}"><input type="hidden" name="build_type" value="Release"><button class="compact">Build Release</button></form>{% elif 'Release' in branch.current_types|default([]) %}<span class="branch-built">{{ _('build.release_ready') }}</span>{% endif %}</span>
     </div>
-    {% else %}<p class="empty">Branche se načítají.</p>{% endfor %}
+    {% else %}<p class="empty">{{ _('ui.00cbb4c4fa7e') }}</p>{% endfor %}
   </div>
   {% if refs.attic_branches|default([]) %}<details class="branch-attic"><summary>Attic · {{ refs.attic_branches|length }}</summary><div class="branch-table">{% for branch in refs.attic_branches %}<div class="branch-row"><strong>{{ branch.name }}</strong><code>{{ branch.commit_id[:12] }}</code><span>{{ branch.commit_at }}</span><span>{{ branch.builds|default([])|length }}</span><span></span></div>{% endfor %}</div></details>{% endif %}
 </section>
 
 <section class="panel">
-  <div class="section-head"><div><h2>Uložené adapter buildy</h2>
-    <p class="hint">Build používaný network profilem nebo aktivní Slice nelze smazat.</p>
+  <div class="section-head"><div><h2>{{ _('ui.1a04a5508119') }}</h2>
+    <p class="hint">{{ _('ui.2f70985af598') }}</p>
   </div><b>{{ build.artifacts|default([])|length }}</b></div>
   <div class="binary-list">
     {% for artifact in build.artifacts|default([]) %}
     <article class="binary-card {{ 'stale' if artifact.newer_build_available else '' }}">
-      <div class="binary-head"><div><b>{{ artifact.ref or 'detached' }}</b> <span class="badge ok">{{ artifact.build_type }}</span>{% if artifact.newer_build_available %} <span class="badge warning">starší kód</span>{% endif %}</div>
-        <form method="post" action="{{ url_for('delete_tuntom_binary',build_id=artifact.build_id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="danger compact">Smazat</button></form>
+      <div class="binary-head"><div><b>{{ artifact.ref or 'detached' }}</b> <span class="badge ok">{{ artifact.build_type }}</span>{% if artifact.newer_build_available %} <span class="badge warning">{{ _('ui.c3ae37a4c037') }}</span>{% endif %}</div>
+        <form method="post" action="{{ url_for('delete_tuntom_binary',build_id=artifact.build_id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="danger compact">{{ _('ui.a1ee22baa5d7') }}</button></form>
       </div>
-      <div class="binary-age-grid"><div><span>Stáří buildu</span><strong>{{ artifact.built_at_age_compact }}</strong><small>{{ artifact.built_at_display }}</small></div><div><span>Stáří kódu</span><strong>{{ artifact.commit_at_age_compact }}</strong><small>{{ artifact.commit_at_display }}</small></div><div><span>Commit</span><strong><code>{{ artifact.commit_id[:12] }}</code></strong></div></div>
+      <div class="binary-age-grid"><div><span>{{ _('build.build_age') }}</span><strong>{{ artifact.built_at_age_compact }}</strong><small>{{ artifact.built_at_display }}</small></div><div><span>{{ _('build.code_age') }}</span><strong>{{ artifact.commit_at_age_compact }}</strong><small>{{ artifact.commit_at_display }}</small></div><div><span>Commit</span><strong><code>{{ artifact.commit_id[:12] }}</code></strong></div></div>
       <div class="binary-meta"><code>{{ artifact.build_id }}</code><span>{{ '%.1f'|format(artifact.size_bytes / 1048576) }} MiB</span></div>
     </article>
-    {% else %}<p class="empty">Zatím žádný Tuntom build.</p>{% endfor %}
+    {% else %}<p class="empty">{{ _('ui.9b19f1963eb7') }}</p>{% endfor %}
   </div>
 </section>
 {% endblock %}

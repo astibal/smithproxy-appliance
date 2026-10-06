@@ -20,16 +20,16 @@
       const expired = element.dataset.state === 'expired';
       if (expired && Number.isFinite(expiredAt)) {
         const remaining = (expiredAt + (3 * 3600 * 1000) - now) / 1000;
-        element.textContent = remaining > 0 ? `recovery ${duration(remaining)}` : 'čeká na úklid';
+        element.textContent = remaining > 0 ? `recovery ${duration(remaining)}` : window.sasTr("ui.d86af7b852cb");
         element.classList.toggle('urgent', remaining <= 900);
         return;
       }
       if (!Number.isFinite(deadline)) {
-        element.textContent = 'TTL neznámé';
+        element.textContent = window.sasTr("ui.0da95a60dc96");
         return;
       }
       const remaining = (deadline - now) / 1000;
-      element.textContent = remaining > 0 ? duration(remaining) : 'TTL vypršelo';
+      element.textContent = remaining > 0 ? duration(remaining) : window.sasTr("ui.bb8a0de65e0f");
       element.classList.toggle('urgent', remaining <= 300);
       element.classList.toggle('elapsed', remaining <= 0);
     });

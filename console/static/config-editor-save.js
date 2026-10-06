@@ -38,7 +38,7 @@
   window.setTimeout(() => {
     const state = document.querySelector('#config-save-state');
     if (form.dataset.draftRestored === 'true' && state) {
-      state.textContent = 'Obnoven lokální recovery draft z tohoto prohlížeče.';
+      state.textContent = window.sasTr("ui.68b088c4e277");
       state.className = 'config-save-state ok';
     }
 
@@ -53,13 +53,13 @@
       const buildId = form.elements.build_id?.value || '';
       const copyName = form.elements.copy_name?.value.trim() || '';
       if (!buildId) {
-        state.textContent = 'Vyber validující build.';
+        state.textContent = window.sasTr("ui.11e4be8911c4");
         state.className = 'config-save-state error';
         form.elements.build_id?.focus();
         return;
       }
       if (mode === 'copy' && !copyName) {
-        state.textContent = 'Pro kopii zadej nový název.';
+        state.textContent = window.sasTr("ui.f26f9eb2375a");
         state.className = 'config-save-state error';
         form.elements.copy_name?.focus();
         return;
@@ -67,7 +67,7 @@
 
       saveDraft();
       contentButtons.forEach(button => { button.disabled = true; });
-      state.textContent = 'Validace běží; editor a recovery draft zůstávají zachované…';
+      state.textContent = window.sasTr("ui.a41efd203d13");
       state.className = 'config-save-state pending';
       try {
         const data = new FormData(form);
@@ -94,7 +94,7 @@
         }
       } catch (error) {
         saveDraft();
-        state.textContent = `Validace selhala: ${error.message || error}. Změny zůstaly v editoru i recovery draftu.`;
+        state.textContent = window.sasTr("ui.de8936cf8cff", {error: error.message || error});
         state.className = 'config-save-state error';
         contentButtons.forEach(button => { button.disabled = false; });
       }

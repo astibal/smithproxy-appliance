@@ -168,9 +168,10 @@ def create_app(test_config=None):
         except (URLError, OSError, TimeoutError) as exc:
             raise RuntimeError(f"runner unavailable: {exc}") from exc
 
-    def flash_queued(result, message="Akce zařazena"):
-        prefix = "Stejná akce už ve frontě je" if result.get("deduplicated") else message
-        flash(f"{prefix}: úloha {result.get('task_id', '')[:8]}.", "success")
+    def flash_queued(result, message=None):
+        message = message or tr('ui.84a30942b38b')
+        prefix = tr('ui.a4adfcfb1037') if result.get("deduplicated") else message
+        flash(tr('ui.7ab7133ccc02').format(p0=prefix, p1=result.get('task_id', '')[:8]), "success")
 
     def audit(action, detail=""):
         app.logger.info("audit admin=%s action=%s detail=%s",
@@ -189,7 +190,7 @@ def create_app(test_config=None):
                 age_seconds = max(0, int((now - parsed[key]).total_seconds()))
                 result[f"{key}_age_days"] = age_seconds // 86400
                 if age_seconds < 60:
-                    result[f"{key}_age_compact"] = "teď"
+                    result[f"{key}_age_compact"] = tr('ui.abf4626b823d')
                 elif age_seconds < 3600:
                     result[f"{key}_age_compact"] = f"{age_seconds // 60} min"
                 elif age_seconds < 172800:
@@ -197,7 +198,7 @@ def create_app(test_config=None):
                 else:
                     result[f"{key}_age_compact"] = f"{age_seconds // 86400} d"
             except (TypeError, ValueError):
-                result[f"{key}_display"] = "neznámé"
+                result[f"{key}_display"] = tr('ui.774680eb3313')
                 result[f"{key}_age_days"] = None
                 result[f"{key}_age_compact"] = "?"
         if "built_at" in parsed and "commit_at" in parsed:
@@ -243,9 +244,9 @@ def create_app(test_config=None):
                 item["newest_build_id"] = newest.get("build_id", newest.get("commit_id", ""))
                 item["newest_commit_id"] = newest.get("commit_id", "")
         for item in artifacts:
-            prefix = "★ NEJNOVĚJŠÍ" if item.get("is_latest_build") else "starší"
-            image = "image/rootfs ✓" if item.get("rootfs_ready") else "image/rootfs nevytvořen"
-            stale = " · ⚠ novější kód existuje" if item.get("newer_build_available") else ""
+            prefix = tr('ui.e92f384faa12') if item.get("is_latest_build") else tr('ui.ead3ecdb72b6')
+            image = "image/rootfs ✓" if item.get("rootfs_ready") else tr('ui.98fd385c9b04')
+            stale = tr('ui.2bb17781972d') if item.get("newer_build_available") else ""
             item["choice_label"] = (
                 f"{prefix} · {item.get('ref') or 'detached'} · "
                 f"{item.get('build_type', 'Release')} · "
@@ -254,8 +255,8 @@ def create_app(test_config=None):
                 f"{str(item.get('commit_id', ''))[:12]} · {image}{stale}"
             )
             item["choice_title"] = (
-                f"Build: {item.get('built_at_display', 'neznámé')}; "
-                f"commit: {item.get('commit_at_display', 'neznámé')}; "
+                f"Build: {item.get('built_at_display', tr('ui.774680eb3313'))}; "
+                f"commit: {item.get('commit_at_display', tr('ui.774680eb3313'))}; "
                 f"ID: {item.get('build_id', item.get('commit_id', ''))}"
             )
         return artifacts
@@ -464,7 +465,7 @@ def create_app(test_config=None):
                     },
                 })
                 audit("qemu-image.import", item.get("image_id", ""))
-                flash("QEMU blackbox image byl zařazen do knihovny.", "success")
+                flash(tr('ui.fe97a0689675'), "success")
                 return redirect(url_for("qemu_images"))
             except RuntimeError as exc:
                 flash(str(exc), "error")
@@ -480,7 +481,7 @@ def create_app(test_config=None):
         try:
             api("DELETE", f"/v1/qemu-images/{quote(image_id, safe='')}")
             audit("qemu-image.delete", image_id)
-            flash("QEMU image byl odebrán z knihovny; zdrojové QCOW2 zůstaly zachovány.", "success")
+            flash(tr('ui.d13822a02a40'), "success")
         except RuntimeError as exc:
             flash(str(exc), "error")
         return redirect(url_for("qemu_images"))
@@ -536,7 +537,7 @@ def create_app(test_config=None):
                 f"Export appliance {payload['name'] or build_id[:12]}", "appliance-export",
             )
             audit("appliance-export.create", f"{build_id}:{result.get('task_id', '')}")
-            flash_queued(result, "Appliance export zařazen")
+            flash_queued(result, tr('ui.ec57b154d04f'))
         except RuntimeError as exc:
             flash(str(exc), "error")
         return redirect(url_for("appliance_export_list"))
@@ -612,7 +613,7 @@ def create_app(test_config=None):
                 "config_mode": "rw" if request.form.get("config_rw") == "yes" else "ro",
             }, f"Spustit Test Drive {build_id[:12]}", "test-drive-spawn")
             audit("test-drive.start", f"{build_id}:{result.get('task_id', '')}")
-            flash_queued(result, "Test Drive zařazen")
+            flash_queued(result, tr('ui.5d82fe9d2911'))
         except (RuntimeError, ValueError) as exc:
             flash(str(exc), "error")
         return redirect(url_for("test_drive_list"))
@@ -623,7 +624,7 @@ def create_app(test_config=None):
         try:
             result = enqueue(
                 "DELETE", f"/v1/test-drives/{quote(drive_id, safe='')}", None,
-                f"Zničit Test Drive {drive_id[:12]}", "test-drive-destroy",
+                tr('ui.19975a49dcf7').format(p0=drive_id[:12]), "test-drive-destroy",
             )
             audit("test-drive.destroy", drive_id)
             flash_queued(result)
@@ -643,7 +644,7 @@ def create_app(test_config=None):
                 "test-drive-upgrade",
             )
             audit("test-drive.upgrade", f"{drive_id}:{build_id}")
-            flash_queued(result, "Dirty upgrade zařazen")
+            flash_queued(result, tr('ui.c77761296d15'))
         except RuntimeError as exc:
             flash(str(exc), "error")
         return redirect(url_for("test_drive_detail", drive_id=drive_id))
@@ -656,11 +657,11 @@ def create_app(test_config=None):
             result = enqueue(
                 "POST", f"/v1/test-drives/{quote(drive_id, safe='')}/extend",
                 {"additional_seconds": seconds},
-                f"Prodloužit Test Drive {drive_id[:12]} o {seconds} s",
+                tr('ui.0e4208070606').format(p0=drive_id[:12], p1=seconds),
                 "test-drive-extend",
             )
             audit("test-drive.extend", f"{drive_id}:{seconds}")
-            flash_queued(result, "Prodloužení Test Drive zařazeno")
+            flash_queued(result, tr('ui.2736d06ebde0'))
         except (RuntimeError, ValueError) as exc:
             flash(str(exc), "error")
         return redirect(url_for("test_drive_detail", drive_id=drive_id))
@@ -674,7 +675,7 @@ def create_app(test_config=None):
                 f"Znovu spustit Test Drive {drive_id[:12]}", "test-drive-restart",
             )
             audit("test-drive.restart", drive_id)
-            flash_queued(result, "Restart Test Drive zařazen")
+            flash_queued(result, tr('ui.3c43123300b4'))
         except RuntimeError as exc:
             flash(str(exc), "error")
         return redirect(url_for("test_drive_detail", drive_id=drive_id))
@@ -691,7 +692,7 @@ def create_app(test_config=None):
                 "test-drive-config-mode",
             )
             audit("test-drive.config-mode", f"{drive_id}:{mode}")
-            flash_queued(result, "Změna config režimu zařazena")
+            flash_queued(result, tr('ui.991958e3a809'))
         except RuntimeError as exc:
             flash(str(exc), "error")
         return redirect(url_for("test_drive_detail", drive_id=drive_id))
@@ -710,7 +711,7 @@ def create_app(test_config=None):
                 "test-drive-config-preview",
             )
             audit("test-drive.config-preview", drive_id)
-            flash_queued(result, "Extrakce configu zařazena")
+            flash_queued(result, tr('ui.d58f3460415a'))
         except RuntimeError as exc:
             flash(str(exc), "error")
         return redirect(url_for("test_drive_detail", drive_id=drive_id))
@@ -729,7 +730,7 @@ def create_app(test_config=None):
                 "content_base64": base64.b64encode(uploaded.read()).decode("ascii"),
             })
             audit("test-drive.upload", f"{drive_id}:{path}")
-            flash(f"Nahráno do /work/{path}.", "success")
+            flash(tr('ui.6d65ce61e638').format(p0=path), "success")
         except RuntimeError as exc:
             flash(str(exc), "error")
         return redirect(url_for("test_drive_detail", drive_id=drive_id))
@@ -816,7 +817,7 @@ def create_app(test_config=None):
                 payload = network_profile_payload()
                 result = enqueue(
                     "POST", "/v1/network-profiles", payload,
-                    f"Vytvořit {payload.get('kind')} network profil", "network-profile-create",
+                    tr('ui.117b7b8528fc').format(p0=payload.get('kind')), "network-profile-create",
                 )
                 audit("network-profile.create", result.get("task_id", ""))
                 flash_queued(result)
@@ -850,7 +851,7 @@ def create_app(test_config=None):
                     "secret": request.form.get("secret", ""),
                 })
                 audit("headless-endpoint.import", item.get("package_id", ""))
-                flash("Fabric endpoint package byl importován.", "success")
+                flash(tr('ui.536b6b7026ff'), "success")
             except RuntimeError as exc:
                 flash(str(exc), "error")
             return redirect(url_for("headless_endpoint_library"))
@@ -866,7 +867,7 @@ def create_app(test_config=None):
         try:
             api("DELETE", f"/v1/headless-endpoints/{quote(package_id, safe='')}", None)
             audit("headless-endpoint.delete", package_id)
-            flash("Fabric endpoint package byl smazán.", "success")
+            flash(tr('ui.0582c9ea7410'), "success")
         except RuntimeError as exc:
             flash(str(exc), "error")
         return redirect(url_for("headless_endpoint_library"))
@@ -959,7 +960,7 @@ def create_app(test_config=None):
             result = enqueue("PUT", "/v1/firewall", {
                 "input_enforced": request.form.get("input_enforced") == "on",
                 "forward_enforced": request.form.get("forward_enforced") == "on",
-            }, "Použít globální firewall policy", "firewall-settings")
+            }, tr('ui.d15a704a3d1c'), "firewall-settings")
             audit("firewall.settings", result.get("task_id", ""))
             flash_queued(result)
         except RuntimeError as exc:
@@ -1003,7 +1004,7 @@ def create_app(test_config=None):
             source = request.form.get("source", "")
             result = enqueue(
                 "POST", f"/v1/instances/{quote(instance_id, safe='')}/sources",
-                {"source": source}, f"Připojit source {source} k {instance_id[:12]}",
+                {"source": source}, tr('ui.bba00214d5f7').format(p0=source, p1=instance_id[:12]),
                 "instance-source-attach",
             )
             audit("instance.source.attach", f"{instance_id}:{source}")
@@ -1036,7 +1037,7 @@ def create_app(test_config=None):
                 "POST",
                 f"/v1/firewall/authorizations/{quote(authorization_id, safe='')}/extend",
                 {"additional_seconds": seconds},
-                f"Prodloužit firewall autorizaci {authorization_id[:12]} o {seconds} s",
+                tr('ui.99adc0254541').format(p0=authorization_id[:12], p1=seconds),
                 "firewall-extend",
             )
             audit("firewall.authorization.extend", f"{authorization_id}:{seconds}")
@@ -1071,7 +1072,7 @@ def create_app(test_config=None):
                 "route_table_start": int(request.form.get("route_table_start", "60000")),
                 "mark_start": int(request.form.get("mark_start", "268435456"), 0),
                 "authorized_source_ips": source_ips,
-            }, "Uložit síťová a routing nastavení", "network-settings-update")
+            }, tr('ui.0a1f06dc349e'), "network-settings-update")
             audit("settings.networking.update", result.get("task_id", ""))
             flash_queued(result)
         except (RuntimeError, ValueError) as exc:
@@ -1100,7 +1101,7 @@ def create_app(test_config=None):
                     "egress_network_profile_id", ""
                 ),
                 "filesystem_mode": request.form.get("filesystem_mode", "host"),
-            }, "Vytvořit runtime profil", "profile-create")
+            }, tr('ui.8e41ec071b0c'), "profile-create")
             audit("runtime-profile.create", result.get("task_id", ""))
             flash_queued(result)
         except (RuntimeError, ValueError) as exc:
@@ -1163,7 +1164,7 @@ def create_app(test_config=None):
                 raise RuntimeError("Vyber soubor pro /work.")
             content = uploaded.read(40 * 1024 + 1)
             if len(content) > 40 * 1024:
-                raise RuntimeError("Soubor pro /work může mít nejvýše 40 KiB.")
+                raise RuntimeError(tr('ui.a469e39b0de0'))
             target = request.form.get("path", "").strip() or Path(uploaded.filename).name
             result = api("PUT", f"/v1/runtime-profiles/{quote(profile_id, safe='')}/work-files", {
                 "path": target,
@@ -1171,7 +1172,7 @@ def create_app(test_config=None):
                 "content_base64": base64.b64encode(content).decode("ascii"),
             })
             audit("runtime-profile.work-file.upload", f"{profile_id}:{result.get('path', target)}")
-            flash(f"Soubor /work/{result.get('path', target)} uložen.", "success")
+            flash(tr('ui.107e83810950').format(p0=result.get('path', target)), "success")
         except RuntimeError as exc:
             flash(str(exc), "error")
         return redirect(url_for("edit_runtime_profile", profile_id=profile_id))
@@ -1185,7 +1186,7 @@ def create_app(test_config=None):
                 "path": path,
             })
             audit("runtime-profile.work-file.delete", f"{profile_id}:{path}")
-            flash(f"Soubor /work/{path} smazán.", "success")
+            flash(tr('ui.2fcf0f2cb783').format(p0=path), "success")
         except RuntimeError as exc:
             flash(str(exc), "error")
         return redirect(url_for("edit_runtime_profile", profile_id=profile_id))
@@ -1223,7 +1224,7 @@ def create_app(test_config=None):
                 "common_name": request.form.get("common_name", ""),
                 "days": int(request.form.get("days", "825")),
                 "file_stem": request.form.get("file_stem", ""),
-            }, f"Vygenerovat certifikát v bundle {bundle_id[:12]}", "certificate-generate")
+            }, tr('ui.4b38e6262106').format(p0=bundle_id[:12]), "certificate-generate")
             audit("cert-bundle.certificate-generate", result.get("task_id", ""))
             flash_queued(result)
         except (RuntimeError, ValueError) as exc:
@@ -1236,20 +1237,20 @@ def create_app(test_config=None):
         try:
             uploaded = request.files.get("certificate")
             if not uploaded or not uploaded.filename:
-                raise RuntimeError("Vyber PEM certifikát.")
+                raise RuntimeError(tr('ui.cd4a2042bdb2'))
             raw = uploaded.read(256 * 1024 + 1)
             if len(raw) > 256 * 1024:
-                raise RuntimeError("Certifikát je větší než 256 KiB.")
+                raise RuntimeError(tr('ui.c0f127e9bef2'))
             try:
                 content = raw.decode("utf-8")
             except UnicodeDecodeError as exc:
-                raise RuntimeError("Certifikát musí být PEM v UTF-8/ASCII.") from exc
+                raise RuntimeError(tr('ui.cb5913989dfe')) from exc
             result = enqueue("POST", f"/v1/cert-bundles/{quote(bundle_id, safe='')}/certificates", {
                 "action": "import",
                 "name": request.form.get("name", "").strip() or uploaded.filename,
                 "content": content,
                 "filename": request.form.get("filename", "").strip() or uploaded.filename,
-            }, f"Importovat certifikát do bundle {bundle_id[:12]}", "certificate-import")
+            }, tr('ui.6dd3eb54e8f7').format(p0=bundle_id[:12]), "certificate-import")
             audit("cert-bundle.certificate-import", result.get("task_id", ""))
             flash_queued(result)
         except RuntimeError as exc:
@@ -1332,9 +1333,9 @@ def create_app(test_config=None):
                 task = enqueue("POST", "/v1/config-observer", {
                     "build_id": selected_build,
                     "config_id": selected_config,
-                }, "Porovnat nativní konfigurace", "config-observer")
+                }, tr('ui.acddf5aa958e'), "config-observer")
                 audit("config.observe", f"{selected_build}:{selected_config}")
-                flash_queued(task, "Observer zařazen")
+                flash_queued(task, tr('ui.3b3188ecbc09'))
                 return redirect(url_for("config_observer"))
         except RuntimeError as exc:
             error = str(exc)
@@ -1385,7 +1386,7 @@ def create_app(test_config=None):
                 "ref": ref, "build_type": build_type,
             }, request_timeout=app.config["RUNNER_TIMEOUT"])
             audit("tuntom.build", result.get("task_id", ""))
-            flash_queued(result, f"Tuntom {ref} ({build_type}) zařazen")
+            flash_queued(result, tr('ui.1e17d2681d26').format(p0=ref, p1=build_type))
         except RuntimeError as exc:
             flash(str(exc), "error")
         return redirect(url_for("tuntom_binaries"))
@@ -1396,7 +1397,7 @@ def create_app(test_config=None):
         try:
             result = api("POST", "/v1/tuntom/refs/refresh", {})
             audit("tuntom.refs.refresh", result.get("task_id", ""))
-            flash_queued(result, "Tuntom Git fetch zařazen")
+            flash_queued(result, tr('ui.b8eb66224456'))
         except RuntimeError as exc:
             flash(str(exc), "error")
         return redirect(url_for("tuntom_binaries"))
@@ -1421,7 +1422,7 @@ def create_app(test_config=None):
         try:
             result = api("POST", "/v1/refs/refresh", {})
             audit("refs.refresh", result.get("task_id", ""))
-            flash_queued(result, "Git fetch zařazen")
+            flash_queued(result, tr('ui.bbe4f7ff5c50'))
         except RuntimeError as exc:
             flash(str(exc), "error")
         return redirect(url_for("binaries"))
@@ -1447,7 +1448,7 @@ def create_app(test_config=None):
                 f"Extrahovat default config z {build_id[:12]}", "build-config-preview",
             )
             audit("binary.extract-default-config", build_id)
-            flash_queued(result, "Extrakce configu zařazena")
+            flash_queued(result, tr('ui.d58f3460415a'))
             return redirect(url_for("binaries"))
         except RuntimeError as exc:
             flash(str(exc), "error")
@@ -1459,10 +1460,10 @@ def create_app(test_config=None):
         try:
             result = enqueue(
                 "POST", f"/v1/builds/{quote(build_id, safe='')}/rootfs", {},
-                f"Připravit rootfs image {build_id[:12]}", "build-rootfs",
+                tr('ui.bf9411fb9292').format(p0=build_id[:12]), "build-rootfs",
             )
             audit("binary.prepare-rootfs", build_id)
-            flash_queued(result, "Příprava rootfs image zařazena")
+            flash_queued(result, tr('ui.0b6a7fef5ff3'))
         except RuntimeError as exc:
             flash(str(exc), "error")
         return redirect(url_for("binaries"))
@@ -1496,10 +1497,10 @@ def create_app(test_config=None):
                                "workers": 1, "pcap_quota_mb": 100},
             }, request_timeout=app.config["RUNNER_TIMEOUT"])
             audit("instance.create", result.get("task_id", ""))
-            message = "Stejné spuštění už ve frontě je" if result.get("deduplicated") else "Spuštění instance zařazeno"
+            message = tr('ui.67cb54ca9ae5') if result.get("deduplicated") else tr('ui.47252f94cc5a')
             if request.headers.get("X-Requested-With") == "task-fetch":
                 return jsonify({**result, "message": message}), 202
-            flash(f"{message}: úloha {result.get('task_id', '')[:8]}.", "success")
+            flash(tr('ui.7ab7133ccc02').format(p0=message, p1=result.get('task_id', '')[:8]), "success")
         except (RuntimeError, ValueError) as exc:
             if request.headers.get("X-Requested-With") == "task-fetch":
                 return jsonify(error=str(exc)), 400
@@ -1515,7 +1516,7 @@ def create_app(test_config=None):
                 "additional_seconds": seconds,
             })
             audit("instance.extend", f"{instance_id}:{seconds}")
-            flash(f"Prodloužení zařazeno: úloha {result.get('task_id', '')[:8]}.", "success")
+            flash(tr('ui.4cf296e7ad17').format(p0=result.get('task_id', '')[:8]), "success")
         except (RuntimeError, ValueError) as exc:
             flash(str(exc), "error")
         return redirect(url_for("console") + f"?instance={quote(instance_id, safe='')}")
@@ -1547,7 +1548,7 @@ def create_app(test_config=None):
     def delete_instance(instance_id):
         try:
             result = enqueue("DELETE", f"/v1/instances/{quote(instance_id, safe='')}/record", None,
-                             f"Smazat záznam instance {instance_id[:12]}", "instance-record-delete")
+                             tr('ui.42ef3eb78c82').format(p0=instance_id[:12]), "instance-record-delete")
             audit("instance.delete", instance_id); flash_queued(result)
         except RuntimeError as exc: flash(str(exc), "error")
         return redirect(url_for("console"))
@@ -1561,7 +1562,7 @@ def create_app(test_config=None):
                 "Cleanup stopped non-persistent instances", "instance-cleanup",
             )
             audit("instance.cleanup", result.get("task_id", ""))
-            flash_queued(result, "Cleanup zařazen")
+            flash_queued(result, tr('ui.11b9eec1a57f'))
         except RuntimeError as exc:
             flash(str(exc), "error")
         return redirect(url_for("console"))
@@ -1612,12 +1613,12 @@ def create_app(test_config=None):
                     },
                     f"Upravit metadata configu {config_id[:12]}", "config-metadata",
                 )
-                flash_queued(result, "Přejmenování configu zařazeno")
+                flash_queued(result, tr('ui.2a19d1634ab8'))
                 return redirect(url_for("configs"))
             if save_mode == "copy" and not form_values["copy_name"]:
-                raise RuntimeError("Pro kopii zadej nový název.")
+                raise RuntimeError(tr('ui.f26f9eb2375a'))
             if not form_values["build_id"]:
-                raise RuntimeError("Vyber validující build.")
+                raise RuntimeError(tr('ui.11e4be8911c4'))
             payload = {
                 "name": (
                     form_values["copy_name"] if save_mode == "copy" else original["name"]
@@ -1630,10 +1631,10 @@ def create_app(test_config=None):
                 "config_id": "" if save_mode == "copy" else config_id,
             }
             result = enqueue("POST", "/v1/configs/preview", payload,
-                             f"Připravit změnu configu {config_id[:12]}", "config-preview")
+                             tr('ui.f7bbe1b91201').format(p0=config_id[:12]), "config-preview")
             if task_fetch:
-                return jsonify({**result, "message": "Validace configu zařazena"}), 202
-            flash_queued(result, "Příprava diffu zařazena")
+                return jsonify({**result, "message": tr('ui.737a630243a2')}), 202
+            flash_queued(result, tr('ui.14355982a4eb'))
             return redirect(url_for("configs"))
         except RuntimeError as exc:
             if task_fetch:
@@ -1649,14 +1650,14 @@ def create_app(test_config=None):
         try:
             uploaded = request.files.get("config_file")
             if not uploaded or not uploaded.filename:
-                raise RuntimeError("Vyber konfigurační soubor.")
+                raise RuntimeError(tr('ui.cf2398d1e72f'))
             raw = uploaded.read(1024 * 1024 + 1)
             if len(raw) > 1024 * 1024:
-                raise RuntimeError("Konfigurace je větší než 1 MiB.")
+                raise RuntimeError(tr('ui.bf94163af63b'))
             try:
                 content = raw.decode("utf-8")
             except UnicodeDecodeError as exc:
-                raise RuntimeError("Konfigurace musí být UTF-8.") from exc
+                raise RuntimeError(tr('ui.4a787b9421da')) from exc
             result = enqueue("POST", "/v1/configs/preview", {
                 "action": "create",
                 "name": request.form.get("name", "").strip() or uploaded.filename,
@@ -1665,7 +1666,7 @@ def create_app(test_config=None):
                 "profile": request.form.get("profile", "custom"),
                 "build_id": request.form.get("build_id", ""),
             }, "Importovat a normalizovat konfiguraci", "config-preview")
-            flash_queued(result, "Import configu zařazen")
+            flash_queued(result, tr('ui.1141d565811b'))
             return redirect(url_for("configs"))
         except RuntimeError as exc:
             flash(str(exc), "error")
@@ -1679,7 +1680,7 @@ def create_app(test_config=None):
                 "preview_id": request.form.get("preview_id", ""),
                 "approved": request.form.get("approved") == "yes",
                 "approved_by": str(g.admin.get("email", g.admin.get("id", "admin"))),
-            }, "Schválit a uložit nativní konfiguraci", "config-commit")
+            }, tr('ui.4f7804e4a525'), "config-commit")
             audit("config.native-commit", result.get("task_id", ""))
             flash_queued(result)
         except RuntimeError as exc:
@@ -1691,7 +1692,7 @@ def create_app(test_config=None):
     def cancel_native_config_preview(preview_id):
         try:
             result = enqueue("DELETE", f"/v1/configs/previews/{quote(preview_id, safe='')}", None,
-                             f"Zrušit config preview {preview_id[:12]}", "config-preview-cancel")
+                             tr('ui.77517a0759a5').format(p0=preview_id[:12]), "config-preview-cancel")
             audit("config.native-preview.cancel", preview_id)
             flash_queued(result)
         except RuntimeError as exc:
@@ -1764,8 +1765,8 @@ def create_app(test_config=None):
         try:
             result = enqueue("POST", f"/v1/instances/{quote(instance_id, safe='')}/config/preview", {
                 "name": request.form.get("name", "").strip() or f"Instance {instance_id[:12]}",
-            }, f"Uložit config instance {instance_id[:12]}", "instance-config-preview")
-            flash_queued(result, "Uložení a diff configu zařazeny")
+            }, tr('ui.4fde2834b663').format(p0=instance_id[:12]), "instance-config-preview")
+            flash_queued(result, tr('ui.58c3fe294033'))
             return redirect(url_for("configs"))
         except RuntimeError as exc:
             flash(str(exc), "error")
@@ -1795,7 +1796,7 @@ def create_app(test_config=None):
         try:
             task = api("GET", f"/v1/tasks/{quote(task_id, safe='')}")
             if task.get("state") != "succeeded":
-                raise RuntimeError("Úloha ještě nemá dokončený výsledek.")
+                raise RuntimeError(tr('ui.31f8be2023bb'))
             result = api("GET", f"/v1/tasks/{quote(task_id, safe='')}/result")
             if task.get("kind") in {
                 "config-preview", "build-config-preview", "instance-config-preview",
