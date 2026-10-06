@@ -10,6 +10,7 @@ NotifyAccess=main
 User=sas-console
 Group=sas-console
 WorkingDirectory=/opt/smithproxy-appliance/console
+Environment=SMITHPROXY_APPLIANCE_CONSOLE_STATE=/var/lib/sas-console
 EnvironmentFile=/etc/smithproxy-appliance/console.env
 EnvironmentFile=/etc/smithproxy-appliance/runner-client.env
 ExecStart=/opt/smithproxy-appliance/console/.venv/bin/gunicorn --workers 2 --threads 8 --worker-class gthread --bind ${SMITHPROXY_APPLIANCE_CONSOLE_BIND} --access-logfile - --error-logfile - --capture-output --timeout 120 --graceful-timeout 20 "app:create_app()"

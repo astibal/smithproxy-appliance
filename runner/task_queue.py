@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from .systemd import BackendError
 
 
 def _now() -> str:
@@ -39,6 +40,7 @@ class TaskQueue:
         self.state_file = state_file
         self.history_limit = history_limit
         self.lock = threading.RLock()
+        self.stopping = False
         self.work: queue.Queue[tuple[str, Callable[[], Any]]] = queue.Queue()
         self.tasks: dict[str, Task] = {}
         self.active_keys: dict[str, str] = {}
@@ -81,6 +83,8 @@ class TaskQueue:
     def submit(self, kind: str, label: str, dedupe_key: str, resource: str,
                function: Callable[[], Any]) -> tuple[Task, bool]:
         with self.lock:
+            if self.stopping:
+                raise BackendError("runner is stopping; retry after restart")
             existing_id = self.active_keys.get(dedupe_key)
             if existing_id and existing_id in self.tasks:
                 return self.tasks[existing_id], False
@@ -94,6 +98,18 @@ class TaskQueue:
             self._persist()
             self.work.put((task.task_id, function))
             return task, True
+
+    def stop_accepting(self) -> None:
+        """Reject new work and cancel queued callbacks; leave running work alone."""
+        with self.lock:
+            self.stopping = True
+            for task in self.tasks.values():
+                if task.state == "pending":
+                    task.state = "failed"
+                    task.error = "runner stopped before the task started"
+                    task.finished_at = _now()
+                    self.active_keys.pop(task.dedupe_key, None)
+            self._persist()
 
     def _trim(self) -> None:
         finished = sorted(
@@ -142,6 +158,8 @@ class TaskQueue:
                 continue
             try:
                 with self.lock:
+                    if task.state != "pending":
+                        continue
                     task.state = "running"
                     task.started_at = _now()
                     self._persist()

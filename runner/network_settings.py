@@ -5,6 +5,7 @@ import json
 import os
 import threading
 from pathlib import Path
+from .deployments import atomic_json
 from typing import Any
 
 from .config import ConfigError
@@ -169,11 +170,7 @@ class NetworkSettings:
 
     @staticmethod
     def _write(path: Path, value: Any) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        temporary = path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
-        os.chmod(temporary, 0o600)
-        temporary.replace(path)
+        atomic_json(path, value)
 
     def update(self, value: dict[str, Any]) -> dict[str, Any]:
         validated = self.validate(value)

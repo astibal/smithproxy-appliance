@@ -44,6 +44,7 @@ from .network_profiles import NetworkProfileLibrary
 from .qemu_images import QemuImageLibrary
 from .appliance_exports import ApplianceExportLibrary
 from .headless_endpoints import HeadlessEndpointLibrary
+from .deployments import atomic_json, boot_id, acquire_runner_lock, notify_systemd
 
 
 @dataclass
@@ -94,6 +95,12 @@ class Instance:
     tuntom_build_id: str = ""
     headless_endpoint_id: str = ""
     filesystem_mode: str = "host"
+    desired_state: str = ""
+    boot_id: str = ""
+    deployment_pending: bool = False
+    recovery_attempts: int = 0
+    recovery_after: float = 0
+    deadline_timer: str = ""
 
 
 @dataclass
@@ -114,6 +121,7 @@ class Manager:
         self.runtime_root = runtime_root
         self.template = template
         self.backend = backend
+        self.boot_id = boot_id()
         self.min_runtime = min_runtime
         self.max_runtime = max_runtime
         self.max_instances = max_instances
@@ -131,6 +139,9 @@ class Manager:
         self.config_archive_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
 
     def _remove_runtime(self, instance_id: str) -> None:
+        instance = self._load(instance_id)
+        if instance and instance.deadline_timer and hasattr(self.backend, "cancel_deadline"):
+            self.backend.cancel_deadline(instance_id, instance.deadline_timer)
         shutil.rmtree(self.runtime_root / instance_id, ignore_errors=True)
         remove_type_link(self.runtime_root, "managed", instance_id)
 
@@ -141,11 +152,62 @@ class Manager:
         return self.state_dir / f"{instance_id}.cfg"
 
     def _save(self, instance: Instance) -> None:
-        target = self._state_path(instance.id)
-        temporary = target.with_suffix(".tmp")
-        temporary.write_text(json.dumps(asdict(instance), separators=(",", ":")), encoding="utf-8")
-        os.chmod(temporary, 0o600)
-        temporary.replace(target)
+        atomic_json(self._state_path(instance.id), asdict(instance))
+
+    def _deployment_path(self, instance_id: str) -> Path:
+        return self.state_dir / "deployments" / f"{instance_id}.json"
+
+    def _schedule_deadline(self, instance: Instance) -> None:
+        if hasattr(self.backend, "schedule_deadline"):
+            instance.deadline_timer = self.backend.schedule_deadline(
+                instance.id, instance.deadline, instance.deadline_timer)
+
+    def _recover(self, instance: Instance) -> Instance:
+        """Recreate a missing deployment without re-rendering its live config."""
+        if time.time() < instance.recovery_after:
+            return instance
+        instance.state = "recovering"
+        instance.members = []
+        instance.slice_rss_bytes = 0
+        instance.deployment_pending = True
+        instance.recovery_attempts += 1
+        instance.recovery_after = time.time() + min(300, 5 * 2 ** min(instance.recovery_attempts, 6))
+        self._save(instance)
+        try:
+            document = json.loads(self._deployment_path(instance.id).read_text())
+            if document.get("schema") != 1:
+                raise BackendError("unsupported deployment manifest schema")
+            config = self.runtime_root / instance.id / "smithproxy.cfg"
+            if not config.is_file():
+                raise BackendError("deployment workspace/config missing; refusing to regenerate it")
+            options = dict(document["start_options"])
+            options["preserve_allocations_on_failure"] = True
+            remaining = (max(1, int((datetime.fromisoformat(instance.deadline) -
+                                     datetime.now(timezone.utc)).total_seconds()))
+                         if instance.deadline else 0)
+            elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(instance.created_at)).total_seconds()
+            options["hard_runtime_seconds"] = (max(1, int(document["start_options"]["hard_runtime_seconds"] - elapsed))
+                                               if instance.deadline else 0)
+            # The old host boot is gone, or an interrupted start has no live unit.
+            # Only remove Smithproxy's private PID file, never its work/config.
+            (config.parent / "run" / "smithproxy.default.pid").unlink(missing_ok=True)
+            instance.unit = self.backend.start(instance.id, config, remaining, **options)
+            for source in instance.source_ips:
+                if source != instance.source_ip:
+                    self.backend.attach_source(instance.id, source, instance.profile,
+                                               instance.socks_port, instance.http_port,
+                                               instance.tls_port, instance.plaintext_port)
+            self._schedule_deadline(instance)
+            instance.boot_id = self.boot_id
+            instance.deployment_pending = False
+            instance.recovery_after = 0
+            instance.state = "starting"
+            instance.result = "deployment-restored"
+            instance.resources_cleaned = False
+        except (OSError, ValueError, TypeError, KeyError, BackendError) as exc:
+            instance.result = f"deployment recovery deferred: {exc}"
+        self._save(instance)
+        return instance
 
     def _snapshot_runtime_config(self, instance_id: str) -> None:
         live = self.runtime_root / instance_id / "smithproxy.cfg"
@@ -210,6 +272,15 @@ class Manager:
             if item.get("role") == "smithproxy"
         ), 0)
         deadline = datetime.fromisoformat(instance.deadline) if instance.deadline else None
+        expired = bool(deadline and datetime.now(timezone.utc) >= deadline)
+        if (instance.desired_state == "stopped" and
+                status.active_state in {"active", "activating", "reloading"}):
+            # Complete an explicit stop interrupted between intent and systemctl.
+            return self.stop(instance.id) or instance
+        if (instance.desired_state == "running" and not expired
+                and status.active_state not in {"active", "activating", "reloading", "deactivating"}
+                and (instance.boot_id != self.boot_id or instance.deployment_pending)):
+            return self._recover(instance)
         if (status.active_state in {"active", "activating", "reloading"}
                 and deadline and datetime.now(timezone.utc) >= deadline):
             for session_id, session in list(self.cli_sessions.items()):
@@ -221,6 +292,7 @@ class Manager:
             self._snapshot_runtime_config(instance.id)
             self._remove_runtime(instance.id)
             instance.state = "expired"
+            instance.desired_state = "stopped"
             instance.stopped_at = datetime.now(timezone.utc).isoformat()
             instance.members = []
             instance.slice_rss_bytes = 0
@@ -229,6 +301,15 @@ class Manager:
             self._save(instance)
             return instance
         if status.active_state in {"active", "activating", "reloading"}:
+            if instance.deployment_pending:
+                for source in instance.source_ips:
+                    if source != instance.source_ip:
+                        self.backend.attach_source(instance.id, source, instance.profile,
+                                                   instance.socks_port, instance.http_port,
+                                                   instance.tls_port, instance.plaintext_port)
+            self._schedule_deadline(instance)
+            instance.boot_id = self.boot_id
+            instance.deployment_pending = False
             instance.state = "orphaned" if instance.state == "orphaned" else "running"
             instance.stopped_at = ""
             instance.slice_unit = getattr(
@@ -263,6 +344,7 @@ class Manager:
                 except (AttributeError, BackendError) as exc:
                     instance.crash_trace = f"automatic stack trace unavailable: {exc}"
             if (failed and instance.auto_restart and instance.restart_count < 5
+                    and instance.desired_state != "stopped"
                     and instance.state not in {"stopped", "expired"}
                     and (not deadline or datetime.now(timezone.utc) < deadline)):
                 try:
@@ -276,18 +358,27 @@ class Manager:
                     return instance
                 except BackendError as exc:
                     instance.result = f"auto-restart failed: {exc}"
+            if failed and instance.desired_state == "running" and not expired:
+                # Retain the deployment for diagnosis and the next host boot.
+                # Same-boot retries remain governed by auto_restart and its limit.
+                instance.state = "failed"
+                instance.result = status.result
+                self._save(instance)
+                return instance
             if instance.state not in {"stopped", "failed", "expired"}:
                 instance.state = "expired" if deadline and datetime.now(timezone.utc) >= deadline else (
                     "stopped" if status.result in {"success", ""} else "failed"
                 )
+            if expired:
+                instance.state = "expired"
             if instance.state in {"stopped", "failed", "expired"} and not instance.stopped_at:
                 instance.stopped_at = datetime.now(timezone.utc).isoformat()
             instance.result = status.result
+            instance.desired_state = "stopped"
             if not instance.resources_cleaned:
-                try:
-                    self.backend.stop(instance.unit)
-                except BackendError:
-                    pass
+                # Never remove a workspace until systemd confirmed the stop.
+                self._save(instance)
+                self.backend.stop(instance.unit)
                 self._clear_debug(instance)
                 self._snapshot_runtime_config(instance.id)
                 self._remove_runtime(instance.id)
@@ -301,7 +392,13 @@ class Manager:
             for path in sorted(self.state_dir.glob("*.json")):
                 item = self._load(path.stem)
                 if item:
-                    result.append(self._reconcile(item))
+                    try:
+                        item = self._reconcile(item)
+                    except (BackendError, OSError, ValueError, TypeError) as exc:
+                        # One broken deployment must not prevent TTL checks and
+                        # recovery of all other deployments.
+                        print(f"instance {item.id} reconciliation deferred: {exc}")
+                    result.append(item)
             return result
 
     def snapshot(self) -> list[Instance]:
@@ -592,11 +689,13 @@ class Manager:
         if pool and source_ip not in pool:
             raise ConfigError("source_ip is not present in the configured pool")
         with self.lock:
-            active = sum(i.state in {"starting", "running", "orphaned"} for i in self.list())
+            active = sum(i.desired_state == "running" or i.state in {"starting", "running", "orphaned"}
+                         for i in self.list())
             if active >= self.max_instances:
                 raise ConfigError("instance limit reached")
             if any(source_ip in (i.source_ips or [i.source_ip])
-                   and i.state in {"starting", "running", "orphaned"} for i in self.list()):
+                   and (i.desired_state == "running" or i.state in {"starting", "running", "orphaned"})
+                   for i in self.list()):
                 raise ConfigError("source_ip already has an active instance")
             instance_id = str(uuid.uuid4())
             runtime_dir = self.runtime_root / instance_id
@@ -670,14 +769,15 @@ class Manager:
                 if work_installer:
                     work_installer(runtime_dir)
                 now = datetime.now(timezone.utc)
-                unit = self.backend.start(
-                    instance_id, config_path, runtime, source_ip=source_ip,
+                start_options = dict(
+                    source_ip=source_ip,
                     tls_port=parameters.get("tls_port", 50443),
                     plaintext_port=parameters.get("plaintext_port", 50080),
                     socks_port=parameters.get("socks_port", 1080),
                     cli_port=parameters.get("cli_port", 50000),
                     http_port=parameters.get("http_port", 3128),
-                    smithproxy_binary=str(binary_path) if binary_path else "",
+                    smithproxy_binary=(str(Path(binary_path or self.backend.smithproxy_binary).resolve())
+                                       if binary_path or getattr(self.backend, "smithproxy_binary", "") else ""),
                     profile=profile,
                     config_mode=config_mode,
                     assets_path=str(effective_assets) if effective_assets else "",
@@ -703,12 +803,12 @@ class Manager:
                 remove_type_link(self.runtime_root, "managed", instance_id)
                 self._config_path(instance_id).unlink(missing_ok=True)
                 raise
-            allocation = getattr(self.backend, "allocation", lambda _id: None)(instance_id)
             instance = Instance(
-                instance_id, unit, "starting", now.isoformat(),
+                instance_id, getattr(self.backend, "unit_name", NamespaceBackend.unit_name)(instance_id),
+                "starting", now.isoformat(),
                 (now + timedelta(seconds=runtime)).isoformat() if runtime else "", runtime,
                 source_ip=source_ip,
-                namespace=getattr(allocation, "namespace", ""),
+                namespace=f"cz-{instance_id[:8]}",
                 slice_unit=getattr(
                     self.backend, "slice_name",
                     lambda value: f"capture-zone-slice-{value}.slice",
@@ -737,8 +837,32 @@ class Manager:
                 tuntom_build_id=network_tuntom_build_id,
                 headless_endpoint_id=headless_endpoint_id,
                 filesystem_mode=filesystem_mode,
+                desired_state="running", boot_id=self.boot_id,
+                deployment_pending=True,
             )
+            atomic_json(self._deployment_path(instance_id), {
+                "schema": 1, "start_options": start_options,
+            })
             self._save(instance)
+            try:
+                instance.unit = self.backend.start(instance_id, config_path, runtime, **start_options)
+                allocation = getattr(self.backend, "allocation", lambda _id: None)(instance_id)
+                instance.namespace = getattr(allocation, "namespace", "")
+                self._schedule_deadline(instance)
+                instance.deployment_pending = False
+                self._save(instance)
+            except Exception:
+                # Persist cancellation before cleanup; a service restart must not
+                # turn a rejected spawn into a running deployment.
+                instance.desired_state = "stopped"
+                self._save(instance)
+                self.backend.stop(instance.unit)
+                instance.state = "failed"
+                instance.resources_cleaned = True
+                instance.stopped_at = datetime.now(timezone.utc).isoformat()
+                self._save(instance)
+                self._remove_runtime(instance_id)
+                raise
             return instance
 
     def attach_source(self, instance_id: str, source_ip: object) -> Instance:
@@ -968,7 +1092,9 @@ class Manager:
             instance = self._load(instance_id)
             if not instance:
                 return None
-            if instance.state not in {"stopped", "failed", "expired"}:
+            instance.desired_state = "stopped"
+            self._save(instance)
+            if not instance.resources_cleaned:
                 self.backend.stop(instance.unit)
                 self._clear_debug(instance)
                 self._snapshot_runtime_config(instance.id)
@@ -1003,12 +1129,7 @@ class Manager:
                 instance.debug_address = ""
                 instance.debug_port = 0
             self.backend.restart(instance.unit)
-            now = datetime.now(timezone.utc)
             instance.state = "starting"
-            instance.deadline = (
-                (now + timedelta(seconds=instance.runtime_seconds)).isoformat()
-                if instance.runtime_seconds else ""
-            )
             instance.members = []
             instance.slice_rss_bytes = 0
             instance.result = "restarted"
@@ -1045,6 +1166,8 @@ class Manager:
             instance.deadline = deadline.isoformat()
             instance.runtime_seconds = total_seconds
             instance.result = f"ttl-extended-by-{additional_seconds}s"
+            self._save(instance)
+            self._schedule_deadline(instance)
             self._save(instance)
             return instance
 
@@ -1086,7 +1209,8 @@ class Manager:
             if not instance:
                 return None
             instance = self._reconcile(instance)
-            if (instance.state in {"starting", "running", "orphaned"}
+            if (instance.desired_state == "running"
+                    or instance.state in {"starting", "running", "orphaned"}
                     or any(int(item.get("pid", 0)) > 0 for item in instance.members)):
                 raise ConfigError("running instance cannot be deleted")
             if not instance.resources_cleaned:
@@ -1104,6 +1228,7 @@ class Manager:
             except FileNotFoundError:
                 return None
             self._config_path(instance.id).unlink(missing_ok=True)
+            self._deployment_path(instance.id).unlink(missing_ok=True)
             return instance
 
     def _archive_stopped_config(self, instance: Instance) -> Path:
@@ -1143,7 +1268,7 @@ class Manager:
         with self.lock:
             for path in sorted(self.state_dir.glob("*.json")):
                 instance = self._load(path.stem)
-                if (not instance or instance.persistent
+                if (not instance or instance.persistent or instance.desired_state == "running"
                         or instance.state not in {"stopped", "failed", "expired"}):
                     continue
                 if not instance.stopped_at:
@@ -1171,6 +1296,7 @@ class Manager:
                 self._remove_runtime(instance.id)
                 self._state_path(instance.id).unlink(missing_ok=True)
                 self._config_path(instance.id).unlink(missing_ok=True)
+                self._deployment_path(instance.id).unlink(missing_ok=True)
                 cleaned.append({"instance_id": instance.id, "config_archive": str(archive)})
         return cleaned
 
@@ -1221,7 +1347,7 @@ class Manager:
             if not stop_instances:
                 return
             for instance in self.list():
-                if instance.state in {"starting", "running", "orphaned"}:
+                if instance.desired_state == "running" or instance.state in {"starting", "running", "orphaned"}:
                     try:
                         self.stop(instance.id)
                     except BackendError as exc:
@@ -1931,7 +2057,7 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
             }
             for item in manager.snapshot()
             if item.build_id == build_id
-            and item.state in {"starting", "running", "orphaned"}
+            and (item.desired_state == "running" or item.state in {"starting", "running", "orphaned"})
         ]
         drives = [
             {"id": item.id, "state": item.state}
@@ -1949,7 +2075,7 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
         profile_snapshot = runtime_profiles.list() if runtime_profiles else []
         instance_usage: dict[str, list[dict]] = {}
         for item in instance_snapshot:
-            if item.state not in {"starting", "running", "orphaned"}:
+            if item.desired_state != "running" and item.state not in {"starting", "running", "orphaned"}:
                 continue
             instance_usage.setdefault(item.build_id, []).append({
                 "id": item.id, "state": item.state, "user_id": item.user_id,
@@ -4108,7 +4234,7 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     {"instance_id": item.id, "state": item.state}
                     for item in manager.snapshot()
                     if item.tuntom_build_id == build_id
-                    and item.state in {"starting", "running", "orphaned"}
+                    and (item.desired_state == "running" or item.state in {"starting", "running", "orphaned"})
                 ]
                 if usage or active_instances:
                     self._json(HTTPStatus.CONFLICT, {
@@ -4245,8 +4371,9 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
 def reaper(manager: Manager, test_drives: TestDriveManager | None = None,
            firewall: FirewallManager | None = None,
            network_settings: NetworkSettings | None = None,
-           interval_seconds: float = 2.0) -> None:
-    while True:
+           interval_seconds: float = 2.0, stopping: threading.Event | None = None) -> None:
+    stopping = stopping or threading.Event()
+    while not stopping.is_set():
         try:
             manager.expire_cli_sessions()
             manager.reconcile_orphans()
@@ -4261,7 +4388,7 @@ def reaper(manager: Manager, test_drives: TestDriveManager | None = None,
                 )
         except Exception as exc:
             print(f"instance reconciliation failed: {exc}")
-        time.sleep(interval_seconds)
+        stopping.wait(interval_seconds)
 
 
 def websocket_handler_factory(manager: Manager, token: str,
@@ -4372,6 +4499,9 @@ def main() -> None:
     token = os.environ.get("CZ_RUNNER_TOKEN", "")
     if len(token) < 32:
         raise SystemExit("CZ_RUNNER_TOKEN must contain at least 32 characters")
+    # Keep this reference alive until process exit. Children do not inherit fd.
+    runner_lock = acquire_runner_lock(Path(os.environ.get(
+        "CZ_RUNNER_STATE_DIR", "/var/lib/capture-zone-runner")))
     network_settings = NetworkSettings(
         Path(os.environ.get(
             "CZ_RUNNER_NETWORK_SETTINGS", "/var/lib/capture-zone-runner/network-settings.json"
@@ -4390,7 +4520,7 @@ def main() -> None:
     manager = Manager(
         Path(os.environ.get("CZ_RUNNER_STATE_DIR", "/var/lib/capture-zone-runner")),
         Path(os.environ.get(
-            "CZ_RUNNER_RUNTIME_DIR", "/run/capture-zone-runner/instances",
+            "CZ_RUNNER_RUNTIME_DIR", "/var/lib/capture-zone-runner/instances",
         )),
         Path(os.environ.get("CZ_RUNNER_TEMPLATE", "/etc/capture-zone-runner/smithproxy.cfg.in")),
         namespace_backend,
@@ -4488,8 +4618,10 @@ def main() -> None:
     host = os.environ.get("CZ_RUNNER_HOST", "127.0.0.1")
     port = int(os.environ.get("CZ_RUNNER_PORT", "9080"))
     ws_port = int(os.environ.get("CZ_RUNNER_WS_PORT", "9081"))
+    stopping = threading.Event()
     threading.Thread(
         target=reaper, args=(manager, test_drives, firewall, network_settings),
+        kwargs={"stopping": stopping},
         daemon=True, name="instance-reaper"
     ).start()
     server = ThreadingHTTPServer((host, port), handler_factory(
@@ -4514,14 +4646,20 @@ def main() -> None:
     threading.Thread(target=ws_server.serve_forever, daemon=True, name="runner-websocket").start()
 
     def request_shutdown(_signum, _frame) -> None:
+        stopping.set()
+        tasks.stop_accepting()
+        notify_systemd("STOPPING=1")
         # BaseServer.shutdown must be called from a thread other than serve_forever.
         threading.Thread(target=server.shutdown, daemon=True, name="runner-shutdown").start()
 
     signal.signal(signal.SIGINT, request_shutdown)
     signal.signal(signal.SIGTERM, request_shutdown)
     try:
+        notify_systemd("READY=1\nSTATUS=API ready; reconciling deployments in background")
         server.serve_forever()
     finally:
+        stopping.set()
+        tasks.stop_accepting()
         ws_server.shutdown()
         manager.shutdown(
             stop_instances=os.environ.get("CZ_RUNNER_STOP_INSTANCES_ON_EXIT", "0") == "1"

@@ -61,6 +61,10 @@ class FakeBackend:
         self.units = {}
         self.orphans = {}
 
+    @staticmethod
+    def unit_name(instance_id):
+        return f"test-{instance_id}.service"
+
     def start(self, instance_id, config_path, runtime_seconds, **_network):
         unit = f"test-{instance_id}.service"
         self.units[unit] = "active"
@@ -1154,7 +1158,7 @@ starttls_signatures = (
         _, content = self.manager.config_content(item.id)
         self.assertIn('saved_by_cli="yes"', content)
 
-    def test_restart_preserves_instance_container_and_resets_ttl(self):
+    def test_restart_preserves_instance_container_and_deadline(self):
         item = self.manager.create({
             "runtime_seconds": 30, "source_ip": "198.51.100.10",
             "user_id": "restart-user", "parameters": {"socks_port": 1080},
@@ -1167,7 +1171,7 @@ starttls_signatures = (
         self.assertEqual(unit, restarted.unit)
         self.assertEqual(namespace, restarted.namespace)
         self.assertEqual("starting", restarted.state)
-        self.assertGreater(restarted.deadline, old_deadline)
+        self.assertEqual(restarted.deadline, old_deadline)
         self.assertEqual(1, self.backend.restart_count)
 
     def test_extend_adds_runtime_and_updates_backend_limit(self):

@@ -13,6 +13,8 @@ import subprocess
 import time
 import uuid
 import threading
+import hashlib
+from datetime import datetime, timezone
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
@@ -748,7 +750,7 @@ class NamespaceBackend:
               tuntom_admission: str = "immediate", tuntom_mtu: int = 1500,
               tuntom_switch_ip: str = "", tuntom_secret: str = "",
               tuntom_tunnel_id: int = 0,
-              rootfs_path: str = "") -> str:
+              rootfs_path: str = "", preserve_allocations_on_failure: bool = False) -> str:
         if egress_driver not in {"split-veth", "on-a-stick", "tuntom-via"}:
             raise BackendError("unsupported egress network driver")
         try:
@@ -760,7 +762,7 @@ class NamespaceBackend:
         try:
             ingress = self._allocate(ingress_id, "ingress", instance_id)
         except Exception:
-            if self.network_settings:
+            if self.network_settings and not preserve_allocations_on_failure:
                 self.network_settings.release(instance_id)
             raise
         if egress_driver == "on-a-stick":
@@ -1079,7 +1081,7 @@ class NamespaceBackend:
         except Exception:
             self._cleanup_network(ingress)
             self._cleanup_network(allocation)
-            if self.network_settings:
+            if self.network_settings and not preserve_allocations_on_failure:
                 self.network_settings.release(instance_id)
                 self.network_settings.release(ingress_id)
             raise
@@ -1523,6 +1525,33 @@ class NamespaceBackend:
         if completed.returncode:
             raise BackendError(completed.stderr.strip() or "systemctl restart failed")
 
+    def schedule_deadline(self, instance_id: str, deadline: str, previous: str = "") -> str:
+        """Let PID 1 enforce TTL even while the runner is stopped."""
+        if not SAFE_ID.fullmatch(instance_id):
+            raise BackendError("invalid instance ID")
+        name = ""
+        if deadline:
+            instant = datetime.fromisoformat(deadline).astimezone(timezone.utc)
+            digest = hashlib.sha256(deadline.encode()).hexdigest()[:16]
+            name = f"capture-zone-deadline-{instance_id}-{digest}"
+            status = self.status(name + ".timer")
+            if status.active_state != "active":
+                self._run([
+                    "systemd-run", "--quiet", "--collect", f"--unit={name}",
+                    f"--on-calendar={instant.strftime('%Y-%m-%d %H:%M:%S.%f UTC')}",
+                    "--timer-property=AccuracySec=1s",
+                    "--timer-property=RemainAfterElapse=no",
+                    "/usr/bin/systemctl", "stop", self.slice_name(instance_id),
+                ])
+        if previous and previous != name:
+            self.cancel_deadline(instance_id, previous)
+        return name
+
+    def cancel_deadline(self, instance_id: str, name: str) -> None:
+        if not re.fullmatch(r"capture-zone-deadline-" + re.escape(instance_id) + r"-[0-9a-f]{16}", name):
+            raise BackendError("invalid deadline timer")
+        self._run(["systemctl", "stop", name + ".timer"], timeout=10, tolerate_missing=True)
+
     def extend_runtime(self, unit: str, total_seconds: int) -> None:
         """Validate an extension against the unit's preallocated hard ceiling.
 
@@ -1578,12 +1607,17 @@ class NamespaceBackend:
         return discovered
 
     def status(self, unit: str) -> UnitStatus:
-        completed = subprocess.run(
-            ["systemctl", "show", unit, "--property=ActiveState,SubState,Result,MainPID"],
-            capture_output=True, text=True, timeout=10, check=False,
-        )
+        try:
+            completed = subprocess.run(
+                ["systemctl", "show", unit, "--property=LoadState,ActiveState,SubState,Result,MainPID"],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise BackendError(f"cannot query systemd unit status: {exc}") from exc
+        if "LoadState=not-found" in completed.stdout:
+            return UnitStatus("inactive", "dead", "success", 0)
         if completed.returncode:
-            return UnitStatus("inactive", "dead", "unknown", 0)
+            raise BackendError(completed.stderr.strip() or "cannot query systemd unit status")
         return parse_unit_status(completed.stdout)
 
     def slice_processes(self, instance_id: str, smithproxy_unit: str) -> list[dict]:

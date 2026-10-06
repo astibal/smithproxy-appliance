@@ -54,7 +54,8 @@ def partition_branches(branches, *, now=None, attic_days=365):
 
 
 def create_app(test_config=None):
-    app = Flask(__name__, instance_relative_config=True)
+    app = Flask(__name__, instance_relative_config=True,
+                instance_path=os.getenv("SMITHPROXY_APPLIANCE_CONSOLE_STATE") or None)
     app.config.from_mapping(
         ADMIN_FILE=os.getenv(
             "SMITHPROXY_APPLIANCE_CONSOLE_ADMINS",

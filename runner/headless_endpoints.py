@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .systemd import BackendError
+from .deployments import atomic_json
 
 
 SAFE_IDENTITY = re.compile(r"[A-Za-z0-9_.:/-]{1,160}")
@@ -42,13 +43,7 @@ class HeadlessEndpointLibrary:
         return [item for item in items if isinstance(item, dict)]
 
     def _save(self, items: list[dict[str, Any]]) -> None:
-        temporary = self.path.with_suffix(".tmp")
-        temporary.write_text(
-            json.dumps({"schema": 1, "packages": items}, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        os.chmod(temporary, 0o600)
-        temporary.replace(self.path)
+        atomic_json(self.path, {"schema": 1, "packages": items})
 
     @staticmethod
     def _validate(payload: dict[str, Any]) -> dict[str, Any]:

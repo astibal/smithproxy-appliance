@@ -21,7 +21,7 @@ from .output import emit
 
 
 INSTANCE_COLUMNS = [
-    ("id", "ID"), ("state", "STATE"), ("source_ip", "SOURCE"),
+    ("id", "ID"), ("state", "STATE"), ("desired_state", "DESIRED"), ("source_ip", "SOURCE"),
     ("user_id", "USER"), ("profile", "CONFIG PROFILE"),
     ("slice_unit", "SLICE"), ("slice_rss_bytes", "SLICE RSS"),
     ("deadline", "DEADLINE"),

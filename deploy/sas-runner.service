@@ -3,19 +3,23 @@ Description=Smithproxy Appliance Service runner
 Documentation=file:/opt/smithproxy-appliance/docs/SYSTEMD.md
 Wants=network-online.target
 After=network-online.target dbus.service
+StartLimitIntervalSec=60s
+StartLimitBurst=5
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
 User=root
 Group=root
 WorkingDirectory=/opt/smithproxy-appliance
+Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 EnvironmentFile=/etc/smithproxy-appliance/runner.env
 EnvironmentFile=/etc/smithproxy-appliance/runner-client.env
-ExecStart=/usr/bin/python3 -m runner.app
+ExecStart=/opt/smithproxy-appliance/.venv/bin/python -m runner.app
 Restart=on-failure
 RestartSec=2s
-TimeoutStartSec=30s
-TimeoutStopSec=30s
+TimeoutStartSec=120s
+TimeoutStopSec=120s
 KillSignal=SIGTERM
 UMask=0077
 
@@ -30,24 +34,17 @@ RuntimeDirectoryPreserve=yes
 # The runner must retain host networking, mount-namespace visibility and access
 # to systemd so it can create netns/veth/nft rules and transient units.
 NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=yes
-ProtectHostname=yes
-ProtectClock=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectKernelLogs=yes
-ProtectControlGroups=yes
-PrivateDevices=yes
 RestrictSUIDSGID=yes
 RestrictRealtime=yes
 LockPersonality=yes
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-ReadWritePaths=/var/lib/smithproxy-appliance /run/smithproxy-appliance -/run/netns
 
 # Do not enable PrivateTmp or PrivateMounts: transient native-save processes and
 # persistent network namespaces must see paths created by the runner.
+# ProtectSystem, ProtectHome, PrivateDevices and ReadWritePaths also create a
+# mount namespace: do not add them here. Isolation belongs to the appliance
+# units; this privileged host orchestrator must publish /run/netns mounts.
 
 [Install]
 WantedBy=multi-user.target
