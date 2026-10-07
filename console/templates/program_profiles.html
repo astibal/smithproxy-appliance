@@ -4,11 +4,19 @@
 {% include '_profile_tabs.html' %}
 {% if error %}<div class="flash error">{{ error }}</div>{% endif %}
 <p>{{ _('rootfs.program_help') }}</p>
+<nav class="program-cards" aria-label="{{ _('programs.title') }}">
+  {% for kind, symbol, title in [('router', '⇄', 'Router'), ('webfsd', '▤', 'webfsd'), ('elf', '◇', 'ELF')] %}
+  <a class="program-card" href="{{ url_for('program_profiles', application=kind) }}" {% if application == kind %}aria-current="page"{% endif %}>
+    <span class="program-symbol" aria-hidden="true">{{ symbol }}</span>
+    <strong>{{ title }}</strong><small>{{ _('programs.' + kind) }}</small>
+  </a>
+  {% endfor %}
+  <a class="program-card program-add" href="{{ url_for('program_storage') }}">
+    <span class="program-symbol" aria-hidden="true">+</span><strong>{{ _('programs.add') }}</strong>
+    <small>{{ _('storage.title') }}</small>
+  </a>
+</nav>
 <section class="panel">
-  <div class="actions">
-    <a class="button-link secondary" href="{{ url_for('program_profiles', application='router') }}">+ Router</a>
-    <a class="button-link secondary" href="{{ url_for('program_profiles', application='webfsd') }}">+ webfsd</a>
-  </div>
   <h2>{{ profile.name if profile else application }}</h2>
   <p>{{ _('programs.' + application) }}</p>
   <form method="post" class="stack">
@@ -16,17 +24,24 @@
     <div class="config-editor-meta">
       {% include '_rootfs_variant.html' %}
       <label>{{ _('ui.11002cd1dcb7') }}<input name="name" maxlength="128" value="{{ profile.name if profile else '' }}" required></label>
+      {% if application == 'elf' %}
+      <label>{{ _('storage.artifact') }}<select name="artifact_id" required>
+        <option value="">—</option>
+        {% for artifact in artifacts|default([]) %}<option value="{{ artifact.artifact_id }}" {{ 'selected' if (profile and profile.program_settings.artifact_id == artifact.artifact_id) or (not profile and request.args.get('artifact') == artifact.artifact_id) }}>{{ artifact.name }} · {{ artifact.version }} · {{ artifact.created_at[:10] }} · {{ artifact.artifact_id[:12] }}</option>{% endfor %}
+      </select></label>
+      <label>{{ _('storage.argv') }}<input name="argv" value="{{ program_argv|default('') }}" placeholder="--foreground"><small>{{ _('storage.argv_help') }}</small></label>
+      {% endif %}
       {% if application == 'webfsd' %}<label>{{ _('programs.port') }}<input type="number" name="port" min="1" max="65535" value="{{ profile.program_settings.port if profile else 8000 }}" required></label>{% endif %}
       <label>{{ _('ui.109738a1f94a') }}<input type="number" name="ttl_seconds" min="5" max="86400" value="{{ profile.ttl_seconds if profile and profile.ttl_seconds is not none else 1800 }}"></label>
-      <label class="check"><input type="checkbox" name="ttl_unlimited" {{ 'checked' if profile and profile.ttl_seconds is none }}>{{ _('programs.unlimited') }}</label>
-      <label class="check"><input type="checkbox" name="auto_restart" {{ 'checked' if profile and profile.auto_restart }}>{{ _('ui.62d3a1874a93') }}</label>
+      <label class="check"><input type="checkbox" name="ttl_unlimited" {{ 'checked' if not profile or profile.ttl_seconds is none }}>{{ _('programs.unlimited') }}</label>
+    {% include '_restart_options.html' %}
     </div>
     <p><code>rootfs · Wiring · 00-start</code> — {{ _('programs.isolation') }}</p>
     {% include '_wiring_bindings.html' %}
     <button>{{ _('ui.500503baf0ae') }}</button>
   </form>
 </section>
-{% if profile and profile.profile_id and application == 'webfsd' %}
+{% if profile and profile.profile_id and application in ['webfsd', 'elf'] %}
 <section class="panel">
   <h2>/work</h2><p>{{ _('programs.files') }}</p>
   <form method="post" enctype="multipart/form-data" action="{{ url_for('upload_runtime_profile_work_file', profile_id=profile.profile_id) }}" class="config-editor-meta">

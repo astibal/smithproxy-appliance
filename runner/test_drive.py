@@ -93,7 +93,7 @@ class TestDriveManager:
     """Disposable two-interface binary labs with no persistent payload."""
 
     def __init__(self, state_dir: Path, runtime_root: Path, backend: NamespaceBackend,
-                 default_ttl: int = 1800, max_ttl: int = 7200,
+                 default_ttl: int = 0, max_ttl: int = 7200,
                  expired_retention_seconds: int = 3 * 3600) -> None:
         self.state_dir = state_dir
         self.runtime_root = runtime_root
@@ -170,7 +170,7 @@ class TestDriveManager:
     def create(self, build_id: str, binary: Path, template: Path, assets: Path,
                ttl_seconds: int | None = None, config_mode: str = "ro") -> TestDrive:
         ttl = self.default_ttl if ttl_seconds is None else ttl_seconds
-        if isinstance(ttl, bool) or not isinstance(ttl, int) or not 60 <= ttl <= self.max_ttl:
+        if isinstance(ttl, bool) or not isinstance(ttl, int) or (ttl != 0 and not 60 <= ttl <= self.max_ttl):
             raise ConfigError(f"ttl_seconds must be between 60 and {self.max_ttl}")
         if not binary.is_file() or not template.is_file() or not assets.is_dir():
             raise BackendError("test drive build bundle is incomplete")
@@ -239,7 +239,7 @@ class TestDriveManager:
             now = datetime.now(timezone.utc)
             drive = TestDrive(
                 id=drive_id, build_id=build_id, unit=unit, state="starting",
-                created_at=now.isoformat(), deadline=(now + timedelta(seconds=ttl)).isoformat(),
+                created_at=now.isoformat(), deadline=(now + timedelta(seconds=ttl)).isoformat() if ttl else "",
                 namespace=allocation.namespace,
                 ingress_interface=ingress.guest_if, ingress_ip=ingress.guest_ip,
                 egress_interface=allocation.guest_if, egress_ip=allocation.guest_ip,
@@ -257,9 +257,9 @@ class TestDriveManager:
 
     def _reconcile(self, drive: TestDrive) -> TestDrive | None:
         status = self.backend.status(drive.unit)
-        deadline = datetime.fromisoformat(drive.deadline)
+        deadline = datetime.fromisoformat(drive.deadline) if drive.deadline else None
         now = datetime.now(timezone.utc)
-        if now >= deadline:
+        if deadline and now >= deadline:
             if status.active_state in {"active", "activating", "reloading"}:
                 self.backend.stop_test_drive_process(drive.unit)
             if not drive.expired_at:
@@ -352,9 +352,9 @@ class TestDriveManager:
             if not drive or drive.state not in {"running", "stopped"}:
                 raise ConfigError("only a running or stopped test drive can be upgraded")
             remaining = math.ceil(
-                (datetime.fromisoformat(drive.deadline) - datetime.now(timezone.utc)).total_seconds()
+                (datetime.fromisoformat(drive.deadline) - datetime.now(timezone.utc)).total_seconds() if drive.deadline else 0
             )
-            if remaining < 5:
+            if drive.deadline and remaining < 5:
                 raise ConfigError("test drive has less than five seconds remaining")
             root = Path(drive.workspace).parent
             drive.previous_build_id = drive.build_id
@@ -387,9 +387,9 @@ class TestDriveManager:
                 return drive
             if drive.state == "running":
                 remaining = math.ceil(
-                    (datetime.fromisoformat(drive.deadline) - datetime.now(timezone.utc)).total_seconds()
+                    (datetime.fromisoformat(drive.deadline) - datetime.now(timezone.utc)).total_seconds() if drive.deadline else 0
                 )
-                if remaining < 5:
+                if drive.deadline and remaining < 5:
                     raise ConfigError("test drive has less than five seconds remaining")
                 root = Path(drive.workspace).parent
                 self._prepare_runtime_files(drive)
@@ -417,6 +417,8 @@ class TestDriveManager:
             if not drive:
                 raise ConfigError("test drive recovery window has expired")
             now = datetime.now(timezone.utc)
+            if not drive.deadline:
+                return drive
             current = datetime.fromisoformat(drive.deadline)
             deadline = max(now, current) + timedelta(seconds=additional_seconds)
             remaining = math.ceil((deadline - now).total_seconds())
@@ -440,13 +442,13 @@ class TestDriveManager:
             if not drive:
                 raise ConfigError("test drive recovery window has expired")
             remaining = math.ceil(
-                (datetime.fromisoformat(drive.deadline) - datetime.now(timezone.utc)).total_seconds()
+                (datetime.fromisoformat(drive.deadline) - datetime.now(timezone.utc)).total_seconds() if drive.deadline else 0
             )
-            if remaining < 5:
+            if drive.deadline and remaining < 5:
                 drive.deadline = (
-                    datetime.now(timezone.utc) + timedelta(seconds=self.default_ttl)
+                    datetime.now(timezone.utc) + timedelta(seconds=self.default_ttl or 1800)
                 ).isoformat()
-                remaining = self.default_ttl
+                remaining = self.default_ttl or 1800
             root = Path(drive.workspace).parent
             self._prepare_runtime_files(drive)
             self.backend.upgrade_test_drive(

@@ -194,6 +194,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wait", action="store_true", help="wait for asynchronous task completion")
     parser.add_argument("-o", "--output", choices=("table", "json"), default="table")
     groups = parser.add_subparsers(dest="group", required=True)
+    program = groups.add_parser('program-artifact')
+    program_sub = program.add_subparsers(dest='command', required=True)
+    program_sub.add_parser('list')
+    imp = program_sub.add_parser('import')
+    imp.add_argument('--name', required=True)
+    imp.add_argument('--version', default='')
+    source = imp.add_mutually_exclusive_group(required=True)
+    source.add_argument('--file', type=Path)
+    source.add_argument('--path', help='Absolute path on the runner origin')
 
     groups.add_parser("health", help="check the unauthenticated health endpoint")
     groups.add_parser("status", help="show runner status")
@@ -278,7 +287,7 @@ def build_parser() -> argparse.ArgumentParser:
     spawn.add_argument("--ingress-driver", choices=("authorized-veth", "unlimited-veth", "none"))
     spawn.add_argument("--egress-driver", choices=("veth-out", "none"))
     spawn.add_argument("--user", required=True)
-    spawn.add_argument("--ttl", type=lambda value: duration(value), default=1800)
+    spawn.add_argument("--ttl", type=ttl_duration, default=None)
     spawn.add_argument("--config-mode", choices=("ro", "rw"), default="ro")
     spawn.add_argument('--no-system-start', action='store_true', help='disable reserved 00-start reconciliation')
     spawn.add_argument('--wiring-file', type=Path, help='JSON list of Wiring bindings; overrides profile, [] clears')
@@ -328,23 +337,31 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("name")
     create.add_argument("--build")
     create.add_argument("--config-id")
-    create.add_argument('--application', choices=('smithproxy', 'router', 'webfsd'), default='smithproxy')
+    create.add_argument('--application', choices=('smithproxy', 'router', 'webfsd', 'elf'), default='smithproxy')
+    create.add_argument('--artifact-id')
+    create.add_argument('--argv-json', default='[]')
     create.add_argument('--http-port', type=int, default=8000)
     create.add_argument('--rootfs-variant', choices=('barebone', 'utils', 'network'), default='barebone')
     create.add_argument("--cert-bundle", default="")
-    create.add_argument("--ttl", type=ttl_duration, default=1800)
+    create.add_argument("--ttl", type=ttl_duration, default=None)
     create.add_argument("--auto-restart", action="store_true")
+    create.add_argument('--restart-on-exit', choices=('yes', 'no'))
+    create.add_argument('--restart-on-failure', choices=('yes', 'no'))
     create.add_argument('--wiring-file', type=Path, help='JSON list of segment_id/interface bindings, no addresses')
     update = profile_sub.add_parser("update")
     update.add_argument("profile")
     update.add_argument("--name")
     update.add_argument('--http-port', type=int)
+    update.add_argument('--artifact-id')
+    update.add_argument('--argv-json')
     update.add_argument('--rootfs-variant', choices=('barebone', 'utils', 'network'))
     update.add_argument("--build")
     update.add_argument("--config-id")
     update.add_argument("--cert-bundle")
-    update.add_argument("--ttl", type=ttl_duration)
+    update.add_argument("--ttl", type=ttl_duration, default=argparse.SUPPRESS)
     update.add_argument("--auto-restart", choices=("yes", "no"))
+    update.add_argument('--restart-on-exit', choices=('yes', 'no'))
+    update.add_argument('--restart-on-failure', choices=('yes', 'no'))
     update.add_argument('--wiring-file', type=Path, help='JSON list replacing Wiring bindings; [] clears')
     delete = profile_sub.add_parser("delete")
     delete.add_argument("profile")
@@ -656,6 +673,10 @@ def _profile(client: RunnerClient, args: argparse.Namespace) -> tuple[Any, Any]:
         if args.application != 'smithproxy':
             payload.update(application=args.application, filesystem_mode='rootfs',
                            program_settings={'port': args.http_port} if args.application == 'webfsd' else {})
+        if args.application == 'elf':
+            payload['program_settings'] = {'artifact_id': args.artifact_id, 'argv': json.loads(args.argv_json)}
+        payload['auto_restart'] = {'on_exit': args.restart_on_exit == 'yes',
+            'on_failure': args.restart_on_failure == 'yes' if args.restart_on_failure is not None else args.auto_restart}
         if args.wiring_file:
             payload['wiring'] = json.loads(args.wiring_file.read_text())
         value = client.enqueue("POST", "/v1/runtime-profiles", payload,
@@ -670,7 +691,7 @@ def _profile(client: RunnerClient, args: argparse.Namespace) -> tuple[Any, Any]:
         "config_id": _id(client, "config", args.config_id) if args.config_id else current["config_id"],
         "cert_bundle_id": (_id(client, "bundle", args.cert_bundle) if args.cert_bundle else "")
         if args.cert_bundle is not None else current.get("cert_bundle_id", ""),
-        "ttl_seconds": args.ttl if args.ttl is not None else current.get("ttl_seconds", 1800),
+        "ttl_seconds": args.ttl if hasattr(args, 'ttl') else current.get("ttl_seconds", 1800),
         "auto_restart": (args.auto_restart == "yes") if args.auto_restart is not None
         else current.get("auto_restart", False),
     }
@@ -681,6 +702,21 @@ def _profile(client: RunnerClient, args: argparse.Namespace) -> tuple[Any, Any]:
                        program_settings=current.get('program_settings', {}))
         if args.http_port is not None:
             payload['program_settings'] = {'port': args.http_port}
+        if current['application'] == 'elf':
+            if args.artifact_id:
+                payload['program_settings']['artifact_id'] = args.artifact_id
+            if args.argv_json is not None:
+                payload['program_settings']['argv'] = json.loads(args.argv_json)
+    selected = payload['auto_restart']
+    if isinstance(selected, bool):
+        selected = {'on_exit': False, 'on_failure': selected}
+    else:
+        selected = dict(selected)
+    for flag in ('on_exit', 'on_failure'):
+        option = getattr(args, 'restart_' + flag)
+        if option is not None:
+            selected[flag] = option == 'yes'
+    payload['auto_restart'] = selected
     value = client.enqueue("PUT", f"/v1/runtime-profiles/{profile_id}", payload,
                            f"Update profile {profile_id[:12]}", "profile-update")
     return complete(client, value, args), None
@@ -891,6 +927,21 @@ def dispatch(client: RunnerClient, args: argparse.Namespace) -> tuple[Any, Any]:
                     path += "/endpoints/" + endpoint["id"]
                 value = client.delete(path)
         return complete(client, value, args), None
+    if args.group == 'program-artifact':
+        if args.command == 'list':
+            return client.get('/v1/program-artifacts')['artifacts'], None
+        payload = {'name': args.name, 'version': args.version}
+        if args.file:
+            import base64
+            with args.file.open('rb') as stream:
+                content = stream.read(16 * 1024 * 1024 + 1)
+            if len(content) > 16 * 1024 * 1024:
+                raise ValueError('Maximum ELF size: 16 MiB')
+            payload['content_base64'] = base64.b64encode(content).decode('ascii')
+            payload['filename'] = args.file.name
+        else:
+            payload['path'] = args.path
+        return complete(client, client.post('/v1/program-artifacts', payload), args), None
     if args.group == "health": return client.get("/healthz"), None
     if args.group == "status": return client.get("/v1/status"), None
     if args.group == "openapi": return client.get("/v1/openapi.json"), None

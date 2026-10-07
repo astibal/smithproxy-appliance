@@ -74,13 +74,16 @@ class WiringViewTests(unittest.TestCase):
     def test_program_profile_forms(self):
         self.app.jinja_env.globals['wiring_choices'] = lambda: []
         for locale in ('cs', 'en', 'fr'):
-            for application in ('router', 'webfsd'):
+            for application in ('router', 'webfsd', 'elf'):
                 with self.app.test_request_context('/program-profiles'):
                     g.locale = locale
                     g.admin = None
                     page = render_template('program_profiles.html', profiles=[], profile=None,
                                            application=application, error=None)
                     self.assertNotIn('programs.pending', page)
+                    self.assertIn('class="program-cards"', page)
+                    self.assertNotIn('>+ Router</a>', page)
+                    self.assertIn('class="program-card program-add" href="/program-storage"', page)
                     self.assertNotIn('name="build_id"', page)
                     self.assertEqual(application == 'webfsd', 'name="port"' in page)
 
@@ -90,7 +93,7 @@ class WiringViewTests(unittest.TestCase):
                  'managed': True, 'instance_id': 'test', 'interface': 'cable0',
                  'segment_id': 'segment', 'segment_name': 'lab', 'endpoint_id': '0'}
         page = self.render(1, {'tree': network_tree([usage])})
-        self.assertIn('10.0.0.0/8', page)
+        self.assertNotIn('10.0.0.0/8', page)
         self.assertIn('10.100.30.0/24', page)
         self.assertIn('href="#endpoint-0"', page)
         self.assertIn('data-wiring-address-form', page)

@@ -635,7 +635,7 @@ def create_app(test_config=None):
     def start_test_drive():
         try:
             build_id = request.form.get("build_id", "")
-            ttl = int(request.form.get("ttl_seconds", "1800"))
+            ttl = int(request.form.get("ttl_seconds", "0") or "0")
             result = enqueue("POST", "/v1/test-drives", {
                 "build_id": build_id, "ttl_seconds": ttl,
                 "config_mode": "rw" if request.form.get("config_rw") == "yes" else "ro",
@@ -810,9 +810,11 @@ def create_app(test_config=None):
         profiles = []
         profile = None
         application = request.args.get('application', 'router')
-        if application not in {'router', 'webfsd'}:
+        artifacts = []
+        if application not in {'router', 'webfsd', 'elf'}:
             application = 'router'
         try:
+            artifacts = api('GET', '/v1/program-artifacts')['artifacts']
             profiles = [p for p in api('GET', '/v1/runtime-profiles')['profiles']
                         if p.get('application', 'smithproxy') != 'smithproxy']
             profile_id = request.args.get('edit', '')
@@ -829,11 +831,15 @@ def create_app(test_config=None):
                     'refresh_rootfs': request.form.get('refresh_rootfs') == 'on',
                     'ttl_seconds': None if request.form.get('ttl_unlimited') == 'on'
                         else int(request.form.get('ttl_seconds', '1800')),
-                    'auto_restart': request.form.get('auto_restart') == 'on',
+                    'auto_restart': {'on_exit': request.form.get('restart_on_exit') == 'on', 'on_failure': request.form.get('restart_on_failure') == 'on'},
                     'program_settings': {'port': int(request.form.get('port', '8000'))}
                         if application == 'webfsd' else {},
                     **wiring_form(profile=True),
                 }
+                if application == 'elf':
+                    import shlex
+                    values['program_settings'] = {'artifact_id': request.form.get('artifact_id', ''),
+                                                  'argv': shlex.split(request.form.get('argv', ''))}
                 path = '/v1/runtime-profiles' + ('/' + profile_id if profile_id else '')
                 result = enqueue('PUT' if profile_id else 'POST', path, values,
                                  values['name'], 'profile-update' if profile_id else 'profile-create')
@@ -846,9 +852,39 @@ def create_app(test_config=None):
                 profile = {**(profile or {}), 'name': request.form.get('name', ''),
                            'ttl_seconds': request.form.get('ttl_seconds', '1800'),
                            'program_settings': {'port': request.form.get('port', '8000')},
-                           'auto_restart': request.form.get('auto_restart') == 'on'}
+                           'auto_restart': {'on_exit': request.form.get('restart_on_exit') == 'on', 'on_failure': request.form.get('restart_on_failure') == 'on'}}
+        if error and request.method == 'POST' and application == 'elf' and profile:
+            profile['program_settings'] = {'artifact_id': request.form.get('artifact_id', ''), 'argv': []}
+        import shlex
         return render_template('program_profiles.html', profiles=profiles, profile=profile,
-                               application=application, error=error)
+                               application=application, error=error, artifacts=artifacts,
+                               program_argv=request.form.get('argv', shlex.join((profile or {}).get('program_settings', {}).get('argv', []))))
+
+    @app.route('/program-storage', methods=['GET', 'POST'])
+    @login_required
+    def program_storage():
+        error = None
+        artifacts = []
+        try:
+            if request.method == 'POST':
+                import base64
+                payload = {'name': request.form.get('name', ''), 'version': request.form.get('version', '')}
+                upload = request.files.get('file')
+                if upload and upload.filename:
+                    content = upload.read(16 * 1024 * 1024 + 1)
+                    if len(content) > 16 * 1024 * 1024:
+                        raise ValueError('Maximum ELF size: 16 MiB')
+                    payload['content_base64'] = base64.b64encode(content).decode('ascii')
+                    payload['filename'] = upload.filename
+                else:
+                    payload['path'] = request.form.get('path', '')
+                result = api('POST', '/v1/program-artifacts', payload)
+                flash_queued(result)
+                return redirect(url_for('program_storage'))
+            artifacts = api('GET', '/v1/program-artifacts')['artifacts']
+        except (RuntimeError, ValueError) as exc:
+            error = str(exc)
+        return render_template('program_storage.html', artifacts=artifacts, error=error)
 
     def network_profile_payload():
         kind = request.form.get("kind", "")
@@ -1231,7 +1267,7 @@ def create_app(test_config=None):
                 "build_id": request.form.get("build_id", ""),
                 "config_id": request.form.get("config_id", ""),
                 "cert_bundle_id": request.form.get("cert_bundle_id", ""),
-                "auto_restart": request.form.get("auto_restart") == "on",
+                "auto_restart": {'on_exit': request.form.get('restart_on_exit') == 'on', 'on_failure': request.form.get('restart_on_failure') == 'on'},
                 "ttl_seconds": ttl_seconds,
                 "ingress_network_profile_id": request.form.get(
                     "ingress_network_profile_id", ""
@@ -1275,7 +1311,7 @@ def create_app(test_config=None):
                 "build_id": request.form.get("build_id", ""),
                 "config_id": request.form.get("config_id", ""),
                 "cert_bundle_id": request.form.get("cert_bundle_id", ""),
-                "auto_restart": request.form.get("auto_restart") == "on",
+                "auto_restart": {'on_exit': request.form.get('restart_on_exit') == 'on', 'on_failure': request.form.get('restart_on_failure') == 'on'},
                 "ttl_seconds": (
                     None if request.form.get("ttl_unlimited") == "on"
                     else int(request.form.get("ttl_seconds", "1800"))
@@ -1638,7 +1674,7 @@ def create_app(test_config=None):
                 "config_mode": request.form.get("config_mode", "ro"),
                 "persistent": request.form.get("persistent") == "on",
                 "filesystem_mode": request.form.get("filesystem_mode", "host"),
-                "runtime_seconds": int(request.form.get("runtime_seconds", "3600")),
+                "runtime_seconds": int(request.form.get("runtime_seconds", "0") or "0"),
                 "parameters": {"socks_port": 1080, "plaintext_port": 50080, "tls_port": 50443,
                                "http_port": 3128, "cli_port": 50000,
                                "workers": 1, "pcap_quota_mb": 100},

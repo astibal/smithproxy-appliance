@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .restart_policy import policy as restart_policy, properties as restart_properties
 
 import ipaddress
 import json
@@ -1203,15 +1204,8 @@ class NamespaceBackend:
             ])
         if hard_runtime_seconds:
             command.insert(5, f"--property=RuntimeMaxSec={hard_runtime_seconds}s")
-        if auto_restart:
-            # The runner performs bounded restarts so TTL remains
-            # authoritative. Keep the failed transient unit loaded long
-            # enough to restart it and let systemd enforce a second limit.
-            command.extend([
-                "--property=StartLimitIntervalSec=60s",
-                "--property=StartLimitBurst=5",
-            ])
-        else:
+        command.extend(restart_properties(auto_restart))
+        if restart_policy(auto_restart) == 'no':
             command.insert(2, "--collect")
         if config_mode == "ro":
             command.append(f"--property=ReadOnlyPaths={config_path}")
@@ -1439,7 +1433,7 @@ class NamespaceBackend:
         command = [
                 "systemd-run", "--quiet", "--collect", f"--unit={unit}",
                 "--property=Type=simple", "--property=KillMode=control-group",
-                "--property=TimeoutStopSec=10s", f"--property=RuntimeMaxSec={ttl_seconds}s",
+                "--property=TimeoutStopSec=10s", f"--property=RuntimeMaxSec={str(ttl_seconds) + 's' if ttl_seconds else 'infinity'}",
                 "--property=MemoryMax=1G", "--property=TasksMax=256",
                 f"--property=NetworkNamespacePath=/run/netns/{namespace}",
                 *self._instance_storage_properties(config_path, private_run, binary.resolve()),

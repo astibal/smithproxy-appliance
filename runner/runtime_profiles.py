@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .restart_policy import flags as restart_flags
 import json
 import os
 import shutil
@@ -10,6 +11,20 @@ from pathlib import Path
 
 from .systemd import BackendError
 from .wiring import bindings
+
+
+def elf_settings(settings):
+    import re
+    if not isinstance(settings, dict) or set(settings) - {'artifact_id', 'argv'}:
+        raise BackendError('ELF settings accept artifact_id and argv only')
+    artifact = settings.get('artifact_id', '')
+    argv = settings.get('argv', [])
+    if not isinstance(artifact, str) or not re.fullmatch('[0-9a-f]{64}', artifact):
+        raise BackendError('ELF artifact_id is required')
+    if not isinstance(argv, list) or len(argv) > 128 or any(
+            not isinstance(a, str) or '\0' in a or len(a) > 4096 for a in argv):
+        raise BackendError('argv must be an array of up to 128 strings without NUL')
+    return {'artifact_id': artifact, 'argv': argv}
 
 
 class RuntimeProfileLibrary:
@@ -154,7 +169,7 @@ class RuntimeProfileLibrary:
         temporary.replace(self.path)
 
     def create(self, name: str, build_id: str, config_id: str, cert_bundle_id: str = "",
-               auto_restart: bool = False, ttl_seconds: int | None = 1800,
+               auto_restart: bool = False, ttl_seconds: int | None = None,
                ingress_network_profile_id: str = "",
                egress_network_profile_id: str = "",
                filesystem_mode: str = "host", wiring: list | None = None,
@@ -250,17 +265,16 @@ class RuntimeProfileLibrary:
         Runtime support is deliberately not implied by a saved definition.
         """
         application = payload.get('application')
-        if application not in {'router', 'webfsd'}:
-            raise BackendError('application must be router or webfsd')
+        if application not in {'router', 'webfsd', 'elf'}:
+            raise BackendError('application must be router, webfsd or elf')
         name = payload.get('name', '')
         if not isinstance(name, str) or not name.strip() or len(name) > 128 or any(ord(c) < 32 for c in name):
             raise BackendError('runtime profile name is invalid')
-        ttl = payload.get('ttl_seconds', 1800)
+        ttl = payload.get('ttl_seconds', None)
         if ttl is not None and (type(ttl) is not int or not 5 <= ttl <= 86400):
             raise BackendError('ttl_seconds must be 5..86400 or null')
         restart = payload.get('auto_restart', False)
-        if type(restart) is not bool:
-            raise BackendError('auto_restart must be a boolean')
+        restart_flags(restart)
         settings = payload.get('program_settings', {})
         if not isinstance(settings, dict):
             raise BackendError('program_settings must be an object')
@@ -268,6 +282,8 @@ class RuntimeProfileLibrary:
             if settings:
                 raise BackendError('router has no configurable program settings')
             settings = {}
+        elif application == 'elf':
+            settings = elf_settings(settings)
         else:
             if set(settings) - {'port'}:
                 raise BackendError('webfsd only accepts port; document root is /work')

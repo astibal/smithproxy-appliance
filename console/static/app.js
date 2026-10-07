@@ -606,6 +606,71 @@
     const drawer = q('#task-drawer');
     const list = q('#task-list');
     if (!dock || !drawer || !list) return;
+    const snapshotKey = 'sas-task-states-v1';
+    let previous = null;
+    try { previous = JSON.parse(sessionStorage.getItem(snapshotKey) || 'null'); } catch (_) {}
+    let dirty = false;
+    let refreshPending = false;
+    let refreshTimer;
+    let busyTimer;
+    const busy = () => {
+      document.documentElement.style.cursor = 'progress';
+      clearTimeout(busyTimer);
+      busyTimer = setTimeout(clearBusy, 2500);
+    };
+    const clearBusy = () => {
+      clearTimeout(busyTimer);
+      document.documentElement.style.cursor = '';
+    };
+    document.addEventListener('input', event => {
+      if (event.target.closest('form') || event.target.closest('.cm-editor, .CodeMirror, .monaco-editor')) dirty = true;
+    });
+    document.addEventListener('change', event => {
+      if (event.target.closest('form')) dirty = true;
+    });
+    const refreshView = () => {
+      if (!refreshPending || document.hidden) return;
+      // Runtime owns live lists and terminals: never destroy their sessions.
+      if (q('#runtime-workspace')) {
+        q('#instance-refresh')?.click();
+        q('#terminal-refresh-logs')?.click();
+        q('#diag-refresh')?.click();
+        refreshPending = false;
+        return;
+      }
+      const terminal = [...document.querySelectorAll('.terminal-screen, #terminal-screen')]
+        .some(node => node.getClientRects().length);
+      if (dirty || terminal || document.querySelector('dialog[open]')) {
+        if (!q('#task-refresh-view')) {
+          const button = document.createElement('button');
+          button.id = 'task-refresh-view'; button.type = 'button';
+          button.textContent = locale === 'cs' ? 'Data se změnila · obnovit zobrazení' : locale === 'fr' ? 'Données modifiées · actualiser' : 'Data changed · refresh view';
+          button.addEventListener('click', () => {
+            const message = locale === 'cs' ? 'Obnovit stránku? Rozepsané změny a terminály se zavřou.' : locale === 'fr' ? 'Actualiser ? Les modifications non enregistrées et les terminaux seront fermés.' : 'Refresh? Unsaved edits and terminals will be closed.';
+            if (window.confirm(message)) location.reload();
+          });
+          dock.prepend(button);
+        }
+        return;
+      }
+      location.reload();
+    };
+    const observeTasks = tasks => {
+      const next = Object.fromEntries(tasks.map(task => [task.task_id, task.state]));
+      const active = state => ['pending', 'running'].includes(state);
+      const finished = previous && tasks.some(task => !active(task.state) &&
+        (active(previous[task.task_id]) || !(task.task_id in previous)));
+      previous = next;
+      // Persist before refreshing, including across POST/redirect navigation.
+      try { sessionStorage.setItem(snapshotKey, JSON.stringify(next)); } catch (_) {}
+      if (finished) {
+        refreshPending = true;
+        clearTimeout(refreshTimer);
+        refreshTimer = setTimeout(refreshView, 350);
+      }
+    };
+    document.addEventListener('visibilitychange', refreshView);
+    document.addEventListener('submit', busy);
     document.body.classList.add('has-task-dock');
     q('#task-dock-toggle')?.addEventListener('click', () => {
       drawer.hidden = !drawer.hidden;
@@ -666,15 +731,18 @@
         const response = await fetch('/api/tasks', {cache: 'no-store'});
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+        clearBusy();
         render(data.tasks || []);
+        observeTasks(data.tasks || []);
       } catch (error) {
         text('#task-dock-summary', `${tr('error')}: ${error.message || error}`);
       } finally {
+        clearBusy();
         pollInFlight = false;
         schedulePoll(1500);
       }
     };
-    document.addEventListener('task-queued', () => schedulePoll(0));
+    document.addEventListener('task-queued', () => { busy(); schedulePoll(0); });
     poll();
   }
 
@@ -972,7 +1040,9 @@
           instance.id,
           execution.build_type === 'Debug' && instance.state === 'running',
         );
-        appendDiagRow(grid, 'Auto-restart', instance.auto_restart ? window.sasTr("ui.cccb4e4ad1ba", {count: instance.restart_count || 0}) : window.sasTr("ui.cb58e4600bf0"));
+        const restart = typeof instance.auto_restart === 'object' && instance.auto_restart !== null
+          ? instance.auto_restart : {on_exit: false, on_failure: !!instance.auto_restart};
+        appendDiagRow(grid, 'Auto-restart', [restart.on_exit ? 'on-exit' : '', restart.on_failure ? 'on-failure' : ''].filter(Boolean).join(' + ') || window.sasTr("ui.cb58e4600bf0"));
         appendDiagRow(grid, window.sasTr("ui.e1d2d128701a"), instance.last_restart_at || '—');
         output.replaceChildren(grid);
         if (instance.crash_trace) {

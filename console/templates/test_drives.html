@@ -7,7 +7,7 @@
   <form method="post" action="{{ url_for('start_test_drive') }}" class="test-drive-launch-form">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <label>{{ _('drives.build') }}<select name="build_id" required><option value="" disabled selected>{{ _('drives.choose_build') }}</option>{% for artifact in artifacts %}<option value="{{ artifact.build_id|default(artifact.commit_id) }}" title="{{ artifact.choice_title }}">{{ artifact.choice_label }}</option>{% endfor %}</select></label>
-    <label>{{ _('drives.ttl') }}<select name="ttl_seconds"><option value="900">15 min</option><option value="1800" selected>30 min</option><option value="3600">1 h</option><option value="7200">2 h</option></select></label>
+    <label>{{ _('drives.ttl') }}<select name="ttl_seconds"><option value="0" selected>Unlimited</option><option value="900">15 min</option><option value="1800">30 min</option><option value="3600">1 h</option><option value="7200">2 h</option></select></label>
     <label class="check"><input type="checkbox" name="config_rw" value="yes" checked><span>{{ _('drives.rw_config') }}<small>{{ _('drives.rw_help') }}</small></span></label>
     <button>{{ _('drives.start') }}</button>
   </form>

@@ -111,11 +111,26 @@ class WiringTests(unittest.TestCase):
         self.configure()
         entries = self.store.inventory()['entries']
         tree = network_tree(entries)
-        self.assertEqual(tree[0]['prefix'], '10.0.0.0/8')
-        self.assertTrue(tree[0]['summary'])
-        self.assertFalse(tree[0]['children'][0]['children'][0]['summary'])
+        self.assertEqual(tree[0]['prefix'], '10.100.30.0/24')
+        self.assertFalse(tree[0]['summary'])
+        self.assertEqual(tree[0]['children'], [])
         self.assertEqual(tree[1]['version'], 6)
         self.assertFalse(self.store.inventory()['discovery_enabled'])
+
+    def test_tree_retains_branching_and_configured_parent(self):
+        tree = network_tree([{'prefix': p} for p in ('10.1.1.0/24', '10.2.1.0/24')])
+        self.assertEqual(tree[0]['prefix'], '10.0.0.0/8')
+        self.assertEqual([c['prefix'] for c in tree[0]['children']], ['10.1.1.0/24', '10.2.1.0/24'])
+        tree = network_tree([{'prefix': p} for p in ('10.1.0.0/16', '10.1.1.0/24')])
+        self.assertEqual(tree[0]['prefix'], '10.1.0.0/16')
+        self.assertEqual(len(tree[0]['usages']), 1)
+        self.assertEqual(tree[0]['children'][0]['prefix'], '10.1.1.0/24')
+
+    def test_tree_compacts_ipv6_and_keeps_multiple_usages(self):
+        tree = network_tree([{'prefix': 'fd42:1::/64'}] * 2)
+        self.assertEqual(tree[0]['prefix'], 'fd42:1::/64')
+        self.assertEqual(len(tree[0]['usages']), 2)
+        self.assertEqual(network_tree([]), [])
 
     def test_same_segment_subnet_is_normal_but_duplicate_is_warning(self):
         self.configure()

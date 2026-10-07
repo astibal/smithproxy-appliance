@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .restart_policy import flags as restart_flags
 import hmac
 import base64
 import gzip
@@ -16,6 +17,8 @@ import threading
 import time
 import uuid
 import tempfile
+from .program_artifacts import ProgramArtifacts
+from .runtime_profiles import elf_settings
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
@@ -367,7 +370,8 @@ class Manager:
                     )
                 except (AttributeError, BackendError) as exc:
                     instance.crash_trace = f"automatic stack trace unavailable: {exc}"
-            if (failed and instance.auto_restart and instance.restart_count < 5
+            if (failed and instance.auto_restart is True and status.result != "start-limit-hit"
+                    and instance.restart_count < 5
                     and instance.desired_state != "stopped"
                     and instance.state not in {"stopped", "expired"}
                     and (not deadline or datetime.now(timezone.utc) < deadline)):
@@ -629,12 +633,12 @@ class Manager:
         if requested_wiring and not self.l2_segments:
             raise ConfigError('Wiring is unavailable')
         runtime_profile_id = str(payload.get("runtime_profile_id", ""))
-        runtime = payload.get("runtime_seconds")
+        runtime = payload.get("runtime_seconds", 0)
+        if runtime is None:
+            runtime = 0
         if isinstance(runtime, bool) or not isinstance(runtime, int):
             raise ConfigError("runtime_seconds must be an integer")
         runtime_max = self.max_total_runtime if runtime_profile_id else self.max_runtime
-        if runtime == 0 and not runtime_profile_id:
-            raise ConfigError("unlimited runtime requires a runtime profile")
         if runtime != 0 and not self.min_runtime <= runtime <= runtime_max:
             raise ConfigError(f"runtime_seconds must be between {self.min_runtime} and {runtime_max}")
         parameters = validate_parameters(payload.get("parameters", {}))
@@ -740,8 +744,7 @@ class Manager:
         if filesystem_mode == "rootfs" and not rootfs_path:
             raise ConfigError("rootfs mode requires a prepared build rootfs")
         auto_restart = payload.get("auto_restart", False)
-        if not isinstance(auto_restart, bool):
-            raise ConfigError("auto_restart must be a boolean")
+        restart_flags(auto_restart)
         persistent = payload.get("persistent", False)
         system_start_enabled = payload.get('system_start_enabled', True)
         if not isinstance(system_start_enabled, bool):
@@ -1608,6 +1611,16 @@ def openapi_document() -> dict[str, Any]:
                 "get": {"summary": "List binary and configuration bindings"},
                 "post": {"summary": "Create a runtime profile"},
             },
+            "/v1/program-artifacts": {
+                "get": {"summary": "List immutable ELF program artifacts", "responses": {"200": {"description": "Artifact list"}}},
+                "post": {"summary": "Queue an ELF import (maximum 16 MiB)",
+                    "requestBody": {"required": True, "content": {"application/json": {"schema": {
+                        "type": "object", "required": ["name"], "properties": {
+                            "name": {"type": "string"}, "version": {"type": "string"},
+                            "path": {"type": "string", "description": "Absolute path on origin; mutually exclusive with content_base64"},
+                            "content_base64": {"type": "string"}, "filename": {"type": "string"}
+                        }}}}}, "responses": {"202": {"description": "Queued import task"}, "400": {"description": "Invalid request"}}}
+            },
             "/v1/runtime-profiles/{id}": {
                 "get": {"summary": "Read one runtime profile and its usage"},
                 "put": {"summary": "Update a binary and configuration binding"},
@@ -1857,6 +1870,8 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     qemu_images: QemuImageLibrary | None = None,
                     appliance_exports: ApplianceExportLibrary | None = None,
                     headless_endpoints: HeadlessEndpointLibrary | None = None):
+    program_artifacts = ProgramArtifacts(runtime_profiles.path.parent / 'program-artifacts') if runtime_profiles else None
+
     def firewall_context(sources: list[str] | None = None) -> tuple[str, list[str]]:
         if not network_settings:
             raise BackendError("network settings are unavailable")
@@ -2066,7 +2081,7 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
         state["topology_updated_at"] = datetime.now(timezone.utc).isoformat()
         return state
 
-    def runtime_profile_ttl(payload: dict, default: int | None = 1800) -> int | None:
+    def runtime_profile_ttl(payload: dict, default: int | None = None) -> int | None:
         ttl = payload.get("ttl_seconds", default)
         if ttl is None:
             return None
@@ -2142,9 +2157,16 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
             build_id = str(payload.get('build_id', (current or {}).get('build_id', '')))
             builder.prepare_rootfs(build_id)
             base = builder.resolve_rootfs(build_id)
+        executable = None
+        executable_name = 'program'
+        if application == 'elf':
+            settings = elf_settings(payload.get('program_settings', {}))
+            executable = program_artifacts.binary(settings['artifact_id'])
+            artifact = program_artifacts.get(settings['artifact_id'])
+            executable_name = artifact.get('filename', Path(artifact.get('origin', 'program')).name)
         return runtime_images.prepare(runtime_profiles.path.parent / 'runtime-images', selected,
             application='' if application == 'smithproxy' else application,
-            settings=payload.get('program_settings', {}), base=base)
+            settings=payload.get('program_settings', {}), base=base, executable=executable, executable_name=executable_name)
 
     def profile_view(item: dict, *, artifacts: list[dict] | None = None,
                      instances: list[Instance] | None = None) -> dict:
@@ -2660,7 +2682,7 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
             effective_payload["build_id"] = binding["build_id"]
             effective_payload["config_id"] = binding["config_id"]
             effective_payload["cert_bundle_id"] = binding.get("cert_bundle_id", "")
-            effective_payload["auto_restart"] = bool(binding.get("auto_restart", False))
+            effective_payload["auto_restart"] = binding.get("auto_restart", False)
             effective_payload["filesystem_mode"] = str(
                 binding.get("filesystem_mode", "host")
             )
@@ -3004,7 +3026,14 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                 if method == "POST" and len(parts) == 2:
                     operation = lambda: l2_segments.create(payload)
                 elif method == "POST" and len(parts) == 4 and parts[3] == "endpoints":
-                    operation = lambda: l2_segments.attach(parts[2], payload)
+                    def operation():
+                        value = l2_segments.attach(parts[2], payload)
+                        # Attachment is durable and catalogue locks are released before
+                        # entering the per-instance controller (manager -> Wiring).
+                        # A disabled 00-start remains disabled; stopped instances defer
+                        # application until startup. Failures surface in this task.
+                        check = manager.check_microservices(payload['instance_id'])
+                        return {**value, 'check': check}
                 elif method == 'POST' and len(parts) == 6 and parts[3] == 'endpoints' and parts[5] == 'addressing':
                     def operation():
                         value = l2_segments.configure_addressing(parts[2], parts[4], payload)
@@ -3182,6 +3211,8 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                 self._json(HTTPStatus.OK, {
                     "configs": builder.configs() if builder else config_library.list()
                 })
+            elif parts == ['v1', 'program-artifacts'] and program_artifacts:
+                self._json(HTTPStatus.OK, {'artifacts': program_artifacts.list()})
             elif parts == ["v1", "runtime-profiles"] and runtime_profiles:
                 try:
                     build_artifacts = builder.status().get("artifacts", []) if builder else []
@@ -3497,8 +3528,7 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     config_id = str(payload.get("config_id", ""))
                     cert_bundle_id = str(payload.get("cert_bundle_id", ""))
                     auto_restart = payload.get("auto_restart", False)
-                    if not isinstance(auto_restart, bool):
-                        raise ConfigError("auto_restart must be a boolean")
+                    restart_flags(auto_restart)
                     current_profile = runtime_profiles.get(parts[2])
                     if current_profile.get('application', 'smithproxy') != 'smithproxy':
                         payload.setdefault('application', current_profile['application'])
@@ -3595,6 +3625,26 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
         def do_POST(self) -> None:
             if not self._authorized():
                 self._json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+                return
+            if self._path() == ['v1', 'program-artifacts'] and program_artifacts:
+                try:
+                    length = int(self.headers.get('Content-Length', '0'))
+                    if not 0 < length <= 23 * 1024 * 1024:
+                        raise BackendError('invalid artifact request size')
+                    payload = json.loads(self.rfile.read(length))
+                    if not isinstance(payload, dict):
+                        raise BackendError('expected JSON object')
+                    if bool(payload.get('path')) == bool(payload.get('content_base64')):
+                        raise BackendError('provide exactly one of path or content_base64')
+                    content = base64.b64decode(payload['content_base64'], validate=True) if payload.get('content_base64') else None
+                    key = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+                    def import_artifact():
+                        if content is not None:
+                            return program_artifacts.import_bytes(content, payload.get('name', ''), payload.get('version', ''), filename=payload.get('filename', 'program'))
+                        return program_artifacts.import_file(payload['path'], payload.get('name', ''), payload.get('version', ''))
+                    self._json(HTTPStatus.ACCEPTED, submit_task('program-import', 'Import ELF', key, 'program-artifacts', import_artifact))
+                except (ValueError, TypeError, BackendError) as exc:
+                    self._json(HTTPStatus.BAD_REQUEST, {'error': str(exc)})
                 return
             if self._l2_request("POST"):
                 return
@@ -3907,7 +3957,7 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     root = binary.parent
                     item = test_drives.create(
                         build_id, binary, root / "smithproxy.cfg",
-                        root / "smithproxy.assets", payload.get("ttl_seconds"),
+                        root / "smithproxy.assets", 0 if payload.get("ttl_seconds") is None else payload["ttl_seconds"],
                         str(payload.get("config_mode", "ro")),
                     )
                     self._json(HTTPStatus.CREATED, asdict(item))
@@ -4361,8 +4411,7 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                         raise ConfigError("runtime profiles require an approved native config")
                     cert_bundle_id = str(payload.get("cert_bundle_id", ""))
                     auto_restart = payload.get("auto_restart", False)
-                    if not isinstance(auto_restart, bool):
-                        raise ConfigError("auto_restart must be a boolean")
+                    restart_flags(auto_restart)
                     ttl_seconds = runtime_profile_ttl(payload)
                     filesystem_mode = str(payload.get("filesystem_mode", "host"))
                     if filesystem_mode not in {"host", "rootfs"}:
@@ -5082,7 +5131,7 @@ def main() -> None:
             "CZ_RUNNER_TEST_DRIVE_RUNTIME", "/run/capture-zone-runner/instances"
         )),
         namespace_backend,
-        default_ttl=int(os.environ.get("CZ_RUNNER_TEST_DRIVE_TTL", "1800")),
+        default_ttl=int(os.environ.get("CZ_RUNNER_TEST_DRIVE_TTL", "0")),
         max_ttl=int(os.environ.get("CZ_RUNNER_TEST_DRIVE_MAX_TTL", "7200")),
         expired_retention_seconds=int(os.environ.get(
             "CZ_RUNNER_TEST_DRIVE_RETENTION", "10800"

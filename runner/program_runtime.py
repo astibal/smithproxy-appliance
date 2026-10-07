@@ -1,5 +1,6 @@
 """Launch a program in the existing appliance Slice and owned netns, never host fs."""
 from pathlib import Path
+from .restart_policy import policy as restart_policy, properties as restart_properties
 from .systemd import BackendError
 
 
@@ -39,9 +40,8 @@ def launch(backend, instance_id, allocation, work: Path, root: Path, program, re
     ]
     if maximum:
         command.append(f'--property=RuntimeMaxSec={maximum}s')
-    if restart:
-        command += ['--property=StartLimitIntervalSec=60s', '--property=StartLimitBurst=5']
-    else:
+    command += restart_properties(restart)
+    if restart_policy(restart) == 'no':
         command.append('--collect')
     # systemd performs specifier expansion even without an intermediate shell.
     command += ['--', *(arg.replace('%', '%%') for arg in argv)]

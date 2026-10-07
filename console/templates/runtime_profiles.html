@@ -21,8 +21,8 @@
     <label class="network-binding ingress">{{ _('ui.5e4833d5d91f') }}<select name="ingress_network_profile_id"><option value="">Global/default · split-veth / di0</option>{% for item in network_profiles if 'ingress' in item.consumes|default([item.kind]) %}<option value="{{ item.network_profile_id }}" data-consumes="{{ item.consumes|default([item.kind])|join(',') }}">{{ item.name }} · {{ 'READY' if item.implemented else 'DESIGN ONLY' }}{{ ' · DUPLEX' if item.consumes|default([])|length > 1 }}</option>{% endfor %}</select><small>SOURCE → runner policy → di0</small></label>
     <label class="network-binding egress">{{ _('ui.be4c6326e750') }}<select name="egress_network_profile_id"><option value="">{{ _('ui.d3fe661a9b6c') }}</option>{% for item in network_profiles if 'egress' in item.consumes|default([item.kind]) %}<option value="{{ item.network_profile_id }}" data-consumes="{{ item.consumes|default([item.kind])|join(',') }}">{{ item.name }} · {{ 'READY' if item.implemented else 'DESIGN ONLY' }}{{ ' · DUPLEX' if item.consumes|default([])|length > 1 }}</option>{% endfor %}</select><small>namespace → uplink / route</small></label>
     <label>{{ _('ui.109738a1f94a') }}<input type="number" name="ttl_seconds" value="1800" min="5" max="86400"></label>
-    <label class="check"><input type="checkbox" name="ttl_unlimited"><span>Unlimited <small>{{ _('ui.c6b7a79cc893') }}</small></span></label>
-    <label class="check"><input type="checkbox" name="auto_restart"><span>{{ _('ui.62d3a1874a93') }} <small>{{ _('ui.f134a10f1e0c') }}</small></span></label>
+    <label class="check"><input type="checkbox" name="ttl_unlimited" checked><span>Unlimited <small>{{ _('ui.c6b7a79cc893') }}</small></span></label>
+    {% include '_restart_options.html' %}
     {% include '_wiring_bindings.html' %}
     <button>{{ _('ui.d64010004e8b') }}</button>
   </form>
@@ -38,7 +38,11 @@
         <b>{{ profile.name }}</b>
         <span class="badge {{ 'ok' if profile.available else '' }}">{{ 'ready' if profile.available else 'unavailable' }}</span>
         <span class="badge">TTL {{ profile.ttl_seconds ~ ' s' if profile.ttl_seconds is not none else 'unlimited' }}</span>
-        {% if profile.auto_restart %}<span class="badge ok">auto-restart</span>{% endif %}
+        {% set restart = profile.auto_restart %}
+        {% if restart is mapping %}
+          {% if restart.get('on_exit') %}<span class="badge ok">on-exit</span>{% endif %}
+          {% if restart.get('on_failure') %}<span class="badge ok">on-failure</span>{% endif %}
+        {% elif restart %}<span class="badge ok">on-failure</span>{% endif %}
         <span class="badge {{ 'ok' if profile.filesystem_mode == 'rootfs' and profile.rootfs_ready else '' }}">{{ 'rootfs' if profile.filesystem_mode == 'rootfs' else 'host fs' }}</span>
         {% if profile.newer_build_available %}<span class="badge warning">{{ _('ui.48ca62a4b2bb') }}</span>{% endif %}
         <div class="runtime-binding-line">

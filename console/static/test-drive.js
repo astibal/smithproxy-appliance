@@ -25,7 +25,7 @@
         return;
       }
       if (!Number.isFinite(deadline)) {
-        element.textContent = window.sasTr("ui.0da95a60dc96");
+        element.textContent = window.sasTr("programs.unlimited");
         return;
       }
       const remaining = (deadline - now) / 1000;

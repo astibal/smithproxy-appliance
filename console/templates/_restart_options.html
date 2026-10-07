@@ -1,0 +1,7 @@
+{% set restart = profile.auto_restart if profile is defined and profile else false %}
+<fieldset class="stack">
+  <legend>Auto-restart</legend>
+  <label class="check"><input type="checkbox" name="restart_on_exit" {{ 'checked' if restart is mapping and restart.get('on_exit', false) }}><span>on-exit <small>{{ _('restart.exit') }}</small></span></label>
+  <label class="check"><input type="checkbox" name="restart_on_failure" {{ 'checked' if (restart.get('on_failure', false) if restart is mapping else restart) }}><span>on-failure <small>{{ _('restart.failure') }}</small></span></label>
+  <small>{{ _('restart.help') }}</small>
+</fieldset>

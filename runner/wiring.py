@@ -233,7 +233,14 @@ def network_tree(entries):
             nodes[parent]['children'].append(nodes[network])
         else:
             roots.append(nodes[network])
-    return roots
+    def compact(node):
+        node['children'] = [compact(child) for child in node['children']]
+        # Only synthetic grouping levels may disappear. A configured prefix
+        # carries actual usage information even when it has one child.
+        if not node['usages'] and len(node['children']) == 1:
+            return node['children'][0]
+        return node
+    return [compact(node) for node in roots]
 
 
 def overlaps(entries, addresses, segment_id='', endpoint_id=''):

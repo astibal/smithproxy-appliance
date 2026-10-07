@@ -178,7 +178,8 @@ class APITests(unittest.TestCase):
         self.store.inventory.return_value = {'entries': [], 'tree': []}
         self.tasks.submit.return_value = (object(), True)
         self.tasks.view.return_value = {"task_id": "queued"}
-        cls = handler_factory(Mock(), "test-token", tasks=self.tasks, l2_segments=self.store)
+        self.manager = Mock()
+        cls = handler_factory(self.manager, "test-token", tasks=self.tasks, l2_segments=self.store)
         handler = object.__new__(cls)
         body = json.dumps(payload).encode() if payload is not None else b""
         handler.headers = {"Content-Length": str(len(body))}
@@ -202,6 +203,37 @@ class APITests(unittest.TestCase):
             handler = self.handler(method, "/v1/l2-segments", {}, authenticated=False)
             self.assertEqual(handler._json.call_args.args[0], 401)
             self.tasks.submit.assert_not_called()
+
+    def test_attach_requests_per_instance_check_after_attachment(self):
+        payload = {'instance_id': str(uuid.uuid4()), 'interface': 'cable0'}
+        segment = str(uuid.uuid4())
+        handler = self.handler('POST', f'/v1/l2-segments/{segment}/endpoints', payload)
+        handler._json.assert_called_once_with(202, {'task_id': 'queued'})
+        self.manager.check_microservices.assert_not_called()
+        events = []
+        self.store.attach.side_effect = lambda *args: events.append('attach') or {'id': segment}
+        self.manager.check_microservices.side_effect = lambda *args: events.append('check') or {'state': 'checked'}
+        result = self.tasks.submit.call_args.args[-1]()
+        self.assertEqual(['attach', 'check'], events)
+        self.manager.check_microservices.assert_called_once_with(payload['instance_id'])
+        self.assertEqual(segment, result['id'])
+
+    def test_failed_attachment_does_not_request_check(self):
+        payload = {'instance_id': str(uuid.uuid4()), 'interface': 'cable0'}
+        self.handler('POST', f'/v1/l2-segments/{uuid.uuid4()}/endpoints', payload)
+        self.store.attach.side_effect = BackendError('attachment failed')
+        with self.assertRaises(BackendError):
+            self.tasks.submit.call_args.args[-1]()
+        self.manager.check_microservices.assert_not_called()
+
+    def test_check_failure_propagates_to_task(self):
+        payload = {'instance_id': str(uuid.uuid4()), 'interface': 'cable0'}
+        self.handler('POST', f'/v1/l2-segments/{uuid.uuid4()}/endpoints', payload)
+        self.store.attach.return_value = {'id': 'segment'}
+        self.manager.check_microservices.side_effect = BackendError('00-start failed')
+        with self.assertRaisesRegex(BackendError, '00-start failed'):
+            self.tasks.submit.call_args.args[-1]()
+        self.store.detach.assert_not_called()
 
     def test_delete_is_queued(self):
         segment_id = str(uuid.uuid4())

@@ -1,0 +1,18 @@
+{% extends 'base.html' %}{% block content %}
+<div class="headline"><h1>{{ _('storage.title') }}</h1></div>
+{% include '_profile_tabs.html' %}
+{% if error %}<div class="flash error">{{ error }}</div>{% endif %}
+<section class="panel"><h2>{{ _('programs.add') }}</h2>
+<p>{{ _('storage.help') }}</p>
+<form method="post" enctype="multipart/form-data" class="stack">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<div class="config-editor-meta">
+<label>{{ _('ui.11002cd1dcb7') }}<input name="name" required maxlength="128" value="{{ request.form.get('name', '') }}"></label>
+<label>{{ _('storage.version') }}<input name="version" maxlength="128" value="{{ request.form.get('version', '') }}"></label>
+<label>{{ _('storage.upload') }}<input name="file" type="file"></label>
+<label>{{ _('storage.path') }}<input name="path" placeholder="/usr/bin/example" value="{{ request.form.get('path', '') }}"></label>
+</div><button>{{ _('storage.import') }}</button></form></section>
+<section class="panel"><table><thead><tr><th>{{ _('storage.artifact') }}</th><th>SHA-256</th><th>{{ _('storage.created') }}</th><th></th></tr></thead><tbody>
+{% for item in artifacts %}<tr><td><b>{{ item.name }}</b> · {{ item.version }}<br><small>ELF {{ item.bits }} · {{ item.size_bytes }} B</small></td><td><code title="{{ item.sha256 }}">{{ item.sha256[:16] }}</code></td><td>{{ item.created_at[:19] }}</td><td><a class="button-link" href="{{ url_for('program_profiles', application='elf', artifact=item.artifact_id) }}">{{ _('storage.profile') }}</a></td></tr>{% else %}<tr><td colspan="4">{{ _('ui.38f752b4f261') }}</td></tr>{% endfor %}
+</tbody></table></section>
+{% endblock %}

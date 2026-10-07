@@ -1,4 +1,6 @@
-<nav class="actions" aria-label="{{ _('nav.profiles') }}" style="margin-bottom:1rem">
-  <a class="button-link {{ 'secondary' if request.endpoint == 'program_profiles' }}" href="{{ url_for('runtime_profiles') }}">Smithproxy</a>
-  <a class="button-link {{ 'secondary' if request.endpoint != 'program_profiles' }}" href="{{ url_for('program_profiles') }}">{{ _('programs.title') }}</a>
+<link rel="stylesheet" href="{{ url_for('static', filename='program-cards.css', v='1') }}">
+<nav class="profile-family-tabs" aria-label="{{ _('nav.profiles') }}">
+  <a {% if request.endpoint != 'program_profiles' %}aria-current="page"{% endif %} href="{{ url_for('runtime_profiles') }}">Smithproxy</a>
+  <a {% if request.endpoint == 'program_profiles' %}aria-current="page"{% endif %} href="{{ url_for('program_profiles') }}">{{ _('programs.title') }}</a>
+  <a {% if request.endpoint == 'program_storage' %}aria-current="page"{% endif %} href="{{ url_for('program_storage') }}">{{ _('storage.title') }}</a>
 </nav>

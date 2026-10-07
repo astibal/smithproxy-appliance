@@ -36,9 +36,13 @@ def copy_elf(source: Path, root: Path, destination: Path):
         SmithproxyBuilder._copy_rootfs_file(dependency, root)
 
 
-def prepare(library: Path, selected='barebone', *, application='', settings=None, base=None):
+def prepare(library: Path, selected='barebone', *, application='', settings=None, base=None, executable=None, executable_name='program'):
     """Same image contract for built-in programs and an existing Smithproxy base."""
     selected = variant(selected)
+    if application == 'elf':
+        import re
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._+-]{0,127}', executable_name):
+            raise BackendError('invalid ELF executable name')
     library.mkdir(parents=True, exist_ok=True, mode=0o700)
     root = Path(tempfile.mkdtemp(prefix='.building-', dir=library))
     settings = settings or {}
@@ -49,16 +53,19 @@ def prepare(library: Path, selected='barebone', *, application='', settings=None
             (root / name).mkdir(parents=True, exist_ok=True)
         argv = []
         if application:
-            tool = {'router': 'sleep', 'webfsd': 'webfsd'}.get(application)
-            source = shutil.which(tool) if tool else None
+            tool = {'router': 'sleep', 'webfsd': 'webfsd', 'elf': 'sas-program'}.get(application)
+            source = str(executable) if application == 'elf' and executable else (shutil.which(tool) if tool else None)
             imported = library.parent / 'program-sources' / (tool or 'unknown')
             if not source and imported.is_file():
                 source = str(imported)
             if not source:
                 raise BackendError(f'required program is not installed on origin: {tool or application}')
-            copy_elf(Path(source), root, Path('/usr/bin') / tool)
+            destination = Path('/opt/program') / executable_name if application == 'elf' else Path('/usr/bin') / tool
+            copy_elf(Path(source), root, destination)
             argv = ['/usr/bin/sleep', 'infinity'] if application == 'router' else [
                 '/usr/bin/webfsd', '-F', '-r', '/work', '-p', str(settings.get('port', 8000)), '-u', 'root', '-g', 'root', '-f', 'index.html', '-l', '-']
+            if application == 'elf':
+                argv = [str(destination), *settings.get('argv', [])]
             if application == 'webfsd' and Path('/etc/mime.types').is_file():
                 shutil.copyfile('/etc/mime.types', root / 'etc/mime.types')
             (root / 'etc/passwd').write_text('root:x:0:0:root:/work:/bin/sh\n')

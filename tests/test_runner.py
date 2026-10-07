@@ -419,6 +419,22 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(b"enable\r\nsave config\r\n", self.backend.test_drive_cli.sent)
         self.assertTrue(self.backend.test_drive_cli.closed)
 
+    def test_test_drive_defaults_to_unlimited_across_restart(self):
+        root = Path(self.temp.name)
+        binary = root / 'smithproxy-unlimited'
+        binary.write_bytes(b'binary')
+        binary.chmod(0o700)
+        assets = root / 'assets-unlimited'
+        (assets / 'certs' / 'default').mkdir(parents=True)
+        (assets / 'msg' / 'en').mkdir(parents=True)
+        manager = TestDriveManager(root / 'td-unlimited-state', root / 'td-unlimited-run', self.backend)
+        item = manager.create('unlimited-release', binary, self.template, assets)
+        self.assertEqual('', item.deadline)
+        self.assertEqual('', manager.get(item.id).deadline)
+        restarted = manager.restart(item.id)
+        self.assertEqual('', restarted.deadline)
+        self.assertEqual(0, self.backend.test_drive_upgrade['ttl_seconds'])
+
     def test_test_drive_dirty_upgrade_preserves_workspace_and_deadline(self):
         root = Path(self.temp.name)
         original = root / "smithproxy-old"
@@ -1278,15 +1294,9 @@ starttls_signatures = (
         self.assertEqual(extended.runtime_seconds, self.backend.extended_runtime[1])
 
     def test_unlimited_runtime_has_no_deadline_and_cannot_be_extended(self):
-        with self.assertRaises(ConfigError):
-            self.manager.create({
-                "runtime_seconds": 0, "source_ip": "198.51.100.10",
-                "user_id": "manual-unlimited", "parameters": {"socks_port": 1080},
-            })
         item = self.manager.create({
-            "runtime_seconds": 0, "source_ip": "198.51.100.10",
+            "source_ip": "198.51.100.10",
             "user_id": "unlimited-user", "parameters": {"socks_port": 1080},
-            "runtime_profile_id": str(uuid.uuid4()),
         })
         self.assertEqual("", item.deadline)
         self.assertEqual(0, item.runtime_seconds)

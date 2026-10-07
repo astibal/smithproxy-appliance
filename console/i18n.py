@@ -368,6 +368,13 @@ for _locale, _warning in {
     CATALOGUE[_locale]['netns.warning'] = _warning
 
 
+for _locale, _restart in {
+    'cs': ('Po úspěšném ukončení', 'Při chybě nebo pádu', 'Obě volby = restart po obou typech ukončení. Stop a TTL se respektují. Pauza 2 s, nejvýše 5 startů za 60 s.'),
+    'en': ('After successful exit', 'On error or crash', 'Both = restart after either exit type. Stop and TTL remain authoritative. Delay 2 s, at most 5 starts per 60 s.'),
+    'fr': ('Après une sortie réussie', 'En cas d’erreur ou de crash', 'Les deux = redémarrer après chaque type de sortie. Stop et TTL restent prioritaires. Délai 2 s, 5 démarrages maximum par 60 s.'),
+}.items():
+    CATALOGUE[_locale].update(dict(zip(('restart.exit', 'restart.failure', 'restart.help'), _restart)))
+
 for _locale, _entries in {
     "cs": {
         "title": "Kabely a switche", "name": "Název", "kind": "Typ", "create": "Vytvořit",
@@ -464,6 +471,14 @@ for _locale, _entries in {
 }.items():
     CATALOGUE[_locale].update({'wiring.' + key: value for key, value in _entries.items()})
 
+for _locale, _entries in {
+    'cs': {'title': 'Storage · ELF programy', 'artifact': 'Artefakt', 'version': 'Verze / popisek', 'upload': 'Nahrát ELF (max. 16 MiB)', 'path': 'Nebo absolutní cesta na originu', 'import': 'Importovat do fronty', 'created': 'Importováno', 'profile': 'Vytvořit profil', 'argv': 'Argumenty programu', 'argv_help': 'Uvozovky seskupují argumenty. Bez shellu, expanze a přesměrování. Program musí běžet v popředí.', 'help': 'Vyber soubor nebo cestu na originu. Import program nespouští. Stejný SHA-256 vrací existující artefakt; nové verze nepřepínají profily.'},
+    'en': {'title': 'Storage · ELF programs', 'artifact': 'Artifact', 'version': 'Version / label', 'upload': 'Upload ELF (max. 16 MiB)', 'path': 'Or absolute path on origin', 'import': 'Queue import', 'created': 'Imported', 'profile': 'Create profile', 'argv': 'Program arguments', 'argv_help': 'Quotes group arguments. No shell, expansion or redirection. The program must run in the foreground.', 'help': 'Choose a file or origin path. Import never executes the program. Identical SHA-256 returns the existing artifact; new versions do not switch profiles.'},
+    'fr': {'title': 'Stockage · programmes ELF', 'artifact': 'Artefact', 'version': 'Version / libellé', 'upload': 'Importer ELF (16 Mio max.)', 'path': 'Ou chemin absolu sur l’origine', 'import': 'Mettre l’import en file', 'created': 'Importé', 'profile': 'Créer un profil', 'argv': 'Arguments du programme', 'argv_help': 'Les guillemets regroupent les arguments. Aucun shell, expansion ou redirection. Le programme doit rester au premier plan.', 'help': 'Choisir un fichier ou un chemin sur l’origine. L’import ne lance jamais le programme. Un SHA-256 identique renvoie l’artefact existant ; les nouvelles versions ne modifient pas les profils.'},
+}.items():
+    CATALOGUE[_locale].update({'storage.' + key: value for key, value in _entries.items()})
+    CATALOGUE[_locale]['programs.elf'] = {'cs': 'Program ze storage, připnutá verze ELF ve vlastním rootfs.', 'en': 'Storage program: pinned ELF version in its own rootfs.', 'fr': 'Programme du stockage : version ELF fixe dans son propre rootfs.'}[_locale]
+
 for _locale, _values in {
     'cs': ['Nespravováno', 'Čeká na 00-start', 'Aplikuje se', 'Aplikováno', 'Pouze evidence', 'Chyba'],
     'en': ['Unmanaged', 'Pending 00-start', 'Applying', 'Applied', 'Declared only', 'Error'],
@@ -497,6 +512,8 @@ for _locale, _text in {
 for _locale, _entries in {
     'cs': {
         'title': 'Ostatní programy',
+        'add': 'Přidat program',
+        'add_help': 'Import dalšího programu zatím není dostupný.',
         'pending': 'Definice profilu · spouštění tohoto typu zatím není implementované.',
         'router': 'Linux router: plánovaný IPv4/IPv6 forwarding pouze uvnitř namespace. Bez automatického NAT nebo uplinku.',
         'webfsd': 'Webfsd: statický HTTP server s dokumenty v /work.',
@@ -506,6 +523,8 @@ for _locale, _entries in {
     },
     'en': {
         'title': 'Other programs',
+        'add': 'Add program',
+        'add_help': 'Importing another program is not available yet.',
         'pending': 'Profile definition · launching this application type is not implemented yet.',
         'router': 'Linux router: planned IPv4/IPv6 forwarding inside its namespace only. No automatic NAT or uplink.',
         'webfsd': 'Webfsd: a static HTTP server with documents in /work.',
@@ -515,6 +534,8 @@ for _locale, _entries in {
     },
     'fr': {
         'title': 'Autres programmes',
+        'add': 'Ajouter un programme',
+        'add_help': 'L’import d’un autre programme n’est pas encore disponible.',
         'pending': 'Définition du profil · le démarrage de ce type n’est pas encore implémenté.',
         'router': 'Routeur Linux : transfert IPv4/IPv6 prévu uniquement dans son namespace. Sans NAT ni liaison montante automatiques.',
         'webfsd': 'Webfsd : serveur HTTP statique avec les documents dans /work.',
