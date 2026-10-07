@@ -1,0 +1,10 @@
+<label>{{ _('rootfs.variant') }}
+  <select name="rootfs_variant">
+  {% for variant in ['barebone', 'utils', 'network'] %}
+    <option value="{{ variant }}" {{ 'selected' if profile is defined and profile and profile.rootfs_variant|default('barebone') == variant }}>{{ _('rootfs.' + variant) }}</option>
+  {% endfor %}
+  </select><small>{{ _('rootfs.help') }}</small>
+</label>
+{% if profile is defined and profile and profile.rootfs_image %}
+<label class="check"><input type="checkbox" name="refresh_rootfs">{{ _('rootfs.refresh') }}</label>
+{% endif %}

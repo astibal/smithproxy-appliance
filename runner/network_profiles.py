@@ -94,14 +94,29 @@ class NetworkProfileLibrary:
         if kind == "ingress":
             item = cls._base(payload, kind)
             driver = str(payload.get("driver", "split-veth"))
+            if driver == "split-veth":
+                driver = "authorized-veth"
             selector = str(payload.get("selector", "source"))
-            if driver not in {"split-veth", "tuntom"}:
-                raise BackendError("ingress driver must be split-veth or tuntom")
+            if driver not in {"authorized-veth", "unlimited-veth", "none", "tuntom"}:
+                raise BackendError("ingress driver must be authorized-veth, unlimited-veth or none")
+            if driver in {"unlimited-veth", "none"}:
+                item.update({
+                    "driver": driver, "selector": "none",
+                    "require_authorization": False,
+                    "interface_name": "transport0" if driver == "unlimited-veth" else "",
+                    "destination_cidrs": [], "consumes": ["ingress"],
+                    "start_parameters": [], "implemented": item["address_family"] == "dual",
+                    "namespace_role": "transport" if driver == "unlimited-veth" else "none",
+                    "driver_label": "Unlimited veth" if driver == "unlimited-veth" else "no ingress",
+                })
+                return item
             if selector not in {"source", "destination", "source-destination"}:
                 raise BackendError("unsupported ingress selector")
             authorization = payload.get("require_authorization", True)
             if not isinstance(authorization, bool):
                 raise BackendError("require_authorization must be boolean")
+            if driver == "authorized-veth":
+                authorization = True
             interface = cls._interface(payload.get("interface_name"), "di0")
             if interface != "di0":
                 raise BackendError(f"{driver} ingress interface must be di0")
@@ -119,6 +134,8 @@ class NetworkProfileLibrary:
                 raise BackendError("destination selector requires at least one destination CIDR")
             item.update({
                 "driver": driver, "selector": selector,
+                "driver_label": "Authorized veth" if driver == "authorized-veth" else driver,
+                "namespace_role": "instance",
                 "require_authorization": authorization,
                 "interface_name": interface, "destination_cidrs": cidrs,
                 "tuntom_build_id": tuntom_build_id,
@@ -129,7 +146,7 @@ class NetworkProfileLibrary:
                     if driver == "tuntom" else []
                 ),
                 "implemented": (
-                    driver == "split-veth" and selector == "source"
+                    driver == "authorized-veth" and selector == "source"
                     and interface == "di0" and authorization
                     and item["address_family"] == "dual"
                 ),
@@ -138,9 +155,17 @@ class NetworkProfileLibrary:
         if kind == "egress":
             item = cls._base(payload, kind)
             driver = str(payload.get("driver", "split-veth"))
+            if driver == "split-veth":
+                driver = "veth-out"
+            if driver == "none":
+                item.update({"driver": driver, "driver_label": "no egress",
+                             "mode": "routed", "interface_name": "", "host_interface": "",
+                             "consumes": ["egress"], "start_parameters": [],
+                             "implemented": item["address_family"] == "dual"})
+                return item
             mode = str(payload.get("mode", "masquerade"))
             if driver not in {
-                "split-veth", "on-a-stick", "tuntom", "tuntom-via", "blackbox-link"
+                "veth-out", "on-a-stick", "tuntom", "tuntom-via", "blackbox-link"
             }:
                 raise BackendError(
                     "egress driver must be split-veth, on-a-stick, tuntom, "
@@ -185,6 +210,7 @@ class NetworkProfileLibrary:
                 raise BackendError("tuntom MTU must be between 576 and 9000")
             item.update({
                 "driver": driver, "mode": mode, "interface_name": interface,
+                "driver_label": "veth out" if driver == "veth-out" else driver,
                 "host_interface": host_interface,
                 "tuntom_socket": tuntom_socket, "tuntom_build_id": tuntom_build_id,
                 "tuntom_in_prefix": in_prefix, "tuntom_out_prefix": out_prefix,
@@ -200,7 +226,7 @@ class NetworkProfileLibrary:
                     if driver == "tuntom" else []
                 ),
                 "implemented": (
-                    driver in {"split-veth", "on-a-stick", "tuntom-via"}
+                    driver in {"veth-out", "on-a-stick", "tuntom-via"}
                     and interface == expected_interface
                     and item["address_family"] == "dual"
                 ),
@@ -217,6 +243,9 @@ class NetworkProfileLibrary:
                     if str(uuid.UUID(profile_id)) != profile_id:
                         continue
                     item = {**raw, **self.validate(raw, str(raw.get("kind", "")))}
+                    if item["driver"].startswith("tuntom") or item["driver"] in {"blackbox-link", "on-a-stick"}:
+                        item["implemented"] = False
+                        item["retired"] = True
                     item["network_profile_id"] = profile_id
                     item["created_at"] = str(raw.get("created_at", ""))
                     if raw.get("updated_at"):
@@ -239,6 +268,7 @@ class NetworkProfileLibrary:
         return item
 
     def create(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self._check_available_driver(payload)
         validated = self.validate(payload)
         now = datetime.now(timezone.utc).isoformat()
         item = {
@@ -252,6 +282,7 @@ class NetworkProfileLibrary:
 
     def update(self, profile_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         current = self.get(profile_id)
+        self._check_available_driver(payload)
         validated = self.validate(payload, current["kind"])
         updated = {
             **current, **validated, "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -268,6 +299,14 @@ class NetworkProfileLibrary:
                 raise BackendError("network profile is unavailable")
             self._save(items)
         return updated
+
+    @staticmethod
+    def _check_available_driver(payload: dict[str, Any]) -> None:
+        if not isinstance(payload, dict):
+            raise BackendError("network profile must be an object")
+        driver = str(payload.get("driver", "split-veth"))
+        if driver.startswith("tuntom") or driver in {"blackbox-link", "on-a-stick"}:
+            raise BackendError("this network driver has been retired; choose a veth driver or none")
 
     def delete(self, profile_id: str) -> dict[str, Any] | None:
         with self.lock:

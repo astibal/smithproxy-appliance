@@ -4,6 +4,7 @@
   <div><div class="eyebrow">RUNTIME BINDINGS</div><h1>{{ _('pages.profiles.title') }}</h1><p>{{ _('pages.profiles.intro') }}</p></div>
 </div>
 {% if error %}<div class="flash error">{{ error }}</div>{% endif %}
+{% include '_profile_tabs.html' %}
 
 {% set ingress_profiles = network_profiles|selectattr('kind', 'equalto', 'ingress')|list %}
 {% set egress_profiles = network_profiles|selectattr('kind', 'equalto', 'egress')|list %}
@@ -12,6 +13,7 @@
   <form method="post" action="{{ url_for('create_runtime_profile') }}" class="config-editor-meta runtime-profile-compose">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <label>{{ _('ui.11002cd1dcb7') }}<input name="name" maxlength="128" required></label>
+    {% include '_rootfs_variant.html' %}
     <label>{{ _('ui.ef9b8b9ef8e5') }}<select name="build_id" required>{% for artifact in status.build.artifacts|default([]) %}<option value="{{ artifact.build_id|default(artifact.commit_id) }}" title="{{ artifact.choice_title }}">{{ artifact.choice_label }}</option>{% else %}<option value="" disabled selected>{{ _('ui.5e8614158d5b') }}</option>{% endfor %}</select><small>{{ _('ui.b2f048205d61') }}</small></label>
     <label>{{ _('nav.configs') }}<select name="config_id" required>{% for config in status.build.configs|default([]) %}<option value="{{ config.config_id }}" {{ 'disabled' if not config.native else '' }}>{{ config.name }} · {{ config.profile|default('custom') }} · {{ config.sha256[:12] }}{% if not config.native %} · legacy{% endif %}</option>{% else %}<option value="" disabled selected>{{ _('ui.12d253fdf4b9') }}</option>{% endfor %}</select></label>
     <label>CA / Cert bundle<select name="cert_bundle_id"><option value="">{{ _('ui.3e27c3992953') }}</option>{% for bundle in bundles %}<option value="{{ bundle.bundle_id }}">{{ bundle.name }} · {{ bundle.ca_common_name }}</option>{% endfor %}</select></label>
@@ -21,6 +23,7 @@
     <label>{{ _('ui.109738a1f94a') }}<input type="number" name="ttl_seconds" value="1800" min="5" max="86400"></label>
     <label class="check"><input type="checkbox" name="ttl_unlimited"><span>Unlimited <small>{{ _('ui.c6b7a79cc893') }}</small></span></label>
     <label class="check"><input type="checkbox" name="auto_restart"><span>{{ _('ui.62d3a1874a93') }} <small>{{ _('ui.f134a10f1e0c') }}</small></span></label>
+    {% include '_wiring_bindings.html' %}
     <button>{{ _('ui.d64010004e8b') }}</button>
   </form>
 </section>
@@ -57,3 +60,4 @@
   </div>
 </section>
 {% endblock %}
+{% block scripts %}<script src="{{ url_for('static', filename='wiring-bindings.js', v='1') }}" defer></script>{% endblock %}

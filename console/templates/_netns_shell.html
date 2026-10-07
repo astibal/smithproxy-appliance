@@ -1,0 +1,13 @@
+<section id="netns-terminal" class="terminal" hidden data-csrf="{{ csrf_token }}">
+  <div class="terminal-heading"><div><b>NetNS shell</b> <code id="netns-instance"></code><small id="netns-status"></small></div>
+    <div class="terminal-toolbar">
+      <button type="button" class="terminal-action" data-netns="smaller">A−</button>
+      <button type="button" class="terminal-action" data-netns="larger">A+</button>
+      <button type="button" class="terminal-action" data-netns="reconnect">{{ _('runtime.reconnect') }}</button>
+      <button type="button" class="terminal-action" data-netns="clear">{{ _('ui.375c84309b8d') }}</button>
+      <button type="button" class="terminal-action" data-netns="close">{{ _('ui.0924aca48c69') }}</button>
+    </div>
+  </div>
+  <p class="flash warning">{{ _('netns.warning') }}</p>
+  <div class="terminal-screen" id="netns-screen" style="height:480px;padding:12px 12px 24px" aria-label="NetNS shell"></div>
+</section>

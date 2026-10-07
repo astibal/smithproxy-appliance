@@ -287,11 +287,39 @@ def create_app(test_config=None):
             if not secrets.compare_digest(supplied, session.get("csrf_token", "")):
                 abort(400, "invalid CSRF token")
 
+    def wiring_choices():
+        try:
+            return api('GET', '/v1/l2-segments')['segments']
+        except RuntimeError:
+            return []
+
+    def wiring_form(*, profile=False):
+        if request.form.get('wiring_editor_ready') != '1':
+            return {}
+        if not profile and request.form.get('wiring_override') != 'on':
+            return {}
+        result = []
+        segments = request.form.getlist('wiring_segment')
+        interfaces = request.form.getlist('wiring_interface')
+        if len(segments) != len(interfaces) or len(segments) > 16:
+            raise ValueError('Invalid Wiring form')
+        for index, (segment, interface) in enumerate(zip(segments, interfaces)):
+            item = {'segment_id': segment, 'interface': interface}
+            if not profile:
+                addresses = request.form.getlist('wiring_addresses')
+                modes = request.form.getlist('wiring_mode')
+                if len(addresses) != len(segments) or len(modes) != len(segments):
+                    raise ValueError('Invalid Wiring address form')
+                item['addressing'] = {'mode': modes[index], 'addresses': addresses[index].split(), 'routes': []}
+            result.append(item)
+        return {'wiring': result}
+
     @app.context_processor
     def globals_():
         return {
             "csrf_token": session.setdefault("csrf_token", secrets.token_urlsafe(24)),
             "_": tr, "locale": g.locale, "languages": LANGUAGES,
+            'wiring_choices': wiring_choices,
         }
 
     @app.after_request
@@ -763,6 +791,7 @@ def create_app(test_config=None):
         try:
             status = api("GET", "/v1/status")
             profiles = api("GET", "/v1/runtime-profiles")["profiles"]
+            profiles = [p for p in profiles if p.get('application', 'smithproxy') == 'smithproxy']
             bundles = api("GET", "/v1/cert-bundles")["bundles"]
             network_profiles = api("GET", "/v1/network-profiles")["profiles"]
         except RuntimeError as exc:
@@ -773,6 +802,53 @@ def create_app(test_config=None):
             "runtime_profiles.html", status=status, profiles=profiles, bundles=bundles,
             network_profiles=network_profiles, error=error,
         )
+
+    @app.route('/program-profiles', methods=['GET', 'POST'])
+    @login_required
+    def program_profiles():
+        error = None
+        profiles = []
+        profile = None
+        application = request.args.get('application', 'router')
+        if application not in {'router', 'webfsd'}:
+            application = 'router'
+        try:
+            profiles = [p for p in api('GET', '/v1/runtime-profiles')['profiles']
+                        if p.get('application', 'smithproxy') != 'smithproxy']
+            profile_id = request.args.get('edit', '')
+            if profile_id:
+                profile = next((p for p in profiles if p['profile_id'] == profile_id), None)
+                if profile is None:
+                    abort(404)
+                application = profile['application']
+            if request.method == 'POST':
+                values = {
+                    'name': request.form.get('name', ''), 'application': application,
+                    'filesystem_mode': 'rootfs',
+                    'rootfs_variant': request.form.get('rootfs_variant', 'barebone'),
+                    'refresh_rootfs': request.form.get('refresh_rootfs') == 'on',
+                    'ttl_seconds': None if request.form.get('ttl_unlimited') == 'on'
+                        else int(request.form.get('ttl_seconds', '1800')),
+                    'auto_restart': request.form.get('auto_restart') == 'on',
+                    'program_settings': {'port': int(request.form.get('port', '8000'))}
+                        if application == 'webfsd' else {},
+                    **wiring_form(profile=True),
+                }
+                path = '/v1/runtime-profiles' + ('/' + profile_id if profile_id else '')
+                result = enqueue('PUT' if profile_id else 'POST', path, values,
+                                 values['name'], 'profile-update' if profile_id else 'profile-create')
+                audit('program-profile.save', result.get('task_id', ''))
+                flash_queued(result)
+                return redirect(url_for('program_profiles', application=application))
+        except (RuntimeError, ValueError) as exc:
+            error = str(exc)
+            if request.method == 'POST':
+                profile = {**(profile or {}), 'name': request.form.get('name', ''),
+                           'ttl_seconds': request.form.get('ttl_seconds', '1800'),
+                           'program_settings': {'port': request.form.get('port', '8000')},
+                           'auto_restart': request.form.get('auto_restart') == 'on'}
+        return render_template('program_profiles.html', profiles=profiles, profile=profile,
+                               application=application, error=error)
 
     def network_profile_payload():
         kind = request.form.get("kind", "")
@@ -808,6 +884,68 @@ def create_app(test_config=None):
                 "tuntom_mtu": request.form.get("tuntom_mtu", "1500"),
             })
         return payload
+
+    @app.route("/l2-segments", methods=["GET", "POST"])
+    @app.route("/network/wiring", methods=["GET", "POST"])
+    @login_required
+    def l2_segments():
+        if request.method == "POST":
+            try:
+                action = request.form.get("action", "create")
+                path = "/v1/l2-segments"
+                method, payload = "POST", {}
+                if action == "create":
+                    payload = {"kind": request.form.get("kind"), "name": request.form.get("name")}
+                else:
+                    path += "/" + quote(request.form.get("segment_id", ""), safe="")
+                    if action == "attach":
+                        path += "/endpoints"
+                        payload = {"instance_id": request.form.get("instance_id"),
+                                   "interface": request.form.get("interface")}
+                    elif action == 'addressing':
+                        path += '/endpoints/' + quote(request.form.get('endpoint_id', ''), safe='') + '/addressing'
+                        routes = []
+                        for line in request.form.get('routes', '').splitlines():
+                            fields = line.split()
+                            if not fields:
+                                continue
+                            if len(fields) not in {1, 2}:
+                                raise RuntimeError('Route: destination/prefix [gateway]')
+                            routes.append({'destination': fields[0], 'gateway': fields[1] if len(fields) == 2 else ''})
+                        payload = {'mode': request.form.get('mode'),
+                                   'addresses': request.form.get('addresses', '').split(), 'routes': routes}
+                    elif action in {"detach", "delete"}:
+                        method, payload = "DELETE", None
+                        if action == "detach":
+                            path += "/endpoints/" + quote(request.form.get("endpoint_id", ""), safe="")
+                    else:
+                        raise RuntimeError("invalid L2 action")
+                result = api(method, path, payload)  # Runner queues every mutation itself.
+                audit("l2." + action, result.get("task_id", ""))
+                if request.headers.get('Accept') == 'application/json':
+                    return jsonify(result)
+                flash_queued(result)
+            except RuntimeError as exc:
+                if request.headers.get('Accept') == 'application/json':
+                    return jsonify({'error': str(exc)}), 400
+                flash(str(exc), "error")
+            return redirect(url_for("l2_segments"))
+        try:
+            segments = api("GET", "/v1/l2-segments")["segments"]
+            instances = api("GET", "/v1/instances")["instances"]
+            inventory = api('GET', '/v1/l2-segments/addressing')
+            return render_template("l2_segments.html", segments=segments,
+                                   instances=instances, inventory=inventory, error=None)
+        except RuntimeError as exc:
+            return render_template("l2_segments.html", segments=[], instances=[], error=str(exc))
+
+    @app.post('/network/wiring/preview')
+    @login_required
+    def wiring_preview():
+        try:
+            return jsonify(api('POST', '/v1/l2-segments/addressing/preview', request.get_json()))
+        except RuntimeError as exc:
+            return jsonify({'error': str(exc)}), 400
 
     @app.route("/network-profiles", methods=["GET", "POST"])
     @login_required
@@ -1088,6 +1226,7 @@ def create_app(test_config=None):
                 else int(request.form.get("ttl_seconds", "1800"))
             )
             result = enqueue("POST", "/v1/runtime-profiles", {
+                **wiring_form(profile=True),
                 "name": request.form.get("name", ""),
                 "build_id": request.form.get("build_id", ""),
                 "config_id": request.form.get("config_id", ""),
@@ -1101,6 +1240,8 @@ def create_app(test_config=None):
                     "egress_network_profile_id", ""
                 ),
                 "filesystem_mode": request.form.get("filesystem_mode", "host"),
+                "rootfs_variant": request.form.get('rootfs_variant', 'barebone'),
+                "refresh_rootfs": request.form.get('refresh_rootfs') == 'on',
             }, tr('ui.8e41ec071b0c'), "profile-create")
             audit("runtime-profile.create", result.get("task_id", ""))
             flash_queued(result)
@@ -1113,6 +1254,8 @@ def create_app(test_config=None):
     def edit_runtime_profile(profile_id):
         try:
             profile = api("GET", f"/v1/runtime-profiles/{quote(profile_id, safe='')}")
+            if profile.get('application', 'smithproxy') != 'smithproxy':
+                return redirect(url_for('program_profiles', edit=profile_id))
             status = api("GET", "/v1/status")
             bundles = api("GET", "/v1/cert-bundles")["bundles"]
             network_profiles = api("GET", "/v1/network-profiles")["profiles"]
@@ -1127,6 +1270,7 @@ def create_app(test_config=None):
         values = {}
         try:
             values = {
+                **wiring_form(profile=True),
                 "name": request.form.get("name", ""),
                 "build_id": request.form.get("build_id", ""),
                 "config_id": request.form.get("config_id", ""),
@@ -1143,6 +1287,8 @@ def create_app(test_config=None):
                     "egress_network_profile_id", ""
                 ),
                 "filesystem_mode": request.form.get("filesystem_mode", "host"),
+                "rootfs_variant": request.form.get('rootfs_variant', 'barebone'),
+                "refresh_rootfs": request.form.get('refresh_rootfs') == 'on',
             }
             result = enqueue("PUT", f"/v1/runtime-profiles/{quote(profile_id, safe='')}", values,
                              f"Upravit runtime profil {profile_id[:12]}", "profile-update")
@@ -1473,6 +1619,7 @@ def create_app(test_config=None):
     def create_instance():
         try:
             result = api("POST", "/v1/instances", {
+                **wiring_form(),
                 "source_ip": request.form.get("source_ip", ""),
                 "build_id": request.form.get("build_id", "active"),
                 "config_id": request.form.get("config_id", "active"),
@@ -1841,6 +1988,29 @@ def create_app(test_config=None):
         except RuntimeError as exc:
             return jsonify(error=str(exc)), 503
 
+    @app.post('/api/instances/<instance_id>/microservices/check')
+    @login_required
+    def check_instance_microservices(instance_id):
+        try:
+            result = api('POST', f"/v1/instances/{quote(instance_id, safe='')}/microservices/check", {})
+            audit('microservices.check', instance_id)
+            return jsonify(result), 202
+        except RuntimeError as exc:
+            return jsonify(error=str(exc)), 503
+
+    @app.post('/api/instances/<instance_id>/microservices/00/configure')
+    @login_required
+    def configure_system_start(instance_id):
+        try:
+            payload = request.get_json(silent=True)
+            if not isinstance(payload, dict) or set(payload) != {'enabled'} or not isinstance(payload['enabled'], bool):
+                return jsonify(error='enabled must be boolean'), 400
+            result = api('POST', f"/v1/instances/{quote(instance_id, safe='')}/microservices/00/configure", payload)
+            audit('microservices.00.configure', instance_id)
+            return jsonify(result), 202
+        except RuntimeError as exc:
+            return jsonify(error=str(exc)), 503
+
     @app.post("/api/instances/<instance_id>/cli")
     @login_required
     def cli(instance_id):
@@ -1854,7 +2024,7 @@ def create_app(test_config=None):
 
     @sock.route("/ws/instances/<instance_id>/<terminal_kind>")
     def terminal_websocket(ws, instance_id, terminal_kind):
-        if terminal_kind not in {"cli", "gdb"}:
+        if terminal_kind not in {"cli", "gdb", "netns"}:
             ws.close()
             return
         if not g.admin or not secrets.compare_digest(
@@ -1866,6 +2036,8 @@ def create_app(test_config=None):
             app.config["RUNNER_WS_URL"].rstrip("/")
             + f"/v1/instances/{quote(instance_id, safe='')}/{terminal_kind}"
         )
+        if terminal_kind == 'netns':
+            audit('instance.netns-shell', instance_id)
         try:
             with websocket_connect(
                 upstream_url,

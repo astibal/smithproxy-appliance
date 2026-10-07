@@ -7,23 +7,28 @@
   <link rel="stylesheet" href="{{ url_for('static',filename='vendor/xterm/xterm.css') }}">
   <link rel="stylesheet" href="{{ url_for('static',filename='app.css',v='52') }}">
   <link rel="stylesheet" href="{{ url_for('static',filename='network-profiles.css',v='5') }}">
-  <script src="{{ url_for('static',filename='ui-i18n.js',v='i18n-20261005') }}" defer></script>
+  <script src="{{ url_for('static',filename='ui-i18n.js',v='wiring-start-20261007') }}" defer></script>
   <script src="{{ url_for('static',filename='vendor/xterm/xterm.js',v='i18n-20261005') }}" defer></script>
   <script src="{{ url_for('static',filename='vendor/xterm/addon-fit.js',v='i18n-20261005') }}" defer></script>
-  <script src="{{ url_for('static',filename='app.js',v='i18n-20261005') }}" defer></script>
+  <script src="{{ url_for('static',filename='app.js',v='netns-20261006') }}" defer></script>
 </head>
 <body class="page-{{ request.endpoint|default('unknown') }}">
 <header>
   <a class="brand" href="{{ url_for('console') }}"><i></i>Smithproxy Appliance</a>
   {% if g.admin %}
   {% set endpoint = request.endpoint|default('') %}
-  {% set profile_active = endpoint in ('runtime_profiles','create_runtime_profile','edit_runtime_profile','delete_runtime_profile') %}
+  {% set profile_active = endpoint in ('runtime_profiles','program_profiles','create_runtime_profile','edit_runtime_profile','delete_runtime_profile') %}
   {% set library_active = endpoint in ('binaries','tuntom_binaries','build_tuntom','refresh_tuntom_branches','delete_tuntom_binary') or 'qemu_image' in endpoint or endpoint in ('configs','edit_config','upload_config','delete_config','config_observer') or 'cert_bundle' in endpoint or 'bundle_certificate' in endpoint %}
-  {% set network_active = 'network_profile' in endpoint or 'headless_endpoint' in endpoint or 'firewall' in endpoint or endpoint in ('settings','update_networking_settings') %}
+  {% set network_active = 'network_profile' in endpoint or 'headless_endpoint' in endpoint or 'firewall' in endpoint or endpoint in ('settings','update_networking_settings','l2_segments') %}
   <nav aria-label="Main navigation">
     <a class="nav-link {{ 'active' if endpoint == 'console' else '' }}" href="{{ url_for('console') }}">{{ _('nav.runtime') }}</a>
-    <a class="nav-link {{ 'active' if endpoint in ('test_drive_list','test_drive_detail') else '' }}" href="{{ url_for('test_drive_list') }}">{{ _('nav.test_drives') }}</a>
-    <a class="nav-link {{ 'active' if endpoint == 'appliance_export_list' else '' }}" href="{{ url_for('appliance_export_list') }}">{{ _('nav.appliance_exports') }}</a>
+    <details class="nav-menu">
+      <summary class="{{ 'active' if 'test_drive' in endpoint or 'appliance_export' in endpoint else '' }}">AdHoc<span aria-hidden="true">⌄</span></summary>
+      <div class="nav-menu-panel">
+        <a class="{{ 'active' if 'test_drive' in endpoint else '' }}" href="{{ url_for('test_drive_list') }}">{{ _('nav.test_drives') }}</a>
+        <a class="{{ 'active' if 'appliance_export' in endpoint else '' }}" href="{{ url_for('appliance_export_list') }}">{{ _('nav.appliance_exports') }}</a>
+      </div>
+    </details>
     <a class="nav-link {{ 'active' if profile_active else '' }}" href="{{ url_for('runtime_profiles') }}">{{ _('nav.profiles') }}</a>
     <details class="nav-menu">
       <summary class="{{ 'active' if library_active else '' }}">{{ _('nav.library') }}<span aria-hidden="true">⌄</span></summary>
@@ -40,6 +45,7 @@
       <summary class="{{ 'active' if network_active else '' }}">{{ _('nav.network') }}<span aria-hidden="true">⌄</span></summary>
       <div class="nav-menu-panel">
         <a class="{{ 'active' if 'network_profile' in endpoint else '' }}" href="{{ url_for('network_profile_library') }}">{{ _('nav.network_profiles') }}</a>
+        <a class="{{ 'active' if endpoint == 'l2_segments' else '' }}" href="{{ url_for('l2_segments') }}">Wiring</a>
         <a class="{{ 'active' if 'headless_endpoint' in endpoint else '' }}" href="{{ url_for('headless_endpoint_library') }}">{{ _('nav.headless_endpoints') }}</a>
         <a class="{{ 'active' if 'firewall' in endpoint else '' }}" href="{{ url_for('firewall') }}">{{ _('nav.firewall') }}</a>
         <a class="{{ 'active' if endpoint in ('settings','update_networking_settings') else '' }}" href="{{ url_for('settings') }}">{{ _('nav.settings') }}</a>

@@ -8,7 +8,7 @@ import uuid
 import subprocess
 import threading
 import time
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -264,6 +264,82 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual("stopped", stopped.state)
         self.assertIn('socks_port="1080"', snapshot)
 
+    def test_spawn_wiring_reserved_before_start_and_failed_spawn_released(self):
+        self.manager.l2_segments = Mock()
+        links = [{'segment_id': str(uuid.uuid4()), 'interface': 'lab0'}]
+        original = self.backend.start
+        def start(instance_id, *args, **kwargs):
+            self.manager.l2_segments.reserve_instance.assert_called_once_with(instance_id, links)
+            return original(instance_id, *args, **kwargs)
+        self.backend.start = start
+        item = self.manager.create({'runtime_seconds': 30, 'source_ip': '198.51.100.10',
+            'user_id': 'test', 'wiring': links, 'system_start_enabled': False, 'parameters': {'socks_port': 1080}})
+        self.assertEqual(item.wiring, links)
+        self.manager.stop(item.id)
+        self.manager.l2_segments.reset_mock()
+        self.backend.start = Mock(side_effect=BackendError('launch failed'))
+        with self.assertRaises(BackendError):
+            self.manager.create({'runtime_seconds': 30, 'source_ip': '198.51.100.10',
+                'user_id': 'test', 'wiring': links, 'parameters': {'socks_port': 1080}})
+        self.manager.l2_segments.release_instance.assert_called_once()
+        failed_id = self.manager.l2_segments.release_instance.call_args.args[0]
+        self.assertEqual(self.manager.peek(failed_id).desired_state, 'stopped')
+
+    def test_proxy_launch_orders_wiring_then_system_start_then_program(self):
+        backend = NamespaceBackend()
+        events = []
+        instance = SimpleNamespace(id=str(uuid.uuid4()))
+        backend.system_start = Mock()
+        backend.system_start.manager.peek.return_value = instance
+        backend.system_start.check.side_effect = lambda *a, **k: events.append('00-start')
+        backend.wiring = Mock()
+        backend.wiring.prepare_instance.side_effect = lambda *a, **k: events.append('wiring')
+        backend._instance_storage_properties = Mock(return_value=[])
+        backend._run = lambda *_args: events.append('program')
+        backend._launch_proxy(instance.id, SimpleNamespace(namespace='test'), self.template,
+                              '/bin/true', '', 'rw', '', False, 0)
+        self.assertEqual(events, ['wiring', '00-start', 'program'])
+        backend.wiring.prepare_instance.side_effect = BackendError('cannot connect')
+        events.clear()
+        with self.assertRaises(BackendError):
+            backend._launch_proxy(instance.id, SimpleNamespace(namespace='test'), self.template,
+                                  '/bin/true', '', 'rw', '', False, 0)
+        self.assertEqual(events, [])
+
+    def test_interrupted_spawn_recovers_reservation_once_not_after_user_detach(self):
+        self.manager.l2_segments = Mock()
+        links = [{'segment_id': str(uuid.uuid4()), 'interface': 'lab0'}]
+        item = self.manager.create({'runtime_seconds': 30, 'source_ip': '198.51.100.10',
+            'user_id': 'test', 'wiring': links, 'parameters': {'socks_port': 1080}})
+        path = self.manager._deployment_path(item.id)
+        document = json.loads(path.read_text())
+        document['wiring_reserved'] = False
+        path.write_text(json.dumps(document))
+        self.manager.l2_segments.reset_mock()
+        self.manager._recover(item)
+        self.manager.l2_segments.reserve_instance.assert_called_once_with(item.id, links)
+        self.assertTrue(json.loads(path.read_text())['wiring_reserved'])
+        self.manager.l2_segments.reset_mock()
+        item.recovery_after = 0
+        self.manager._recover(item)
+        self.manager.l2_segments.reserve_instance.assert_not_called()
+
+    def test_transport_instances_do_not_require_or_reserve_source_ip(self):
+        payload = {"runtime_seconds": 30, "user_id": "test-user", "parameters": {"socks_port": 1080},
+                   "network_ingress_driver": "unlimited-veth", "network_egress_driver": "none"}
+        first = self.manager.create(payload)
+        second = self.manager.create(payload)
+        self.assertNotEqual(first.id, second.id)
+        self.assertEqual("", first.source_ip)
+        self.assertEqual([], first.source_ips)
+        self.assertEqual("unlimited-veth", self.backend.last_network["ingress_driver"])
+        self.assertEqual("none", self.backend.last_network["egress_driver"])
+        with self.assertRaisesRegex(ConfigError, "Authorized veth"):
+            self.manager.attach_source(first.id, "192.0.2.10")
+        stored = json.loads(self.manager._deployment_path(first.id).read_text())
+        self.assertEqual("unlimited-veth", stored["start_options"]["ingress_driver"])
+        self.assertEqual("none", stored["start_options"]["egress_driver"])
+
     def test_instance_snapshot_never_calls_lifecycle_backend(self):
         item = self.manager.create({
             "runtime_seconds": 30, "source_ip": "198.51.100.10",
@@ -484,6 +560,21 @@ class RunnerTests(unittest.TestCase):
         }, selected_binary, selected_template, rootfs_path=rootfs)
         self.assertEqual("rootfs", item.filesystem_mode)
         self.assertEqual(str(rootfs), self.backend.last_network["rootfs_path"])
+
+    def test_program_uses_existing_lifecycle_and_persists_launch_contract(self):
+        rootfs = Path(self.temp.name) / 'program-root'
+        rootfs.mkdir()
+        config = rootfs / 'program.cfg'
+        config.write_text('# program\n')
+        program = {'application': 'router', 'argv': ['/usr/bin/sleep', 'infinity']}
+        item = self.manager.create({
+            'runtime_seconds': 30, 'user_id': 'test', 'filesystem_mode': 'rootfs',
+            'network_ingress_driver': 'none', 'network_egress_driver': 'none',
+        }, template_path=config, rootfs_path=rootfs, program=program)
+        self.assertEqual('router', item.application)
+        document = json.loads(self.manager._deployment_path(item.id).read_text())
+        self.assertEqual(program, document['start_options']['program'])
+        self.assertEqual(str(rootfs), document['start_options']['rootfs_path'])
 
     def test_create_records_network_bindings_and_passes_egress_policy(self):
         ingress_id = str(uuid.uuid4())
@@ -1497,59 +1588,28 @@ starttls_signatures = (
         self.assertTrue(ingress["implemented"])
         self.assertTrue(egress["implemented"])
         stick = library.create({
-            "kind": "egress", "name": "Return on ingress link",
-            "address_family": "dual", "driver": "on-a-stick",
-            "mode": "routed", "interface_name": "di0",
+            "kind": "egress", "name": "No egress",
+            "address_family": "dual", "driver": "none",
+            "mode": "routed", "interface_name": "",
         })
         self.assertTrue(stick["implemented"])
-        self.assertEqual("di0", stick["interface_name"])
-        tuntom = library.create({
-            "kind": "egress", "name": "VIA service link",
-            "address_family": "dual", "driver": "tuntom-via",
-            "mode": "routed", "interface_name": "do0",
-            "tuntom_socket": "/run/tuntom/via.sock",
-            "tuntom_build_id": "a" * 40 + "-release",
-            "tuntom_in_prefix": "proxy-in-", "tuntom_out_prefix": "proxy-out-",
-            "tuntom_admission": "immediate", "tuntom_mtu": 1400,
-        })
-        self.assertTrue(tuntom["implemented"])
-        self.assertEqual(1400, tuntom["tuntom_mtu"])
-        self.assertEqual(["ingress", "egress"], tuntom["consumes"])
-        self.assertEqual(
-            ["headless_endpoint_id"], tuntom["start_parameters"]
-        )
-        self.assertEqual(
-            tuntom["network_profile_id"],
-            library.get(tuntom["network_profile_id"], "ingress")["network_profile_id"],
-        )
-        tuntom_in = library.create({
-            "kind": "ingress", "name": "Encrypted ingress",
-            "address_family": "dual", "driver": "tuntom",
-            "selector": "source", "require_authorization": True,
-            "interface_name": "di0", "destination_cidrs": [],
-            "tuntom_build_id": "b" * 40 + "-release", "tuntom_mtu": 1400,
-        })
-        tuntom_out = library.create({
-            "kind": "egress", "name": "Encrypted egress",
-            "address_family": "dual", "driver": "tuntom",
-            "mode": "routed", "interface_name": "do0",
-            "tuntom_build_id": "b" * 40 + "-release", "tuntom_mtu": 1400,
-        })
-        self.assertEqual(["ingress"], tuntom_in["consumes"])
-        self.assertEqual(["egress"], tuntom_out["consumes"])
-        self.assertEqual(
-            ["tuntom_local_ip", "tuntom_peer_ip", "tuntom_peer_host", "tuntom_secret"],
-            tuntom_in["start_parameters"],
-        )
-        self.assertFalse(tuntom_in["implemented"])
-        self.assertFalse(tuntom_out["implemented"])
-        blackbox = library.create({
-            "kind": "egress", "name": "Blackbox return link",
-            "address_family": "dual", "driver": "blackbox-link",
-            "mode": "routed", "interface_name": "do0",
-        })
-        self.assertFalse(blackbox["implemented"])
-        self.assertEqual("blackbox-link", blackbox["driver"])
+        self.assertEqual("", stick["interface_name"])
+        for driver in ("tuntom", "tuntom-via", "blackbox-link", "on-a-stick"):
+            with self.subTest(driver=driver):
+                with self.assertRaisesRegex(BackendError, "retired"):
+                    library.create({"kind": "egress", "name": "Removed", "driver": driver})
+                with self.assertRaisesRegex(BackendError, "retired"):
+                    library.update(egress["network_profile_id"], {**egress, "driver": driver})
+        # Retired records remain readable/deletable, but cannot start a new run.
+        legacy = {
+            **egress, "driver": "blackbox-link",
+            "network_profile_id": str(uuid.uuid4()),
+        }
+        library._save([*library._load(), legacy])
+        stored = library.get(legacy["network_profile_id"])
+        self.assertTrue(stored["retired"])
+        self.assertFalse(stored["implemented"])
+        library.delete(legacy["network_profile_id"])
         design = library.create({
             "kind": "ingress", "name": "Destination design",
             "driver": "split-veth", "selector": "destination",
@@ -1572,7 +1632,7 @@ starttls_signatures = (
             })
         document = json.loads(Path(self.temp.name, "network-profiles.json").read_text())
         self.assertEqual(1, document["schema"])
-        self.assertEqual(8, len(document["profiles"]))
+        self.assertEqual(4, len(document["profiles"]))
         self.assertEqual(
             ingress["network_profile_id"],
             library.delete(ingress["network_profile_id"])["network_profile_id"],

@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import threading
 import time
 import uuid
@@ -21,7 +22,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, parse_qs
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from websockets.sync.server import ServerConnection, serve
@@ -41,10 +42,15 @@ from .test_drive import TestDriveManager
 from .instance_layout import ensure_type_link, prepare_layout, remove_type_link
 from .firewall import FirewallManager
 from .network_profiles import NetworkProfileLibrary
+from .l2_segments import L2Segments
+from .wiring import overlaps, bindings
 from .qemu_images import QemuImageLibrary
 from .appliance_exports import ApplianceExportLibrary
 from .headless_endpoints import HeadlessEndpointLibrary
 from .deployments import atomic_json, boot_id, acquire_runner_lock, notify_systemd
+from .microservices import Microservices, SystemdServices, ServiceError
+from .system_start import SystemStart
+from . import runtime_images
 
 
 @dataclass
@@ -72,6 +78,8 @@ class Instance:
     template_values: dict[str, str] = field(default_factory=dict)
     config_mode: str = "ro"
     runtime_profile_id: str = ""
+    application: str = 'smithproxy'
+    wiring: list[dict] = field(default_factory=list)
     cert_bundle_id: str = ""
     debug_unit: str = ""
     debug_address: str = ""
@@ -92,6 +100,7 @@ class Instance:
     ingress_network_profile_id: str = ""
     egress_network_profile_id: str = ""
     network_egress_driver: str = "split-veth"
+    network_ingress_driver: str = "authorized-veth"
     tuntom_build_id: str = ""
     headless_endpoint_id: str = ""
     filesystem_mode: str = "host"
@@ -101,6 +110,7 @@ class Instance:
     recovery_attempts: int = 0
     recovery_after: float = 0
     deadline_timer: str = ""
+    alias: str = ""
 
 
 @dataclass
@@ -134,11 +144,18 @@ class Manager:
         self.lock = threading.RLock()
         self.cli_sessions: dict[str, CliSession] = {}
         self.gdb_sessions: dict[str, Any] = {}
+        self.netns_sessions: dict[str, Any] = {}
+        self.microservices = None
+        self.system_start = None
+        self.l2_segments = None
         state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.runtime_index = prepare_layout(runtime_root, "managed")
         self.config_archive_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
 
     def _remove_runtime(self, instance_id: str) -> None:
+        if self.microservices:
+            self.microservices.stop_instance(instance_id)
+        self.close_netns_transport(instance_id)
         instance = self._load(instance_id)
         if instance and instance.deadline_timer and hasattr(self.backend, "cancel_deadline"):
             self.backend.cancel_deadline(instance_id, instance.deadline_timer)
@@ -177,6 +194,13 @@ class Manager:
             document = json.loads(self._deployment_path(instance.id).read_text())
             if document.get("schema") != 1:
                 raise BackendError("unsupported deployment manifest schema")
+            if not document.get('wiring_reserved', True):
+                if instance.wiring:
+                    if not self.l2_segments:
+                        raise BackendError('Wiring unavailable during recovery')
+                    self.l2_segments.reserve_instance(instance.id, instance.wiring)
+                document['wiring_reserved'] = True
+                atomic_json(self._deployment_path(instance.id), document)
             config = self.runtime_root / instance.id / "smithproxy.cfg"
             if not config.is_file():
                 raise BackendError("deployment workspace/config missing; refusing to regenerate it")
@@ -419,6 +443,91 @@ class Manager:
         """Read one last-reconciled instance without serializing on mutations."""
         return self._load(instance_id)
 
+    def location(self, instance_id: str) -> dict | None:
+        """Read-only host coordinates; never infer paths from unchecked input."""
+        if not uuid_is_valid(instance_id):
+            instance_id = Manager.resolve_alias(self, instance_id)
+            if not instance_id:
+                return None
+        item = self.peek(instance_id)
+        if not item:
+            return None
+        work = self.runtime_root / item.id
+        namespace_path = f"/run/netns/{item.namespace}" if item.namespace else ""
+        transport_namespace = ""
+        if getattr(item, "network_ingress_driver", "authorized-veth") == "unlimited-veth" and hasattr(self.backend, "ingress_allocation"):
+            link = self.backend.ingress_allocation(item.id)
+            if link.topology == "unlimited-veth":
+                transport_namespace = link.namespace
+        transport_path = f"/run/netns/{transport_namespace}" if transport_namespace else ""
+        # Installation staging is separate from the appliance-writable work
+        # tree. Lookup never creates directories or enables script execution.
+        microservices = self.runtime_root.parent / "microservices" / item.id
+        installation_exists = (
+            microservices.is_dir() and not microservices.is_symlink()
+            and not microservices.parent.is_symlink()
+        )
+        supervisor = getattr(self, 'microservices', None)
+        enabled = bool(supervisor and getattr(item, 'filesystem_mode', '') == 'rootfs')
+        return {
+            "id": item.id, "state": item.state, "origin": socket.gethostname(),
+            "alias": getattr(item, "alias", ""),
+            "namespace": item.namespace, "namespace_path": namespace_path,
+            "namespace_exists": bool(namespace_path and Path(namespace_path).exists()),
+            "work_dir": str(work), "work_dir_exists": work.is_dir(),
+            "unit": item.unit, "slice": item.slice_unit,
+            "transport_namespace": transport_namespace,
+            "transport_namespace_path": transport_path,
+            "transport_namespace_exists": bool(transport_path and Path(transport_path).exists()),
+            "microservice_contract_version": 3,
+            "microservices_dir": str(microservices),
+            "microservices_dir_exists": installation_exists,
+            "microservice_mode": "managed" if enabled else "installation_only",
+            "microservice_execution_enabled": enabled,
+            "microservice_rootfs": ({key: supervisor.backend.manifest.get(key) for key in
+                ('schema', 'sha256', 'architecture', 'libc', 'runtime_uid', 'runtime_gid')}
+                if supervisor else None),
+            "microservice_scan_interval_seconds": supervisor.interval if supervisor else None,
+            "microservice_capabilities": {
+                "installation": installation_exists,
+                "supervision": enabled, "status": bool(supervisor), "stop": bool(supervisor),
+            },
+        }
+
+    def resolve_alias(self, value: str) -> str | None:
+        if not isinstance(value, str) or not re.fullmatch(r"[a-z][a-z0-9-]{0,62}", value):
+            return None
+        matches = [item.id for item in self.snapshot() if item.alias == value]
+        return matches[0] if len(matches) == 1 else None
+
+    def check_microservices(self, instance_id: str) -> dict:
+        if self.microservices:
+            return self.microservices.check_instance(instance_id)
+        with self.lock:
+            instance = self.peek(instance_id)
+            if not instance:
+                raise ServiceError('instance_not_found', 404)
+            if not self.system_start:
+                raise ServiceError('microservices_unavailable')
+            return {'instance_id': instance_id, 'state': 'checked',
+                    'system_start': self.system_start.check(instance),
+                    'external_microservices': 'unavailable'}
+
+    def set_alias(self, instance_id: str, alias: str) -> Instance | None:
+        if not isinstance(alias, str) or (alias and (
+            not re.fullmatch(r"[a-z][a-z0-9-]{0,62}", alias) or uuid_is_valid(alias)
+        )):
+            raise ConfigError("alias must be 1–63 lowercase letters, digits or hyphens, starting with a letter; empty clears it")
+        with self.lock:
+            item = self._load(instance_id)
+            if not item:
+                return None
+            if alias and any(other.alias == alias and other.id != item.id for other in self.snapshot()):
+                raise ConfigError("alias already belongs to another instance")
+            item.alias = alias
+            self._save(item)
+            return item
+
     def reconcile_orphans(self) -> list[str]:
         """Adopt unrecorded portal-owned units as visible orphaned instances."""
         with self.lock:
@@ -490,7 +599,7 @@ class Manager:
                template_path: Path | None = None, assets_dir: Path | None = None,
                cert_bundle_dir: Path | None = None,
                work_installer: Callable[[Path], None] | None = None,
-               rootfs_path: Path | None = None) -> Instance:
+               rootfs_path: Path | None = None, program: dict | None = None) -> Instance:
         if not isinstance(payload, dict):
             raise ConfigError("request body must be an object")
         allowed = {
@@ -502,6 +611,7 @@ class Manager:
             "persistent",
             "ingress_network_profile_id", "egress_network_profile_id",
             "network_egress_mode", "network_sas_interface", "network_egress_driver",
+            "network_ingress_driver",
             "network_tuntom_socket", "network_tuntom_adapter",
             "network_tuntom_binary",
             "network_tuntom_build_id",
@@ -510,10 +620,14 @@ class Manager:
             "network_tuntom_tunnel_id", "headless_endpoint_id",
             "network_runtime",
             "filesystem_mode",
+            'wiring', 'system_start_enabled',
         }
         unknown = set(payload) - allowed
         if unknown:
             raise ConfigError(f"unsupported fields: {', '.join(sorted(unknown))}")
+        requested_wiring = bindings(payload.get('wiring', []))
+        if requested_wiring and not self.l2_segments:
+            raise ConfigError('Wiring is unavailable')
         runtime_profile_id = str(payload.get("runtime_profile_id", ""))
         runtime = payload.get("runtime_seconds")
         if isinstance(runtime, bool) or not isinstance(runtime, int):
@@ -530,9 +644,13 @@ class Manager:
             for key, value in network_runtime.items()
         ):
             raise ConfigError("network_runtime must be an object of string values")
-        source_ip = str(payload.get("source_ip", "")).strip()
+        network_ingress_driver = str(payload.get("network_ingress_driver", "authorized-veth"))
+        if network_ingress_driver not in {"authorized-veth", "unlimited-veth", "none"}:
+            raise ConfigError("network_ingress_driver must be authorized-veth, unlimited-veth or none")
+        source_ip = str(payload.get("source_ip", "")).strip() if network_ingress_driver == "authorized-veth" else ""
         try:
-            source_ip = str(ipaddress.ip_address(source_ip))
+            if source_ip or network_ingress_driver == "authorized-veth":
+                source_ip = str(ipaddress.ip_address(source_ip))
         except ValueError as exc:
             raise ConfigError("source_ip must be an IPv4 or IPv6 address") from exc
         build_id = str(payload.get("build_id", "active"))
@@ -554,9 +672,9 @@ class Manager:
         if network_egress_mode not in {"", "masquerade", "routed"}:
             raise ConfigError("network_egress_mode must be masquerade or routed")
         network_egress_driver = str(payload.get("network_egress_driver", "split-veth"))
-        if network_egress_driver not in {"split-veth", "on-a-stick", "tuntom-via"}:
+        if network_egress_driver not in {"split-veth", "veth-out", "on-a-stick", "tuntom-via", "none"}:
             raise ConfigError(
-                "network_egress_driver must be split-veth, on-a-stick, or tuntom-via"
+                "network_egress_driver must be veth-out or none (legacy stored drivers are also accepted)"
             )
         network_sas_interface = str(payload.get("network_sas_interface", ""))
         if network_sas_interface and not re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", network_sas_interface):
@@ -625,6 +743,9 @@ class Manager:
         if not isinstance(auto_restart, bool):
             raise ConfigError("auto_restart must be a boolean")
         persistent = payload.get("persistent", False)
+        system_start_enabled = payload.get('system_start_enabled', True)
+        if not isinstance(system_start_enabled, bool):
+            raise ConfigError('system_start_enabled must be boolean')
         if not isinstance(persistent, bool):
             raise ConfigError("persistent must be a boolean")
         user_id = str(payload.get("user_id", "")).strip()
@@ -683,23 +804,25 @@ class Manager:
                 r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", hostname
             )):
                 raise ConfigError(f"{label} must be a valid hostname")
-        if not source_ip:
+        if not source_ip and network_ingress_driver == "authorized-veth":
             raise ConfigError("source_ip is required")
         pool = self.sources()
-        if pool and source_ip not in pool:
+        if source_ip and pool and source_ip not in pool:
             raise ConfigError("source_ip is not present in the configured pool")
         with self.lock:
             active = sum(i.desired_state == "running" or i.state in {"starting", "running", "orphaned"}
                          for i in self.list())
             if active >= self.max_instances:
                 raise ConfigError("instance limit reached")
-            if any(source_ip in (i.source_ips or [i.source_ip])
+            if source_ip and any(source_ip in (i.source_ips or [i.source_ip])
                    and (i.desired_state == "running" or i.state in {"starting", "running", "orphaned"})
                    for i in self.list()):
                 raise ConfigError("source_ip already has an active instance")
             instance_id = str(uuid.uuid4())
             runtime_dir = self.runtime_root / instance_id
             runtime_dir.mkdir(mode=0o700)
+            if self.microservices:
+                self.microservices.provision(instance_id)
             ensure_type_link(self.runtime_root, "managed", instance_id, runtime_dir)
             config_path = runtime_dir / "smithproxy.cfg"
             try:
@@ -741,7 +864,7 @@ class Manager:
                 # read-only mode is enforced only after the final content is
                 # installed and again by the transient systemd mount policy.
                 os.chmod(config_path, 0o600)
-                if binary_path and hasattr(self.backend, "native_save"):
+                if binary_path and not program and hasattr(self.backend, "native_save"):
                     # Validate the exact post-overlay runtime config before
                     # allocating the persistent namespace/routing. Validate a
                     # copy because Smithproxy's `save config` mutates its file.
@@ -785,6 +908,7 @@ class Manager:
                     hard_runtime_seconds=0 if runtime == 0 else self.max_total_runtime,
                     egress_mode=network_egress_mode,
                     egress_driver=network_egress_driver,
+                    ingress_driver=network_ingress_driver,
                     sas_interface=network_sas_interface,
                     tuntom_socket=network_tuntom_socket,
                     tuntom_binary=network_tuntom_binary,
@@ -798,6 +922,8 @@ class Manager:
                     tuntom_tunnel_id=network_tuntom_tunnel_id,
                     rootfs_path=str(rootfs_path) if rootfs_path else "",
                 )
+                if program:
+                    start_options['program'] = program
             except Exception:
                 shutil.rmtree(runtime_dir, ignore_errors=True)
                 remove_type_link(self.runtime_root, "managed", instance_id)
@@ -813,20 +939,22 @@ class Manager:
                     self.backend, "slice_name",
                     lambda value: f"capture-zone-slice-{value}.slice",
                 )(instance_id),
-                cli_port=parameters.get("cli_port", 50000),
+                cli_port=0 if program else parameters.get("cli_port", 50000),
                 build_id=build_id,
                 config_id=config_id,
                 user_id=user_id,
                 rewrite_sni=rewrite_sni,
                 rewrite_sni_to=rewrite_sni_to,
-                profile=profile,
+                profile=program['application'] if program else profile,
                 template_values=template_values,
                 config_mode=config_mode,
                 runtime_profile_id=runtime_profile_id,
+                application=program['application'] if program else 'smithproxy',
+                wiring=requested_wiring,
                 cert_bundle_id=cert_bundle_id,
                 auto_restart=auto_restart,
                 persistent=persistent,
-                source_ips=[source_ip],
+                source_ips=[source_ip] if source_ip else [],
                 socks_port=parameters.get("socks_port", 1080),
                 http_port=parameters.get("http_port", 3128),
                 tls_port=parameters.get("tls_port", 50443),
@@ -834,6 +962,7 @@ class Manager:
                 ingress_network_profile_id=ingress_network_profile_id,
                 egress_network_profile_id=egress_network_profile_id,
                 network_egress_driver=network_egress_driver,
+                network_ingress_driver=network_ingress_driver,
                 tuntom_build_id=network_tuntom_build_id,
                 headless_endpoint_id=headless_endpoint_id,
                 filesystem_mode=filesystem_mode,
@@ -841,10 +970,19 @@ class Manager:
                 deployment_pending=True,
             )
             atomic_json(self._deployment_path(instance_id), {
-                "schema": 1, "start_options": start_options,
+                "schema": 1, "start_options": start_options, 'wiring_reserved': False,
             })
             self._save(instance)
+            backend_started = False
             try:
+                if requested_wiring:
+                    self.l2_segments.reserve_instance(instance_id, requested_wiring)
+                atomic_json(self._deployment_path(instance_id), {
+                    'schema': 1, 'start_options': start_options, 'wiring_reserved': True,
+                })
+                if self.system_start:
+                    self.system_start.configure(instance_id, system_start_enabled)
+                backend_started = True
                 instance.unit = self.backend.start(instance_id, config_path, runtime, **start_options)
                 allocation = getattr(self.backend, "allocation", lambda _id: None)(instance_id)
                 instance.namespace = getattr(allocation, "namespace", "")
@@ -856,7 +994,10 @@ class Manager:
                 # turn a rejected spawn into a running deployment.
                 instance.desired_state = "stopped"
                 self._save(instance)
-                self.backend.stop(instance.unit)
+                if backend_started:
+                    self.backend.stop(instance.unit)
+                if requested_wiring:
+                    self.l2_segments.release_instance(instance_id)
                 instance.state = "failed"
                 instance.resources_cleaned = True
                 instance.stopped_at = datetime.now(timezone.utc).isoformat()
@@ -874,6 +1015,8 @@ class Manager:
             instance = self._load(instance_id)
             if not instance:
                 raise ConfigError("instance not found")
+            if instance.network_ingress_driver != "authorized-veth":
+                raise ConfigError("source attachment requires Authorized veth")
             instance = self._reconcile(instance)
             if instance.state not in {"starting", "running", "orphaned"}:
                 raise ConfigError("source can only be attached to an active instance")
@@ -1041,6 +1184,26 @@ class Manager:
             raise ConfigError("instance is not running")
         return self.backend.open_cli(instance.id, instance.cli_port)
 
+    def open_netns_transport(self, instance_id: str):
+        from .netns_shell import open_shell
+        with self.lock:
+            instance = self.get(instance_id)
+            if not instance or instance.state != 'running' or not self._member_pid(instance):
+                raise ConfigError('instance is not running')
+            self.close_netns_transport(instance_id)
+            transport = open_shell(instance.id, instance.namespace)
+            self.netns_sessions[instance_id] = transport
+            return transport
+
+    def close_netns_transport(self, instance_id: str, transport=None) -> None:
+        with self.lock:
+            current = self.netns_sessions.get(instance_id)
+            target = transport or current
+            if target:
+                target.close()
+            if current is target:
+                self.netns_sessions.pop(instance_id, None)
+
     def open_gdb_transport(self, instance_id: str, binary: Path):
         with self.lock:
             instance = self.get(instance_id)
@@ -1082,6 +1245,7 @@ class Manager:
 
     def stop(self, instance_id: str) -> Instance | None:
         with self.lock:
+            self.close_netns_transport(instance_id)
             for session_id, session in list(self.cli_sessions.items()):
                 if session.instance_id == instance_id:
                     session.connection.close()
@@ -1229,6 +1393,8 @@ class Manager:
                 return None
             self._config_path(instance.id).unlink(missing_ok=True)
             self._deployment_path(instance.id).unlink(missing_ok=True)
+            if self.microservices:
+                self.microservices.mark_removed(instance.id)
             return instance
 
     def _archive_stopped_config(self, instance: Instance) -> Path:
@@ -1297,6 +1463,8 @@ class Manager:
                 self._state_path(instance.id).unlink(missing_ok=True)
                 self._config_path(instance.id).unlink(missing_ok=True)
                 self._deployment_path(instance.id).unlink(missing_ok=True)
+                if self.microservices:
+                    self.microservices.mark_removed(instance.id)
                 cleaned.append({"instance_id": instance.id, "config_archive": str(archive)})
         return cleaned
 
@@ -1344,6 +1512,8 @@ class Manager:
             self.cli_sessions.clear()
             for instance_id, transport in list(self.gdb_sessions.items()):
                 self.close_gdb_transport(instance_id, transport)
+            for instance_id in list(self.netns_sessions):
+                self.close_netns_transport(instance_id)
             if not stop_instances:
                 return
             for instance in self.list():
@@ -1442,6 +1612,29 @@ def openapi_document() -> dict[str, Any]:
                 "get": {"summary": "Read one runtime profile and its usage"},
                 "put": {"summary": "Update a binary and configuration binding"},
                 "delete": {"summary": "Delete an unused runtime profile"},
+            },
+            "/v1/l2-segments": {
+                "get": {"summary": "List isolated virtual cables and switches"},
+                "post": {"summary": "Queue segment creation; returns a task (202)"},
+            },
+            "/v1/l2-segments/{id}": {
+                "get": {"summary": "Read segment reservations and observed status"},
+                "delete": {"summary": "Queue deletion of an empty segment"},
+            },
+            "/v1/l2-segments/{id}/endpoints": {
+                "post": {"summary": "Queue a managed instance veth reservation and attachment"},
+            },
+            "/v1/l2-segments/{id}/endpoints/{endpoint_id}": {
+                "delete": {"summary": "Queue disconnection and reservation release"},
+            },
+            '/v1/l2-segments/{id}/endpoints/{endpoint_id}/addressing': {
+                'post': {'summary': 'Queue desired port addressing update and per-instance 00-start check'},
+            },
+            '/v1/l2-segments/addressing': {
+                'get': {'summary': 'Wiring IPv4/IPv6 inventory and prefix tree; no discovery'},
+            },
+            '/v1/l2-segments/addressing/preview': {
+                'post': {'summary': 'Read-only overlap warnings for proposed addresses'},
             },
             "/v1/network-profiles": {
                 "get": {"summary": "List ingress and egress network profiles"},
@@ -1542,6 +1735,33 @@ def openapi_document() -> dict[str, Any]:
             "/v1/instances/{id}/diagnostics": {
                 "get": {"summary": "Read execution model, paths and namespace details"},
             },
+            "/v1/instances/{id}/location": {
+                "get": {"summary": "Read host coordinates for an exact UUID or unique alias; returns canonical UUID"},
+            },
+            "/v1/instances/{id}/alias": {
+                "post": {"summary": "Set unique alias using {alias: name}; empty alias clears it (UUID required)"},
+            },
+            "/v1/instances/{id}/microservices/{prefix}": {
+                "get": {"summary": "V3 status; optional run_id query selects an exact historical run"},
+            },
+            "/v1/instances/{id}/microservices/check": {
+                "post": {"summary": "Queue a deduplicated check of this instance only (202)"},
+            },
+            "/v1/instances/{id}/microservices/00/configure": {
+                "post": {"summary": "Queue persistent 00-start opt-out/in using {enabled: boolean}"},
+            },
+            "/v1/test-drives/{id}/microservices/00": {
+                "get": {"summary": "Read reserved 00-start status for a Test Drive"},
+            },
+            "/v1/test-drives/{id}/microservices/check": {
+                "post": {"summary": "Queue this Test Drive's system-service check"},
+            },
+            "/v1/test-drives/{id}/microservices/00/configure": {
+                "post": {"summary": "Queue Test Drive 00-start opt-out/in using {enabled: boolean}"},
+            },
+            "/v1/instances/{id}/microservices/{prefix}/stop": {
+                "post": {"summary": "V3 verified stop: contract_version=3, owner and run_id required; withdraw registration first"},
+            },
             "/v1/instances/{id}/debug": {
                 "post": {"summary": "Attach a scoped gdbserver helper to a Debug build"},
                 "delete": {"summary": "Stop the gdbserver helper"},
@@ -1632,6 +1852,7 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     test_drives: TestDriveManager | None = None,
                     firewall: FirewallManager | None = None,
                     network_profiles: NetworkProfileLibrary | None = None,
+                    l2_segments: L2Segments | None = None,
                     tuntom_builder: TuntomBuilder | None = None,
                     qemu_images: QemuImageLibrary | None = None,
                     appliance_exports: ApplianceExportLibrary | None = None,
@@ -1725,6 +1946,8 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
 
         for instance in instances:
             for source in (instance.source_ips or [instance.source_ip or "unknown"]):
+                if instance.network_ingress_driver != "authorized-veth":
+                    continue
                 topology_entry(source)["active"] = True
         for source, entry in entries.items():
             try:
@@ -1895,6 +2118,34 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
         if driver == "tuntom-via":
             tuntom_builder.resolve_adapter(build_id)
 
+    def profile_wiring(payload, current=None):
+        selected = bindings(payload.get('wiring', (current or {}).get('wiring', [])), profile=True)
+        for binding in selected:
+            if not l2_segments:
+                raise BackendError('Wiring unavailable')
+            l2_segments.get(binding['segment_id'])
+        return selected
+
+    def prepare_profile_image(payload, current=None):
+        selected = runtime_images.variant(payload.get('rootfs_variant', (current or {}).get('rootfs_variant', 'barebone')))
+        application = payload.get('application', (current or {}).get('application', 'smithproxy'))
+        if current and current.get('rootfs_image') and not payload.get('refresh_rootfs', False):
+            unchanged = (selected == current.get('rootfs_variant', 'barebone')
+                         and application == current.get('application', 'smithproxy')
+                         and payload.get('build_id', current.get('build_id', '')) == current.get('build_id', '')
+                         and payload.get('program_settings', current.get('program_settings', {})) == current.get('program_settings', {}))
+            cached = runtime_profiles.path.parent / 'runtime-images' / current['rootfs_image']
+            if unchanged and (cached / 'runtime-image.json').is_file():
+                return cached
+        base = None
+        if application == 'smithproxy':
+            build_id = str(payload.get('build_id', (current or {}).get('build_id', '')))
+            builder.prepare_rootfs(build_id)
+            base = builder.resolve_rootfs(build_id)
+        return runtime_images.prepare(runtime_profiles.path.parent / 'runtime-images', selected,
+            application='' if application == 'smithproxy' else application,
+            settings=payload.get('program_settings', {}), base=base)
+
     def profile_view(item: dict, *, artifacts: list[dict] | None = None,
                      instances: list[Instance] | None = None) -> dict:
         result = dict(item)
@@ -1903,6 +2154,13 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
         )
         result["available"] = True
         result["newer_build_available"] = False
+        if item.get('application', 'smithproxy') != 'smithproxy':
+            image = item.get('rootfs_image', '')
+            ready = bool(image and (runtime_profiles.path.parent / 'runtime-images' / image / 'runtime-image.json').is_file())
+            result.update(available=ready, runtime_supported=True, rootfs_ready=ready,
+                          usage={'instances': [{'id': i.id, 'state': i.state} for i in manager.snapshot()
+                                               if i.runtime_profile_id == item['profile_id']]})
+            return result
         if config_library:
             try:
                 config = config_library.get(item["config_id"])
@@ -2382,6 +2640,23 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
             if not runtime_profiles:
                 raise ConfigError("runtime profiles are unavailable")
             binding = runtime_profiles.get(runtime_profile_id)
+            if binding.get('application', 'smithproxy') != 'smithproxy':
+                image_id = binding.get('rootfs_image', '')
+                if not re.fullmatch(r'[0-9a-f]{64}', image_id):
+                    raise ConfigError('save the program profile to prepare its rootfs')
+                root = runtime_profiles.path.parent / 'runtime-images' / image_id
+                contract = json.loads((root / 'runtime-image.json').read_text())
+                effective_payload.update(
+                    runtime_seconds=0 if binding['ttl_seconds'] is None else binding['ttl_seconds'],
+                    filesystem_mode='rootfs', network_ingress_driver='none', network_egress_driver='none',
+                    auto_restart=binding['auto_restart'], build_id=image_id, config_id='',
+                    wiring=payload.get('wiring', binding.get('wiring', [])),
+                )
+                return manager.create(effective_payload, template_path=root / 'program.cfg', rootfs_path=root,
+                    work_installer=lambda destination: runtime_profiles.install_work_files(runtime_profile_id, destination),
+                    program={'application': binding['application'], 'argv': contract['argv']})
+            if 'wiring' not in payload:
+                effective_payload['wiring'] = binding.get('wiring', [])
             effective_payload["build_id"] = binding["build_id"]
             effective_payload["config_id"] = binding["config_id"]
             effective_payload["cert_bundle_id"] = binding.get("cert_bundle_id", "")
@@ -2405,6 +2680,8 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     raise ConfigError(
                         f"{kind} network profile uses a driver/selector not implemented by this runner"
                     )
+                if kind == "ingress":
+                    effective_payload["network_ingress_driver"] = selected_network["driver"]
                 if kind == "egress":
                     effective_payload["network_egress_mode"] = selected_network["mode"]
                     effective_payload["network_sas_interface"] = selected_network["host_interface"]
@@ -2412,9 +2689,8 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     for field in (
                         "socket", "build_id", "in_prefix", "out_prefix", "admission", "mtu",
                     ):
-                        effective_payload[f"network_tuntom_{field}"] = selected_network[
-                            f"tuntom_{field}"
-                        ]
+                        if f"tuntom_{field}" in selected_network:
+                            effective_payload[f"network_tuntom_{field}"] = selected_network[f"tuntom_{field}"]
                     if selected_network["driver"] == "tuntom-via":
                         if not tuntom_builder:
                             raise ConfigError("tuntom build library is unavailable")
@@ -2479,6 +2755,13 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
             # without blocking the runner HTTP thread.
             builder.prepare_rootfs(requested_build)
             rootfs = builder.resolve_rootfs(requested_build)
+            if runtime_profile_id and binding.get('rootfs_image'):
+                image_id = binding['rootfs_image']
+                if not re.fullmatch(r'[0-9a-f]{64}', image_id):
+                    raise ConfigError('invalid pinned runtime image')
+                rootfs = runtime_profiles.path.parent / 'runtime-images' / image_id
+                if not (rootfs / 'runtime-image.json').is_file():
+                    raise ConfigError('pinned runtime image is missing; refusing host fallback')
         if requested_config == "active" and config_library:
             raise ConfigError(
                 "active raw configuration cannot be spawned; select an approved native config"
@@ -2688,6 +2971,63 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
         def _path(self) -> list[str]:
             return [part for part in urlsplit(self.path).path.split("/") if part]
 
+        def _l2_request(self, method: str) -> bool:
+            parts = self._path()
+            if parts[:2] != ["v1", "l2-segments"]:
+                return False
+            try:
+                if not l2_segments:
+                    raise BackendError("L2 segments are unavailable")
+                if method == "GET":
+                    if len(parts) == 2:
+                        self._json(HTTPStatus.OK, {"segments": l2_segments.list()})
+                    elif parts == ['v1', 'l2-segments', 'addressing']:
+                        self._json(HTTPStatus.OK, l2_segments.inventory())
+                    elif len(parts) == 3:
+                        self._json(HTTPStatus.OK, l2_segments.get(parts[2]))
+                    else:
+                        self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+                    return True
+                payload = {}
+                if method == "POST":
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if not 0 < length <= max_body:
+                        raise BackendError("invalid L2 request size")
+                    payload = json.loads(self.rfile.read(length))
+                    if not isinstance(payload, dict):
+                        raise BackendError("L2 request must be an object")
+                if method == 'POST' and parts == ['v1', 'l2-segments', 'addressing', 'preview']:
+                    warnings = overlaps(l2_segments.inventory()['entries'], payload.get('addresses', []),
+                                        payload.get('segment_id', ''), payload.get('endpoint_id', ''))
+                    self._json(HTTPStatus.OK, {'warnings': warnings})
+                    return True
+                if method == "POST" and len(parts) == 2:
+                    operation = lambda: l2_segments.create(payload)
+                elif method == "POST" and len(parts) == 4 and parts[3] == "endpoints":
+                    operation = lambda: l2_segments.attach(parts[2], payload)
+                elif method == 'POST' and len(parts) == 6 and parts[3] == 'endpoints' and parts[5] == 'addressing':
+                    def operation():
+                        value = l2_segments.configure_addressing(parts[2], parts[4], payload)
+                        endpoint = next(ep for ep in l2_segments.get(parts[2])['endpoints'] if ep['id'] == parts[4])
+                        # Persist first; failures retain the operator's edits and surface on the task.
+                        return {'addressing': value, 'check': manager.check_microservices(endpoint['instance_id'])}
+                elif method == "DELETE" and len(parts) == 3:
+                    operation = lambda: l2_segments.delete(parts[2])
+                elif method == "DELETE" and len(parts) == 5 and parts[3] == "endpoints":
+                    operation = lambda: l2_segments.detach(parts[2], parts[4])
+                else:
+                    self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+                    return True
+                canonical = json.dumps([method, parts, payload], sort_keys=True)
+                self._json(HTTPStatus.ACCEPTED, submit_task(
+                    "l2-segment", f"L2 {method} {'/'.join(parts[2:]) or payload.get('name', '')}",
+                    "l2:" + hashlib.sha256(canonical.encode()).hexdigest(),
+                    "l2-segments", operation,
+                ))
+            except (BackendError, ValueError, OSError) as exc:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return True
+
         def do_GET(self) -> None:
             parts = self._path()
             if parts == ["healthz"]:
@@ -2695,6 +3035,33 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                 return
             if not self._authorized():
                 self._json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+                return
+            if self._l2_request("GET"):
+                return
+            if len(parts) == 5 and parts[:2] == ['v1', 'test-drives'] and parts[3:] == ['microservices', '00']:
+                try:
+                    if not test_drives or not test_drives.system_start or not uuid_is_valid(parts[2]) or not test_drives.peek(parts[2]):
+                        raise ServiceError('instance_not_found', 404)
+                    self._json(HTTPStatus.OK, test_drives.system_start.status(parts[2]))
+                except (BackendError, OSError, ValueError) as exc:
+                    self._json(getattr(exc, 'http', 503), {'error': str(exc)})
+                return
+            if len(parts) == 5 and parts[:2] == ['v1', 'instances'] and parts[3] == 'microservices':
+                try:
+                    if parts[4] == '00' and manager.system_start:
+                        if not uuid_is_valid(parts[2]) or not manager.peek(parts[2]):
+                            raise ServiceError('instance_not_found', 404)
+                        self._json(HTTPStatus.OK, manager.system_start.status(parts[2]))
+                        return
+                    if not manager.microservices:
+                        raise ServiceError('microservices_unavailable')
+                    query = parse_qs(urlsplit(self.path).query)
+                    value = manager.microservices.status(parts[2], parts[4], query.get('run_id', [None])[0])
+                    self._json(HTTPStatus.OK, value)
+                except (ServiceError, OSError, ValueError) as exc:
+                    self._json(getattr(exc, 'http', 503), {'contract_version': 3,
+                        'error': getattr(exc, 'error', 'state_unknown'), 'state': 'unknown',
+                        'process_group_empty': None})
                 return
             if parts == ["v1", "openapi.json"]:
                 self._json(HTTPStatus.OK, openapi_document())
@@ -2890,6 +3257,9 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
             elif len(parts) == 3 and parts[:2] == ["v1", "instances"]:
                 item = manager.peek(parts[2])
                 self._json(HTTPStatus.OK, asdict(item)) if item else self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+            elif len(parts) == 4 and parts[:2] == ["v1", "instances"] and parts[3] == "location":
+                result = manager.location(parts[2])
+                self._json(HTTPStatus.OK, result) if result else self._json(HTTPStatus.NOT_FOUND, {"error": "instance not found"})
             elif len(parts) == 4 and parts[:2] == ["v1", "instances"] and parts[3] == "diagnostics":
                 item = manager.peek(parts[2])
                 if not item:
@@ -2936,6 +3306,7 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                         network_bindings[kind] = selected
                     self._json(HTTPStatus.OK, {
                         "instance": asdict(item),
+                        "system_start": manager.system_start.status(item.id) if manager.system_start else None,
                         "execution": {
                             "model": "systemd Slice + transient members + network namespace",
                             "slice_unit": item.slice_unit,
@@ -3129,6 +3500,16 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     if not isinstance(auto_restart, bool):
                         raise ConfigError("auto_restart must be a boolean")
                     current_profile = runtime_profiles.get(parts[2])
+                    if current_profile.get('application', 'smithproxy') != 'smithproxy':
+                        payload.setdefault('application', current_profile['application'])
+                        payload.setdefault('rootfs_variant', current_profile.get('rootfs_variant', 'barebone'))
+                        payload['wiring'] = profile_wiring(payload, current_profile)
+                        image = prepare_profile_image(payload, current_profile)
+                        item = runtime_profiles.save_program(payload, parts[2], image_id=image.name)
+                        self._json(HTTPStatus.OK, profile_view(item))
+                        return
+                    if payload.get('application', 'smithproxy') != 'smithproxy':
+                        raise ConfigError('profile application type cannot be changed')
                     filesystem_mode = str(payload.get(
                         "filesystem_mode", current_profile.get("filesystem_mode", "host")
                     ))
@@ -3152,12 +3533,15 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                         if not cert_library:
                             raise ConfigError("certificate bundles are unavailable")
                         cert_library.get(cert_bundle_id)
+                    image = prepare_profile_image(payload, current_profile) if filesystem_mode == 'rootfs' else None
                     item = runtime_profiles.update(
                         parts[2], str(payload.get("name", "")), build_id,
                         config_id, cert_bundle_id,
                         auto_restart, ttl_seconds,
                         ingress_network_id, egress_network_id,
-                        filesystem_mode,
+                        filesystem_mode, wiring=profile_wiring(payload, current_profile),
+                        rootfs_variant=payload.get('rootfs_variant', current_profile.get('rootfs_variant', 'barebone')),
+                        rootfs_image=image.name if image else '',
                     )
                     self._json(HTTPStatus.OK, profile_view(item))
                 except (ConfigError, BackendError, ValueError, TypeError, json.JSONDecodeError) as exc:
@@ -3212,7 +3596,80 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
             if not self._authorized():
                 self._json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
                 return
+            if self._l2_request("POST"):
+                return
             parts = self._path()
+            if len(parts) == 5 and parts[0] == 'v1' and parts[1] in {'instances', 'test-drives'} and parts[3:] == ['microservices', 'check']:
+                try:
+                    owner = manager if parts[1] == 'instances' else test_drives
+                    if not owner or (not owner.system_start and not getattr(owner, 'microservices', None)):
+                        raise ServiceError('microservices_unavailable')
+                    instance_id = parts[2]
+                    if not uuid_is_valid(instance_id) or not owner.peek(instance_id):
+                        raise ServiceError('instance_not_found', 404)
+                    self._json(HTTPStatus.ACCEPTED, submit_task(
+                        'microservices-check', f'Check microservices {instance_id[:8]}',
+                        f'microservices-check:{parts[1]}:{instance_id}',
+                        f"{'instance' if parts[1] == 'instances' else 'test-drive'}:{instance_id}",
+                        lambda: owner.check_microservices(instance_id),
+                    ))
+                except BackendError as exc:
+                    self._json(getattr(exc, 'http', 503), {'error': str(exc)})
+                return
+            if len(parts) == 6 and parts[0] == 'v1' and parts[1] in {'instances', 'test-drives'} and parts[3:] == ['microservices', '00', 'configure']:
+                try:
+                    owner = manager if parts[1] == 'instances' else test_drives
+                    if not owner or not owner.system_start:
+                        raise ServiceError('microservices_unavailable')
+                    if not uuid_is_valid(parts[2]) or not owner.peek(parts[2]):
+                        raise ServiceError('instance_not_found', 404)
+                    length = int(self.headers.get('Content-Length', '0'))
+                    if not 0 < length <= 1024:
+                        raise ServiceError('invalid_request', 400)
+                    payload = json.loads(self.rfile.read(length))
+                    if not isinstance(payload, dict) or set(payload) != {'enabled'} or not isinstance(payload['enabled'], bool):
+                        raise ServiceError('invalid_request', 400)
+                    self._json(HTTPStatus.ACCEPTED, submit_task(
+                        'system-start-configure', f'00-start {parts[2][:8]}',
+                        f"system-start:{parts[1]}:{parts[2]}:{payload['enabled']}",
+                        f"{'instance' if parts[1] == 'instances' else 'test-drive'}:{parts[2]}",
+                        lambda: owner.system_start.configure(parts[2], payload['enabled']),
+                    ))
+                except (BackendError, ValueError) as exc:
+                    self._json(getattr(exc, 'http', 400), {'error': str(exc)})
+                return
+            if len(parts) == 6 and parts[:2] == ['v1', 'instances'] and parts[3] == 'microservices' and parts[5] == 'stop':
+                try:
+                    if not manager.microservices:
+                        raise ServiceError('microservices_unavailable')
+                    length = int(self.headers.get('Content-Length', '0'))
+                    if not 0 < length <= 4096:
+                        raise ServiceError('invalid_request', 400)
+                    try:
+                        payload = json.loads(self.rfile.read(length))
+                    except ValueError:
+                        raise ServiceError('invalid_request', 400)
+                    if not isinstance(payload, dict) or payload.get('contract_version') != 3:
+                        raise ServiceError('invalid_request', 400)
+                    result = manager.microservices.stop(parts[2], parts[4], payload.get('owner'), payload.get('run_id'))
+                    self._json(HTTPStatus.OK, result)
+                except (ServiceError, OSError, ValueError) as exc:
+                    self._json(getattr(exc, 'http', 503), {'contract_version': 3,
+                        'error': getattr(exc, 'error', 'state_unknown'), 'process_group_empty': None})
+                return
+            if len(parts) == 4 and parts[:2] == ["v1", "instances"] and parts[3] == "alias":
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if not 0 < length <= 1024:
+                        raise ConfigError("invalid alias request size")
+                    payload = json.loads(self.rfile.read(length))
+                    if not isinstance(payload, dict) or set(payload) != {"alias"}:
+                        raise ConfigError("expected an object containing only alias")
+                    item = manager.set_alias(parts[2], payload["alias"])
+                    self._json(HTTPStatus.OK, asdict(item)) if item else self._json(HTTPStatus.NOT_FOUND, {"error": "instance not found"})
+                except (ValueError, ConfigError) as exc:
+                    self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
             if parts == ["v1", "instances", "cleanup"]:
                 try:
                     self._json(HTTPStatus.OK, manager.cleanup_nonpersistent())
@@ -3888,6 +4345,12 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     payload = json.loads(self.rfile.read(length))
                     if not isinstance(payload, dict):
                         raise ConfigError("request body must be an object")
+                    if payload.get('application', 'smithproxy') != 'smithproxy':
+                        payload['wiring'] = profile_wiring(payload)
+                        image = prepare_profile_image(payload)
+                        item = runtime_profiles.save_program(payload, image_id=image.name)
+                        self._json(HTTPStatus.CREATED, profile_view(item))
+                        return
                     build_id = str(payload.get("build_id", ""))
                     config_id = str(payload.get("config_id", ""))
                     if build_id == "active":
@@ -3911,11 +4374,14 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                         if not cert_library:
                             raise ConfigError("certificate bundles are unavailable")
                         cert_library.get(cert_bundle_id)
+                    image = prepare_profile_image(payload) if filesystem_mode == 'rootfs' else None
                     item = runtime_profiles.create(
                         str(payload.get("name", "")), build_id, config_id, cert_bundle_id,
                         auto_restart, ttl_seconds,
                         ingress_network_id, egress_network_id,
-                        filesystem_mode,
+                        filesystem_mode, wiring=profile_wiring(payload),
+                        rootfs_variant=payload.get('rootfs_variant', 'barebone'),
+                        rootfs_image=image.name if image else '',
                     )
                     self._json(HTTPStatus.CREATED, profile_view(item))
                 except (ConfigError, BackendError, json.JSONDecodeError) as exc:
@@ -4127,6 +4593,8 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
         def do_DELETE(self) -> None:
             if not self._authorized():
                 self._json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+                return
+            if self._l2_request("DELETE"):
                 return
             parts = self._path()
             if (len(parts) == 3 and parts[:2] == ["v1", "headless-endpoints"]
@@ -4402,7 +4870,7 @@ def websocket_handler_factory(manager: Manager, token: str,
         parts = [part for part in urlsplit(connection.request.path).path.split("/") if part]
         drive_terminal = len(parts) == 4 and parts[:2] == ["v1", "test-drives"]
         instance_terminal = len(parts) == 4 and parts[:2] == ["v1", "instances"]
-        allowed = {"cli", "shell"} if drive_terminal else {"cli", "gdb"}
+        allowed = {"cli", "shell"} if drive_terminal else {"cli", "gdb", "netns"}
         if (not (drive_terminal or instance_terminal)
                 or parts[3] not in allowed or not uuid_is_valid(parts[2])):
             connection.close(1008, "invalid terminal path")
@@ -4416,6 +4884,8 @@ def websocket_handler_factory(manager: Manager, token: str,
                     test_drives.open_shell(parts[2])
                     if terminal_kind == "shell" else test_drives.open_cli(parts[2])
                 )
+            elif terminal_kind == "netns":
+                transport = manager.open_netns_transport(parts[2])
             elif terminal_kind == "gdb":
                 if not builder:
                     raise BackendError("builder is unavailable")
@@ -4478,7 +4948,16 @@ def websocket_handler_factory(manager: Manager, token: str,
                 if len(data) > 64 * 1024:
                     connection.close(1009, "terminal input too large")
                     break
-                transport.sendall(data)
+                if terminal_kind == 'netns':
+                    control = json.loads(data)
+                    if control.get('type') == 'resize':
+                        transport.resize(control.get('cols'), control.get('rows'))
+                    elif control.get('type') == 'input' and isinstance(control.get('data'), str):
+                        transport.sendall(control['data'].encode('utf-8'))
+                    else:
+                        raise ValueError('invalid NetNS terminal message')
+                else:
+                    transport.sendall(data)
         except Exception as exc:
             if not finished.is_set():
                 print(f"{terminal_kind} input failed for instance {parts[2]}: {exc}")
@@ -4488,6 +4967,8 @@ def websocket_handler_factory(manager: Manager, token: str,
                 test_drives.close_shell(parts[2], transport)
             elif terminal_kind == "gdb":
                 manager.close_gdb_transport(parts[2], transport)
+            elif terminal_kind == "netns":
+                manager.close_netns_transport(parts[2], transport)
             else:
                 transport.close()
             reader.join(timeout=2)
@@ -4610,8 +5091,6 @@ def main() -> None:
     # Make portal-owned processes visible even when their state record was lost.
     # Discovery is intentionally non-destructive; an administrator decides
     # whether an orphaned unit should be stopped.
-    manager.reconcile_orphans()
-    test_drives.cleanup_orphans()
     initial_network = network_settings.get()
     firewall.namespace_cidr_v6 = initial_network["namespace_cidr_v6"]
     firewall.apply(initial_network["namespace_cidr"], manager.sources())
@@ -4619,6 +5098,54 @@ def main() -> None:
     port = int(os.environ.get("CZ_RUNNER_PORT", "9080"))
     ws_port = int(os.environ.get("CZ_RUNNER_WS_PORT", "9081"))
     stopping = threading.Event()
+    manager.system_start = SystemStart(manager)
+    namespace_backend.system_start = manager.system_start
+    test_drives.system_start = SystemStart(test_drives, test_drive=True)
+    namespace_backend.test_drive_system_start = test_drives.system_start
+    def resolve_l2_instance(instance_id: str) -> dict | None:
+        # Atomic files avoid manager -> L2 / L2 -> manager lock inversion.
+        try:
+            return json.loads(manager._state_path(instance_id).read_text())
+        except FileNotFoundError:
+            return None
+
+    l2_segments = L2Segments(manager.state_dir.parent / "l2-segments.json", resolve_l2_instance)
+    manager.system_start.wiring = l2_segments
+    manager.l2_segments = l2_segments
+    namespace_backend.wiring = l2_segments
+    # Recovery must have the same Wiring/00-start hooks as a new spawn.
+    manager.reconcile_orphans()
+    test_drives.cleanup_orphans()
+    threading.Thread(target=l2_segments.run, args=(stopping,), daemon=True,
+                     name="l2-reconciler").start()
+    microservice_image = Path(os.environ.get('CZ_RUNNER_MICROSERVICE_ROOTFS',
+        str(manager.runtime_root.parent / 'microservice-rootfs' / 'current')))
+    if microservice_image.is_dir():
+        manager.microservices = Microservices(manager, SystemdServices(microservice_image),
+            interval=float(os.environ.get('CZ_RUNNER_MICROSERVICE_INTERVAL', '60')))
+        namespace_backend.microservices = manager.microservices
+        for instance in manager.snapshot():
+            manager.microservices.provision(instance.id)
+        threading.Thread(target=manager.microservices.run, args=(stopping,),
+                         daemon=True, name='microservice-supervisor').start()
+    def system_start_supervisor():
+        while not stopping.is_set():
+            if not manager.microservices:
+                for instance in manager.snapshot():
+                    try:
+                        manager.check_microservices(instance.id)
+                    except Exception as exc:
+                        print(f'00-start {instance.id}: {type(exc).__name__}: {exc}')
+            for drive in test_drives.snapshot():
+                try:
+                    with test_drives.lock:
+                        current = test_drives.peek(drive.id)
+                        if current:
+                            test_drives.system_start.check(current)
+                except Exception as exc:
+                    print(f'00-start Test Drive {drive.id}: {type(exc).__name__}: {exc}')
+            stopping.wait(60)
+    threading.Thread(target=system_start_supervisor, daemon=True, name='system-start').start()
     threading.Thread(
         target=reaper, args=(manager, test_drives, firewall, network_settings),
         kwargs={"stopping": stopping},
@@ -4634,6 +5161,7 @@ def main() -> None:
         test_drives=test_drives,
         firewall=firewall,
         network_profiles=network_profiles,
+        l2_segments=l2_segments,
         tuntom_builder=tuntom_builder,
         qemu_images=qemu_images,
         appliance_exports=appliance_exports,

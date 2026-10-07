@@ -9,6 +9,9 @@ LANGUAGES = {"cs": "CZ", "en": "EN", "fr": "FR"}
 # never translated or modified.
 CATALOGUE = {
     "cs": {
+        "network.transport_help": "Samostatný transportní namespace a routovaný veth. Adresace a případný NAT podle globálního nastavení; bez SAS source filtrů. Firewall a forwarding hosta se nemění.",
+        "network.no_ingress_help": "SAS nevytvoří ingress ani transportní link. Rozhraní může dodat microservice.",
+        "network.no_egress_help": "SAS nevytvoří do0 ani výchozí egress routu.",
         "nav.runtime": "Runtime", "nav.binaries": "Binárky",
         "nav.test_drives": "Test Drives", "nav.configs": "Konfigurace",
         "nav.observer": "Observer", "nav.profiles": "Profily",
@@ -120,6 +123,9 @@ CATALOGUE = {
         "runtime.cancel": "Zrušit", "runtime.enqueue_start": "Zařadit spuštění",
     },
     "en": {
+        "network.transport_help": "Separate transport namespace and routed veth. Addressing and optional NAT follow global settings; no SAS source filters. Host firewall and forwarding are unchanged.",
+        "network.no_ingress_help": "SAS creates no ingress or transport link. A microservice may provide an interface.",
+        "network.no_egress_help": "SAS creates neither do0 nor a default egress route.",
         "nav.runtime": "Runtime", "nav.binaries": "Binaries",
         "nav.test_drives": "Test Drives", "nav.configs": "Configurations",
         "nav.observer": "Observer", "nav.profiles": "Profiles",
@@ -231,6 +237,9 @@ CATALOGUE = {
         "runtime.cancel": "Cancel", "runtime.enqueue_start": "Enqueue start",
     },
     "fr": {
+        "network.transport_help": "Namespace de transport séparé et veth routé. Adressage et NAT éventuel selon les paramètres globaux ; aucun filtre source SAS. Le pare-feu et le transfert du système hôte restent inchangés.",
+        "network.no_ingress_help": "SAS ne crée aucun lien entrant ni de transport. Un microservice peut fournir une interface.",
+        "network.no_egress_help": "SAS ne crée ni do0 ni route de sortie par défaut.",
         "nav.runtime": "Runtime", "nav.binaries": "Binaires",
         "nav.test_drives": "Essais", "nav.configs": "Configurations",
         "nav.observer": "Comparateur", "nav.profiles": "Profils",
@@ -349,6 +358,195 @@ import json as _json
 from pathlib import Path as _Path
 for _locale, _entries in _json.loads((_Path(__file__).with_name("ui-translations.json")).read_text()).items():
     CATALOGUE[_locale].update(_entries)
+
+
+for _locale, _warning in {
+    'cs': 'ROOT shell na HOSTU: izolovaná je pouze síť instance, nikoli filesystem. Změny mohou poškodit host i instanci. Pokračovat?',
+    'en': 'ROOT shell on the HOST: only the instance network is isolated, not the filesystem. Changes can damage the host and instance. Continue?',
+    'fr': 'Shell ROOT sur l’HÔTE : seul le réseau de l’instance est isolé, pas le système de fichiers. Les modifications peuvent endommager l’hôte et l’instance. Continuer ?',
+}.items():
+    CATALOGUE[_locale]['netns.warning'] = _warning
+
+
+for _locale, _entries in {
+    "cs": {
+        "title": "Kabely a switche", "name": "Název", "kind": "Typ", "create": "Vytvořit",
+        "refresh": "Obnovit", "instance": "Instance", "port": "Rozhraní", "state": "Stav",
+        "connect": "Připojit / rezervovat", "disconnect": "Odpojit a uvolnit", "delete": "Smazat",
+        "intro": "Izolované L2 segmenty. Kabel: nejvýše dva konce. Switch: více konců. Bez adres, routování, NAT a uplinku.",
+        "reserve_help": "Rezervace zůstává i po zastavení instance. Uvolní ji odpojení nebo smazání instance. Změny běží ve frontě; stav aktualizuje Obnovit. Zatím pouze namespace instance přes veth; TAP čeká na QEMU lifecycle.",
+        "port_help": "Nové neobsazené rozhraní. Stávající ingress/egress se nemění; adresaci nastavíš v editoru tohoto konce.",
+    },
+    "en": {
+        "title": "Cables and switches", "name": "Name", "kind": "Type", "create": "Create",
+        "refresh": "Refresh", "instance": "Instance", "port": "Interface", "state": "State",
+        "connect": "Connect / reserve", "disconnect": "Disconnect and release", "delete": "Delete",
+        "intro": "Isolated L2 segments. Cable: at most two ends. Switch: multiple ends. No addresses, routing, NAT or uplink.",
+        "reserve_help": "Reservations survive instance stops. Disconnecting or deleting the instance releases them. Changes are queued; Refresh updates the view. Currently namespace instances via veth only; TAP awaits the QEMU lifecycle.",
+        "port_help": "A new unused interface. Existing ingress/egress is unchanged; configure addressing in this endpoint’s editor.",
+    },
+    "fr": {
+        "title": "Câbles et commutateurs", "name": "Nom", "kind": "Type", "create": "Créer",
+        "refresh": "Actualiser", "instance": "Instance", "port": "Interface", "state": "État",
+        "connect": "Connecter / réserver", "disconnect": "Déconnecter et libérer", "delete": "Supprimer",
+        "intro": "Segments L2 isolés. Câble : deux extrémités au maximum. Commutateur : plusieurs. Sans adresse, routage, NAT ni liaison montante.",
+        "reserve_help": "Les réservations survivent à l’arrêt. La déconnexion ou la suppression de l’instance les libère. Les opérations sont mises en file ; Actualiser recharge la vue. Instances namespace via veth uniquement ; TAP attend le cycle de vie QEMU.",
+        "port_help": "Nouvelle interface libre. L’ingress/egress existant reste inchangé ; configure l’adressage dans l’éditeur de cette extrémité.",
+    },
+}.items():
+    CATALOGUE[_locale].update({"l2." + key: value for key, value in _entries.items()})
+
+
+for _locale, _entries in {
+    'cs': {
+        'search': 'Hledat název, instanci nebo port', 'connections': 'propojení',
+        'new': 'Nové propojení', 'cable': 'Kabel', 'switch': 'Switch',
+        'end': 'Konec', 'free_end': 'Volný konec', 'choose': 'Vyber instanci…',
+        'no_match': 'Žádné odpovídající propojení.',
+        'addressing': 'Adresace: tyto porty zatím nemají editor IP ani správu přes 00-start. Wiring nyní spravuje pouze L2 propojení; nevytváří DHCP, NAT ani routy.',
+        'state.ready': 'Připraveno', 'state.pending': 'Čeká', 'state.connected': 'Připojeno',
+        'state.reserved': 'Rezervováno · nepřipojeno', 'state.error': 'Chyba', 'state.unknown': 'Neověřeno',
+    },
+    'en': {
+        'search': 'Find name, instance or port', 'connections': 'connections',
+        'new': 'New connection', 'cable': 'Cable', 'switch': 'Switch',
+        'end': 'End', 'free_end': 'Free end', 'choose': 'Choose an instance…',
+        'no_match': 'No matching connections.',
+        'addressing': 'Addressing: these ports do not yet have an IP editor or 00-start management. Wiring currently manages L2 connections only; it does not create DHCP, NAT or routes.',
+        'state.ready': 'Ready', 'state.pending': 'Pending', 'state.connected': 'Connected',
+        'state.reserved': 'Reserved · disconnected', 'state.error': 'Error', 'state.unknown': 'Unverified',
+    },
+    'fr': {
+        'search': 'Rechercher un nom, une instance ou un port', 'connections': 'connexions',
+        'new': 'Nouvelle connexion', 'cable': 'Câble', 'switch': 'Commutateur',
+        'end': 'Extrémité', 'free_end': 'Extrémité libre', 'choose': 'Choisir une instance…',
+        'no_match': 'Aucune connexion correspondante.',
+        'addressing': 'Adressage : ces ports ne disposent pas encore d’un éditeur IP ni de la gestion 00-start. Wiring gère uniquement les connexions L2 ; il ne crée ni DHCP, ni NAT, ni routes.',
+        'state.ready': 'Prêt', 'state.pending': 'En attente', 'state.connected': 'Connecté',
+        'state.reserved': 'Réservé · déconnecté', 'state.error': 'Erreur', 'state.unknown': 'Non vérifié',
+    },
+}.items():
+    CATALOGUE[_locale]['l2.title'] = 'Wiring'
+    CATALOGUE[_locale].update({'wiring.' + key: value for key, value in _entries.items()})
+
+
+for _locale, _entries in {
+    'cs': {
+        'scope': 'Adresace patří portům, nikoli bridge. Odpojení ji zachová. Změny aplikuje 00-start; vypnutá služba je neaplikuje.',
+        'summary': 'souhrnná skupina', 'configured': 'evidovaný prefix',
+        'used_networks': 'Použité sítě', 'inventory_help': 'Pouze evidence Wiring. Nezobrazený rozsah není zárukou volného rozsahu. Souhrnné skupiny nejsou celé obsazené. Discovery zatím neběží.',
+        'ip_configuration': 'Adresace a routy', 'mode': 'Správa', 'sas': 'SAS spravuje', 'guest': 'Guest spravuje · pouze evidence', 'none': 'Bez L3 adresace',
+        'addresses': 'Adresy IP/prefix · jedna na řádek', 'routes': 'Routy · cílový prefix [brána] na řádek',
+        'apply_help': 'SAS: uloží a vyžádá kontrolu 00-start. Guest: pouze eviduje, nic nepřepisuje. Bez L3: odstraňuje jen dříve spravovanou adresaci. Překryvy neblokují uložení.',
+        'save': 'Uložit adresaci', 'disconnected': 'Odpojený port', 'duplicate': 'Stejná IP', 'overlap': 'Překryv rozsahu',
+        'refresh_after': 'Po dokončení úlohy obnov přehled. Rozepsané hodnoty zůstávají zachované.',
+    },
+    'en': {
+        'scope': 'Addressing belongs to ports, not the bridge. Disconnecting preserves it. Changes are applied by 00-start; a disabled service does not apply them.',
+        'summary': 'summary group', 'configured': 'recorded prefix',
+        'used_networks': 'Used networks', 'inventory_help': 'Wiring catalogue only. An unlisted range is not guaranteed free. Summary groups are not fully occupied. Discovery is not running yet.',
+        'ip_configuration': 'Addressing and routes', 'mode': 'Management', 'sas': 'SAS managed', 'guest': 'Guest managed · declared only', 'none': 'No L3 addressing',
+        'addresses': 'IP/prefix addresses · one per line', 'routes': 'Routes · destination prefix [gateway] per line',
+        'apply_help': 'SAS: save and request a 00-start check. Guest: record only, do not modify. No L3: remove only previously managed addressing. Overlaps do not block saving.',
+        'save': 'Save addressing', 'disconnected': 'Disconnected port', 'duplicate': 'Duplicate IP', 'overlap': 'Overlapping range',
+        'refresh_after': 'Refresh after the task completes. Your input is preserved.',
+    },
+    'fr': {
+        'scope': 'L’adressage appartient aux ports, pas au pont. La déconnexion le conserve. 00-start applique les changements ; si désactivé, il ne les applique pas.',
+        'summary': 'groupe récapitulatif', 'configured': 'préfixe enregistré',
+        'used_networks': 'Réseaux utilisés', 'inventory_help': 'Catalogue Wiring uniquement. Une plage absente n’est pas nécessairement libre. Les groupes récapitulatifs ne sont pas entièrement occupés. La découverte n’est pas encore active.',
+        'ip_configuration': 'Adressage et routes', 'mode': 'Gestion', 'sas': 'Géré par SAS', 'guest': 'Géré par l’invité · déclaration uniquement', 'none': 'Sans adressage L3',
+        'addresses': 'Adresses IP/préfixe · une par ligne', 'routes': 'Routes · préfixe destination [passerelle] par ligne',
+        'apply_help': 'SAS : enregistrer et demander une vérification 00-start. Invité : déclaration uniquement. Sans L3 : retirer seulement l’adressage précédemment géré. Les chevauchements ne bloquent pas l’enregistrement.',
+        'save': 'Enregistrer l’adressage', 'disconnected': 'Port déconnecté', 'duplicate': 'IP identique', 'overlap': 'Plages superposées',
+        'refresh_after': 'Actualiser après la fin de la tâche. La saisie est conservée.',
+    },
+}.items():
+    CATALOGUE[_locale].update({'wiring.' + key: value for key, value in _entries.items()})
+
+for _locale, _values in {
+    'cs': ['Nespravováno', 'Čeká na 00-start', 'Aplikuje se', 'Aplikováno', 'Pouze evidence', 'Chyba'],
+    'en': ['Unmanaged', 'Pending 00-start', 'Applying', 'Applied', 'Declared only', 'Error'],
+    'fr': ['Non géré', 'En attente de 00-start', 'Application en cours', 'Appliqué', 'Déclaration uniquement', 'Erreur'],
+}.items():
+    for _state, _label in zip(['unmanaged', 'pending', 'applying', 'applied', 'guest', 'error'], _values):
+        CATALOGUE[_locale]['wiring.status.' + _state] = _label
+
+for _locale, _values in {
+    'cs': ['Zapojení před startem', 'Všechny konce se rezervují před vytvořením sítě. Profil obsahuje jen propojení; IP patří konkrétnímu spawnu/Wiring. Plný kabel zabrání startu. Stávající ingress/egress zůstává.',
+           'Nahradit zapojení z profilu pro tento start (prázdné = žádné kabely)', 'Přidat port', 'Odebrat vazbu'],
+    'en': ['Connections before startup', 'All ends are reserved before networking is created. Profiles store links only; IPs belong to the individual spawn/Wiring. A full cable prevents startup. Existing ingress/egress stays unchanged.',
+           'Override profile wiring for this start (empty = no cables)', 'Add port', 'Remove binding'],
+    'fr': ['Connexions avant démarrage', 'Toutes les extrémités sont réservées avant la création du réseau. Les profils conservent uniquement les liens ; les IP appartiennent au démarrage/Wiring. Un câble plein bloque le démarrage. L’ingress/egress existant reste inchangé.',
+           'Remplacer les connexions du profil pour ce démarrage (vide = aucun câble)', 'Ajouter un port', 'Retirer le lien'],
+}.items():
+    for _key, _label in zip(['start_title', 'start_help', 'override', 'add_port', 'remove_binding'], _values):
+        CATALOGUE[_locale]['wiring.' + _key] = _label
+
+for _locale, _text in {
+    'cs': ('Zkontrolovat mikroservisy', 'Úloha ve frontě', 'Vypnout správu sítě 00-start', 'Zapnout správu sítě 00-start'),
+    'en': ('Check microservices', 'Task queued', 'Disable 00-start network management', 'Enable 00-start network management'),
+    'fr': ('Vérifier les microservices', 'Tâche en file', 'Désactiver la gestion réseau 00-start', 'Activer la gestion réseau 00-start'),
+}.items():
+    CATALOGUE[_locale]['microservices.check'] = _text[0]
+    CATALOGUE[_locale]['microservices.queued'] = _text[1]
+    CATALOGUE[_locale]['microservices.disable00'] = _text[2]
+    CATALOGUE[_locale]['microservices.enable00'] = _text[3]
+
+
+for _locale, _entries in {
+    'cs': {
+        'title': 'Ostatní programy',
+        'pending': 'Definice profilu · spouštění tohoto typu zatím není implementované.',
+        'router': 'Linux router: plánovaný IPv4/IPv6 forwarding pouze uvnitř namespace. Bez automatického NAT nebo uplinku.',
+        'webfsd': 'Webfsd: statický HTTP server s dokumenty v /work.',
+        'port': 'HTTP port', 'unlimited': 'Bez časového limitu',
+        'isolation': 'Izolovaná síť; adresy a routy patří portům ve Wiring.',
+        'files': 'Obsah budoucího /work. Jednotlivé soubory do 40 KiB; nepřidávej sem tajné klíče — webový obsah bude dostupný klientům.',
+    },
+    'en': {
+        'title': 'Other programs',
+        'pending': 'Profile definition · launching this application type is not implemented yet.',
+        'router': 'Linux router: planned IPv4/IPv6 forwarding inside its namespace only. No automatic NAT or uplink.',
+        'webfsd': 'Webfsd: a static HTTP server with documents in /work.',
+        'port': 'HTTP port', 'unlimited': 'Unlimited',
+        'isolation': 'Isolated network; addresses and routes belong to Wiring ports.',
+        'files': 'Future /work contents. Up to 40 KiB per file; do not upload secret keys — web content will be accessible to clients.',
+    },
+    'fr': {
+        'title': 'Autres programmes',
+        'pending': 'Définition du profil · le démarrage de ce type n’est pas encore implémenté.',
+        'router': 'Routeur Linux : transfert IPv4/IPv6 prévu uniquement dans son namespace. Sans NAT ni liaison montante automatiques.',
+        'webfsd': 'Webfsd : serveur HTTP statique avec les documents dans /work.',
+        'port': 'Port HTTP', 'unlimited': 'Sans limite de temps',
+        'isolation': 'Réseau isolé ; les adresses et routes appartiennent aux ports Wiring.',
+        'files': 'Contenu du futur /work. Jusqu’à 40 Kio par fichier ; aucune clé secrète — le contenu web sera accessible aux clients.',
+    },
+}.items():
+    CATALOGUE[_locale].update({'programs.' + key: value for key, value in _entries.items()})
+
+
+for _locale, _values in {
+    'cs': ['Varianta rootfs', 'Barebone · jen runtime', 'Runtime + utility', 'Runtime + síťové nástroje',
+           'Neměnný snapshot závislostí na tomto originu. Chybějící nástroj sestavení zastaví; do host filesystemu se nepřepíná.',
+           'Programy běží z rootfs, /work a /logs jsou zapisovatelné. Síť pouze přes Wiring. U staršího profilu nejprve ulož změny pro přípravu rootfs.', 'Spustit'],
+    'en': ['Rootfs variant', 'Barebone · runtime only', 'Runtime + utilities', 'Runtime + network tools',
+           'Immutable dependency snapshot on this origin. Missing tools stop the build; no host filesystem fallback.',
+           'Programs run from rootfs; /work and /logs are writable. Networking via Wiring only. Save older profiles first to prepare their rootfs.', 'Start'],
+    'fr': ['Variante rootfs', 'Barebone · runtime seul', 'Runtime + utilitaires', 'Runtime + outils réseau',
+           'Snapshot immuable des dépendances de cet origin. Un outil absent bloque la construction ; aucun repli sur le système hôte.',
+           'Les programmes fonctionnent dans rootfs ; /work et /logs sont accessibles en écriture. Réseau via Wiring uniquement. Enregistrer les anciens profils pour préparer leur rootfs.', 'Démarrer'],
+}.items():
+    CATALOGUE[_locale].update(dict(zip(('rootfs.' + key for key in
+        ['variant', 'barebone', 'utils', 'network', 'help', 'program_help', 'start']), _values)))
+
+
+for _locale, _label in {
+    'cs': 'Vytvořit nový snapshot rootfs z aktuálních zdrojů (běžící instance se nemění)',
+    'en': 'Build a new rootfs snapshot from current sources (running instances stay unchanged)',
+    'fr': 'Créer un nouveau snapshot rootfs depuis les sources actuelles (instances actives inchangées)',
+}.items():
+    CATALOGUE[_locale]['rootfs.refresh'] = _label
 
 
 def translate(locale: str, key: str) -> str:

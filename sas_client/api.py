@@ -126,6 +126,6 @@ class RunnerClient:
             time.sleep(interval)
 
     def terminal_url(self, instance_id: str, kind: str = "cli") -> str:
-        if kind not in {"cli", "gdb"}:
-            raise ValueError("terminal kind must be cli or gdb")
+        if kind not in {"cli", "gdb", "netns"}:
+            raise ValueError("terminal kind must be cli, gdb or netns")
         return f"{self.config.ws_url}/v1/instances/{instance_id}/{kind}"

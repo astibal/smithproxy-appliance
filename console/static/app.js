@@ -47,6 +47,16 @@
     const networkRuntimeFields = q('#network-runtime-fields');
     if (configSelect && runtimeSelection && profileSelect && placeholderFields) {
       const updatePlaceholderFields = () => {
+        const sourceIP = q('#spawn-form select[name="source_ip"]');
+        const ingressDriver = runtimeSelection.value === 'profile'
+          ? profileSelect.selectedOptions[0]?.dataset.ingressDriver || 'authorized-veth'
+          : 'authorized-veth';
+        if (sourceIP) {
+          const required = !['none', 'unlimited-veth'].includes(ingressDriver);
+          sourceIP.required = required;
+          sourceIP.disabled = !required;
+          if (sourceIP.closest('label')) sourceIP.closest('label').hidden = !required;
+        }
         const source = runtimeSelection.value === 'profile' ? profileSelect : configSelect;
         const placeholders = (source.selectedOptions[0]?.dataset.placeholders || '')
           .split(',').map(value => value.trim()).filter(Boolean);
@@ -725,7 +735,7 @@
         if (filter === 'active' && !activeState(item.state)) return false;
         if (filter === 'problem' && !problemState(item.state)) return false;
         if (!needle) return true;
-        return [item.id, item.source_ip, item.user_id, item.profile, item.namespace, item.state]
+        return [item.id, item.alias, item.source_ip, item.user_id, item.profile, item.namespace, item.state]
           .some(value => String(value || '').toLowerCase().includes(needle));
       });
     }
@@ -741,7 +751,7 @@
       const stateText = document.createElement('em'); stateText.textContent = item.state;
       state.append(stateDot, stateText);
       const source = document.createElement('b'); source.className = 'instance-cell instance-cell-source'; source.textContent = item.source_ip || '—';
-      const identity = document.createElement('code'); identity.className = 'instance-cell instance-cell-id'; identity.textContent = short(item.id);
+      const identity = document.createElement('code'); identity.className = 'instance-cell instance-cell-id'; identity.textContent = item.alias || short(item.id); identity.title = item.id;
       const owner = document.createElement('span'); owner.className = 'instance-cell instance-card-owner';
       const user = document.createElement('strong'); user.textContent = item.user_id || 'unknown';
       const profile = document.createElement('small'); profile.textContent = `${item.profile || 'custom'}${item.persistent ? ' · persistent' : ''}`;
@@ -790,7 +800,7 @@
       if (!item) return;
       text('#detail-state', item.state);
       q('#detail-state-dot').className = `state-${item.state}`;
-      text('#detail-short-id', short(item.id)); text('#detail-full-id', item.id);
+      text('#detail-short-id', item.alias || short(item.id)); text('#detail-full-id', item.id);
       const members = (item.members || []).filter(member => member.pid);
       text('#detail-pid', item.slice_unit || 'Slice —');
       text('#detail-rss', `${members.map(member => `${member.role} PID ${member.pid}`).join(' · ') || window.sasTr("ui.c667d4a42895")} · RSS ${formatBytes(item.slice_rss_bytes || 0)} · CLI ${item.cli_port ? `:${item.cli_port}` : '—'}`);
@@ -806,13 +816,14 @@
       setForm('#detail-extend', `/instances/${encodeURIComponent(item.id)}/extend`, activeState(item.state));
       setForm('#detail-stop', `/instances/${encodeURIComponent(item.id)}/stop`, activeState(item.state));
       setForm('#detail-delete', `/instances/${encodeURIComponent(item.id)}/delete`, !activeState(item.state));
-      const consoleTab = q('[data-view=console]'); consoleTab.disabled = item.state !== 'running';
+      const consoleTab = q('[data-view=console]'); consoleTab.disabled = item.state !== 'running' || (item.application && item.application !== 'smithproxy');
       updatePopoutLink();
-      if (currentView === 'console' && item.state !== 'running') switchView('overview');
+      if (currentView === 'console' && consoleTab.disabled) switchView('overview');
     }
 
     function selectInstance(id) {
       if (selectedId !== id) {
+        window.dispatchEvent(new Event('sas-netns-close'));
         disconnectTerminal();
         hideGdbTerminal();
       }
@@ -974,6 +985,51 @@
           crash.append(title, meta, trace); output.append(crash);
         }
         appendDebugControls(output, data);
+        const netnsButton = document.createElement('button');
+        netnsButton.type = 'button'; netnsButton.className = 'secondary';
+        netnsButton.textContent = 'NetNS shell';
+        netnsButton.disabled = data.instance?.state !== 'running';
+        netnsButton.onclick = () => window.dispatchEvent(new CustomEvent('sas-netns-open', {detail: instanceId}));
+        output.append(netnsButton);
+        const checkServices = document.createElement('button');
+        checkServices.type = 'button'; checkServices.className = 'secondary';
+        checkServices.textContent = window.sasTr('microservices.check');
+        checkServices.onclick = async () => {
+          checkServices.disabled = true;
+          try {
+            const response = await fetch(`/api/instances/${encodeURIComponent(instanceId)}/microservices/check`, {
+              method: 'POST', headers: {'X-CSRF-Token': csrf}
+            });
+            const result = await response.json();
+            if (!response.ok) throw new Error(result.error || response.statusText);
+            checkServices.textContent = `${window.sasTr('microservices.queued')} · ${result.task_id.slice(0, 8)}`;
+          } catch (error) {
+            checkServices.textContent = String(error.message || error);
+          } finally { checkServices.disabled = false; }
+        };
+        output.append(checkServices);
+        if (data.system_start) {
+          const status = document.createElement('p');
+          status.textContent = `00-start · ${data.system_start.state} · ${data.system_start.checked_at || '—'}`;
+          if (data.system_start.error) status.textContent += ` · ${data.system_start.error}`;
+          output.append(status);
+          const toggle = document.createElement('button');
+          toggle.type = 'button'; toggle.className = 'secondary';
+          toggle.textContent = window.sasTr(data.system_start.enabled ? 'microservices.disable00' : 'microservices.enable00');
+          toggle.onclick = async () => {
+            toggle.disabled = true;
+            try {
+              const response = await fetch(`/api/instances/${encodeURIComponent(instanceId)}/microservices/00/configure`, {
+                method: 'POST', headers: {'X-CSRF-Token': csrf, 'Content-Type': 'application/json'},
+                body: JSON.stringify({enabled: !data.system_start.enabled})
+              });
+              const result = await response.json();
+              if (!response.ok) throw new Error(result.error || response.statusText);
+              toggle.textContent = `${window.sasTr('microservices.queued')} · ${result.task_id.slice(0, 8)}`;
+            } catch (error) { toggle.textContent = String(error.message || error); toggle.disabled = false; }
+          };
+          output.append(toggle);
+        }
       } catch (error) {
         if (requestId === diagnosticsRequest && instanceId === selectedId) {
           output.replaceChildren(Object.assign(document.createElement('p'), {className: 'flash error', textContent: String(error.message || error)}));
@@ -982,6 +1038,7 @@
     }
 
     function switchView(view, changeUrl = true) {
+      if (view === 'console' && q('[data-view=console]')?.disabled) view = 'overview';
       if (!['overview', 'console', 'logs', 'diag'].includes(view)) view = 'overview';
       currentView = view;
       document.querySelectorAll('.detail-tabs [data-view]').forEach(button => button.classList.toggle('active', button.dataset.view === view));

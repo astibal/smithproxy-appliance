@@ -1,0 +1,52 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="headline"><h1>{{ _('programs.title') }}</h1></div>
+{% include '_profile_tabs.html' %}
+{% if error %}<div class="flash error">{{ error }}</div>{% endif %}
+<p>{{ _('rootfs.program_help') }}</p>
+<section class="panel">
+  <div class="actions">
+    <a class="button-link secondary" href="{{ url_for('program_profiles', application='router') }}">+ Router</a>
+    <a class="button-link secondary" href="{{ url_for('program_profiles', application='webfsd') }}">+ webfsd</a>
+  </div>
+  <h2>{{ profile.name if profile else application }}</h2>
+  <p>{{ _('programs.' + application) }}</p>
+  <form method="post" class="stack">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="config-editor-meta">
+      {% include '_rootfs_variant.html' %}
+      <label>{{ _('ui.11002cd1dcb7') }}<input name="name" maxlength="128" value="{{ profile.name if profile else '' }}" required></label>
+      {% if application == 'webfsd' %}<label>{{ _('programs.port') }}<input type="number" name="port" min="1" max="65535" value="{{ profile.program_settings.port if profile else 8000 }}" required></label>{% endif %}
+      <label>{{ _('ui.109738a1f94a') }}<input type="number" name="ttl_seconds" min="5" max="86400" value="{{ profile.ttl_seconds if profile and profile.ttl_seconds is not none else 1800 }}"></label>
+      <label class="check"><input type="checkbox" name="ttl_unlimited" {{ 'checked' if profile and profile.ttl_seconds is none }}>{{ _('programs.unlimited') }}</label>
+      <label class="check"><input type="checkbox" name="auto_restart" {{ 'checked' if profile and profile.auto_restart }}>{{ _('ui.62d3a1874a93') }}</label>
+    </div>
+    <p><code>rootfs · Wiring · 00-start</code> — {{ _('programs.isolation') }}</p>
+    {% include '_wiring_bindings.html' %}
+    <button>{{ _('ui.500503baf0ae') }}</button>
+  </form>
+</section>
+{% if profile and profile.profile_id and application == 'webfsd' %}
+<section class="panel">
+  <h2>/work</h2><p>{{ _('programs.files') }}</p>
+  <form method="post" enctype="multipart/form-data" action="{{ url_for('upload_runtime_profile_work_file', profile_id=profile.profile_id) }}" class="config-editor-meta">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="mode" value="0644">
+    <label>{{ _('ui.5ee136c77acd') }}<input type="file" name="file" required></label>
+    <label>{{ _('ui.eb1d7a4fd503') }}<input name="path" placeholder="index.html"></label>
+    <button>{{ _('ui.d0bb4c70ae44') }}</button>
+  </form>
+  {% for item in profile.work_files|default([]) %}<div class="config-row"><code>/work/{{ item.path }} · {{ item.size }} B</code>
+    <form method="post" action="{{ url_for('delete_runtime_profile_work_file', profile_id=profile.profile_id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="path" value="{{ item.path }}"><button class="danger compact">{{ _('ui.a1ee22baa5d7') }}</button></form>
+  </div>{% endfor %}
+</section>
+{% endif %}
+<section class="panel">
+{% for item in profiles %}<div class="config-row"><div><b>{{ item.name }}</b> · {{ item.application }} · rootfs / {{ item.rootfs_variant|default('barebone') }} <small>{{ item.rootfs_image|default('') }}</small></div><div class="actions">
+  <form method="post" action="{{ url_for('create_instance') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="runtime_profile_id" value="{{ item.profile_id }}"><button {{ 'disabled' if not item.available }}>{{ _('rootfs.start') }}</button></form>
+  <a class="button-link secondary" href="{{ url_for('program_profiles', edit=item.profile_id) }}">{{ _('ui.ec3d71143fde') }}</a>
+  <form method="post" action="{{ url_for('delete_runtime_profile', profile_id=item.profile_id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="danger compact">{{ _('ui.a1ee22baa5d7') }}</button></form>
+</div></div>{% else %}<p>{{ _('ui.38f752b4f261') }}</p>{% endfor %}
+</section>
+{% endblock %}
+{% block scripts %}<script src="{{ url_for('static', filename='wiring-bindings.js', v='1') }}" defer></script>{% endblock %}

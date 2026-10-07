@@ -5,7 +5,15 @@
   </div>
 
   {% if kind == 'ingress' %}
-  <div class="network-driver-panel" data-driver-panel="split-veth">
+  <div class="network-driver-panel" data-driver-panel="unlimited-veth" hidden>
+    <div class="network-driver-flow">
+      <div class="network-driver-node uplink"><small>HOST</small><strong>Routing</strong><span>IPv4 / IPv6</span></div>
+      <i class="network-driver-arrow"><span>veth</span></i>
+      <div class="network-driver-node namespace"><small>TRANSPORT NETNS</small><strong>Unlimited veth</strong><span>transport0 · microservices</span></div>
+    </div>
+    <p>{{ _('network.transport_help') }}</p>
+  </div>
+  <div class="network-driver-panel" data-driver-panel="authorized-veth">
     <div class="network-driver-flow">
       <div class="network-driver-node source"><small>{{ _('ui.ed8d80502aee') }}</small><strong>authorized IP</strong><span>IPv4 / IPv6</span></div>
       <i class="network-driver-arrow"><span>{{ _('ui.7755d70c2970') }}</span></i>
@@ -13,27 +21,7 @@
       <i class="network-driver-arrow"><span>route</span></i>
       <div class="network-driver-node namespace"><small>INSTANCE NETNS</small><strong><span data-interface-label>di0</span> · Smithproxy</strong><span>ingress veth <code>czi*</code></span></div>
     </div>
-    <p><b>Split-veth</b> {{ _('ui.8676aaa3f987') }} <code>di0</code>{{ _('ui.ed218e9d82f8') }}</p>
-  </div>
-  <div class="network-driver-panel" data-driver-panel="tuntom" hidden>
-    <div class="network-driver-flow">
-      <div class="network-driver-node source"><small>REMOTE PEER</small><strong>encrypted Tuntom</strong><span>peer host · secret</span></div>
-      <i class="network-driver-arrow"><span>UDP + AEAD</span></i>
-      <div class="network-driver-node policy"><small>INSTANCE SIDE</small><strong><span data-interface-label>di0</span></strong><span>local IP ⇄ peer IP</span></div>
-      <i class="network-driver-arrow"><span>ingress only</span></i>
-      <div class="network-driver-node namespace"><small>INSTANCE NETNS</small><strong>Smithproxy</strong><span>{{ _('ui.e50f978b65e1') }}</span></div>
-    </div>
-    <p><b>Tuntom ingress</b> {{ _('ui.ffdd0c5b2cb2') }} <code>di0</code>{{ _('ui.99c45bed6830') }}</p>
-  </div>
-  <div class="network-driver-panel" data-driver-panel="tuntom-via" hidden>
-    <div class="network-driver-flow via-duplex-shadow-flow">
-      <div class="network-driver-node uplink"><small>REMOTE FABRIC</small><strong>VIA IN tunnel</strong><span>switch IP · UDP + AEAD</span></div>
-      <i class="network-driver-arrow"><span>relay IN</span></i>
-      <div class="network-driver-node ingress-port"><small>INSTANCE NETNS</small><strong>di0 → Smithproxy</strong><span>{{ _('ui.308b5e5116d0') }}</span></div>
-      <i class="network-driver-arrow"><span>paired</span></i>
-      <div class="network-driver-node egress-port"><small>LOCKED BY OUT</small><strong>Smithproxy → do0</strong><span>{{ _('ui.490a60f89c07') }}</span></div>
-    </div>
-    <p><b>Tuntom VIA</b> {{ _('ui.0b2ffe38dff3') }}</p>
+    <p><b>Authorized veth</b> {{ _('ui.8676aaa3f987') }} <code>di0</code>{{ _('ui.ed218e9d82f8') }}</p>
   </div>
   <section class="network-selector-guide" data-selector-guide>
     <div class="network-selector-head">
@@ -72,7 +60,7 @@
     </div>
   </section>
   {% else %}
-  <div class="network-driver-panel" data-driver-panel="split-veth">
+  <div class="network-driver-panel" data-driver-panel="veth-out">
     <div class="network-driver-flow">
       <div class="network-driver-node namespace"><small>INSTANCE NETNS</small><strong>Smithproxy</strong><span>{{ _('ui.b4ba886d5194') }}</span></div>
       <i class="network-driver-arrow"><span>egress</span></i>
@@ -80,50 +68,8 @@
       <i class="network-driver-arrow"><span data-egress-effect>MASQUERADE</span></i>
       <div class="network-driver-node uplink"><small>UPLINK</small><strong data-uplink-label>global route</strong><span>SAS host</span></div>
     </div>
-    <p><b>Split-veth</b> {{ _('ui.9dca67e1e7bb') }} <code>do0</code>{{ _('ui.806586745bc7') }}</p>
-  </div>
-  <div class="network-driver-panel" data-driver-panel="on-a-stick" hidden>
-    <div class="network-driver-flow">
-      <div class="network-driver-node namespace"><small>INSTANCE NETNS</small><strong>Smithproxy</strong><span>{{ _('ui.bec71c7f6993') }}</span></div>
-      <i class="network-driver-arrow"><span>return</span></i>
-      <div class="network-driver-node egress-port"><small>SHARED IN / OUT</small><strong><span data-interface-label>di0</span></strong><span>{{ _('ui.ad50e3a87711') }}</span></div>
-      <i class="network-driver-arrow"><span>route</span></i>
-      <div class="network-driver-node uplink"><small>SAS HOST</small><strong>policy routing</strong><span>{{ _('ui.b5bd866ffbfc') }}</span></div>
-    </div>
-    <p><b>On-a-stick</b> {{ _('ui.f4defa87c884') }} <code>di0</code> {{ _('ui.f4f85627333e') }} <code>do0/czo*</code>{{ _('ui.c4153bba46de') }}</p>
-  </div>
-  <div class="network-driver-panel" data-driver-panel="tuntom" hidden>
-    <div class="network-driver-flow">
-      <div class="network-driver-node namespace"><small>INSTANCE NETNS</small><strong>Smithproxy</strong><span>{{ _('ui.ee0c07017908') }}</span></div>
-      <i class="network-driver-arrow"><span>egress only</span></i>
-      <div class="network-driver-node egress-port"><small>INSTANCE SIDE</small><strong><span data-interface-label>do0</span></strong><span>local IP ⇄ peer IP</span></div>
-      <i class="network-driver-arrow"><span>UDP + AEAD</span></i>
-      <div class="network-driver-node uplink"><small>REMOTE PEER</small><strong>encrypted Tuntom</strong><span>peer host · secret</span></div>
-    </div>
-    <p><b>Tuntom egress</b> {{ _('ui.ffdd0c5b2cb2') }} <code>do0</code>{{ _('ui.265ee9935632') }}</p>
-  </div>
-  <div class="network-driver-panel" data-driver-panel="tuntom-via" hidden>
-    <div class="network-driver-flow">
-      <div class="network-driver-node uplink"><small>UNIQUE PACKAGE</small><strong>Fabric port + tunnel ID</strong><span>single owner · one Slice</span></div>
-      <i class="network-driver-arrow"><span>switch IP + secret</span></i>
-      <div class="network-driver-node policy"><small>INSTANCE NETNS</small><strong>fabric0 · ipvlan</strong><span>{{ _('ui.3e7d1afbfd77') }}</span></div>
-      <i class="network-driver-arrow"><span>relay.sock</span></i>
-      <div class="network-driver-node egress-port"><small>SLICE MEMBERS</small><strong>Tuntom relay + divert</strong><span>{{ _('ui.ac45251a30c1') }}</span></div>
-      <i class="network-driver-arrow"><span>di0 ⇄ do0</span></i>
-      <div class="network-driver-node namespace"><small>INSTANCE NETNS</small><strong>Smithproxy</strong><span>{{ _('ui.f94ec73ea571') }}</span></div>
-    </div>
-    <p><b>Tuntom VIA</b> {{ _('ui.a49117dfe872') }} <code>di0</code> i <code>do0</code>{{ _('ui.42d788efbf9d') }}</p>
-  </div>
-  <div class="network-driver-panel blackbox-driver-panel" data-driver-panel="blackbox-link" hidden>
-    <div class="network-driver-flow blackbox-return-flow">
-      <div class="network-driver-node namespace"><small>SMITHPROXY</small><strong>{{ _('ui.7f9a271d041e') }}</strong><span>proxy egress</span></div>
-      <i class="network-driver-arrow"><span>egress</span></i>
-      <div class="network-driver-node egress-port"><small>BLACKBOX LINK</small><strong><span data-interface-label>do0</span></strong><span>{{ _('ui.505ab649e2d5') }}</span></div>
-      <i class="network-driver-arrow"><span>to VM</span></i>
-      <div class="network-driver-node blackbox-node"><small>BLACKBOX</small><strong>QEMU / KVM</strong><span>{{ _('ui.d3e34940d9f7') }}</span></div>
-    </div>
-    <div class="network-blackbox-return">BLACKBOX RETURN → SMITHPROXY → SAS EGRESS</div>
-    <p><b>Blackbox link</b> {{ _('ui.848e8be38ff1') }}</p>
+    <p><b>veth out</b> {{ _('ui.9dca67e1e7bb') }} <code>do0</code>{{ _('ui.806586745bc7') }}</p>
   </div>
   {% endif %}
+  <div class="network-driver-panel" data-driver-panel="none" hidden><div class="network-driver-node namespace"><small>INSTANCE NETNS</small><strong>{{ "no ingress" if kind == "ingress" else "no egress" }}</strong><span>{{ _( "network.no_ingress_help" if kind == "ingress" else "network.no_egress_help") }}</span></div></div>
 </aside>

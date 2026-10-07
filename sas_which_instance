@@ -1,0 +1,13 @@
+#!/usr/bin/env python3
+"""Read-only instance lookup; uses the same credentials and API as sasctl."""
+import sys
+import os
+from pathlib import Path
+from sas_client.cli import main
+
+# Deployment-local credentials, never shell-evaluate an environment file.
+if not any(os.environ.get(key) for key in ("SAS_RUNNER_TOKEN", "CZ_RUNNER_TOKEN", "SAS_RUNNER_TOKEN_FILE", "SASCTL_CONFIG")):
+    credentials = Path("/etc/smithproxy-appliance/runner-client.env")
+    if credentials.is_file():
+        os.environ["SAS_RUNNER_TOKEN_FILE"] = str(credentials)
+raise SystemExit(main(["instance", "location", *sys.argv[1:]]))

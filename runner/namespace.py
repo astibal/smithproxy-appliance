@@ -172,6 +172,7 @@ class NamespaceBackend:
         self.smithproxy_binary = smithproxy_binary
         self.network_settings = network_settings
         self.allocation_lock = threading.RLock()
+        self._ephemeral_allocations: dict[str, NetworkAllocation] = {}
 
     @staticmethod
     def unit_name(instance_id: str) -> str:
@@ -277,7 +278,7 @@ class NamespaceBackend:
                     return NetworkAllocation(**value)
                 except TypeError as exc:
                     raise BackendError(f"invalid saved network allocation: {exc}") from exc
-        return self._legacy_allocation(instance_id)
+        return self._ephemeral_allocations.get(instance_id) or self._legacy_allocation(instance_id)
 
     @staticmethod
     def ingress_id(instance_id: str) -> str:
@@ -294,12 +295,12 @@ class NamespaceBackend:
                     return NetworkAllocation(**value)
                 except TypeError as exc:
                     raise BackendError(f"invalid saved ingress allocation: {exc}") from exc
-        return self._legacy_allocation(ingress_id, "ingress", instance_id)
+        return self._ephemeral_allocations.get(ingress_id) or self._legacy_allocation(ingress_id, "ingress", instance_id)
 
     def _live_subnets(self) -> set[str]:
         result = set()
         for interface in self._ip_json(["ip", "-j", "addr", "show"]):
-            if not str(interface.get("ifname", "")).startswith(("czi", "czo")):
+            if not str(interface.get("ifname", "")).startswith(("czi", "czo", "czt")):
                 continue
             for address in interface.get("addr_info", []):
                 if address.get("family") == "inet" and address.get("prefixlen") == 30:
@@ -325,7 +326,7 @@ class NamespaceBackend:
                 item = NetworkAllocation(**existing)
                 if item.role != role or item.owner_id not in {"", owner_id}:
                     raise BackendError("saved network allocation has an incompatible role")
-                if item.guest_if not in {"di0", "do0"}:
+                if item.guest_if not in {"di0", "do0", "transport0"}:
                     raise BackendError("legacy network allocation must be cleaned before spawn")
                 return item
             settings = self.network_settings.get()
@@ -450,12 +451,15 @@ class NamespaceBackend:
             if str(item.get("table", "")) == str(ingress.route_table)
         ]
         def link_view(item: NetworkAllocation) -> dict:
+            if item.topology == "none":
+                return {"role": item.role, "enabled": False, "namespace": item.namespace,
+                        "host_interface": "", "guest_interface": "", "host_interfaces": []}
             subnet = item.subnet or str(ipaddress.ip_network(
                 f"{item.host_ip}/30", strict=False,
             ))
             via_tuntom = item.topology == "tuntom-via"
             return {
-                "role": item.role, "subnet": subnet,
+                "role": item.role, "subnet": subnet, "enabled": True, "namespace": item.namespace,
                 "host_interface": "" if via_tuntom else item.host_if,
                 "guest_interface": item.guest_if,
                 "expected_host_address": "" if via_tuntom else f"{item.host_ip}/30",
@@ -484,13 +488,22 @@ class NamespaceBackend:
             {"di0", "do0"}.issubset(tuntom_interfaces)
             if allocation.topology == "tuntom-via"
             else bool(
-                ingress_view["host_interfaces"] and egress_view["host_interfaces"]
+                (ingress.topology == "none" or ingress_view["host_interfaces"])
+                and (allocation.topology == "none" or egress_view["host_interfaces"])
                 and namespace_interfaces
             )
         )
         return {
             "present": present,
             "ingress": ingress_view, "egress": egress_view,
+            "transport": ({
+                **ingress_view,
+                "namespace_path": f"/run/netns/{ingress.namespace}",
+                "mode": ingress.egress_mode,
+                "interfaces": self._ip_json(["ip", "-j", "-n", ingress.namespace, "addr", "show"]),
+                "routes": self._ip_json(["ip", "-j", "-n", ingress.namespace, "route", "show"]),
+                "routes_v6": self._ip_json(["ip", "-j", "-6", "-n", ingress.namespace, "route", "show"]),
+            } if ingress.topology == "unlimited-veth" else None),
             "route_table": ingress.route_table,
             "packet_mark": hex(ingress.mark),
             "namespace_interfaces": namespace_interfaces,
@@ -750,9 +763,26 @@ class NamespaceBackend:
               tuntom_admission: str = "immediate", tuntom_mtu: int = 1500,
               tuntom_switch_ip: str = "", tuntom_secret: str = "",
               tuntom_tunnel_id: int = 0,
-              rootfs_path: str = "", preserve_allocations_on_failure: bool = False) -> str:
-        if egress_driver not in {"split-veth", "on-a-stick", "tuntom-via"}:
+              rootfs_path: str = "", preserve_allocations_on_failure: bool = False,
+              ingress_driver: str = "authorized-veth", program: dict | None = None) -> str:
+        if program and (not rootfs_path or ingress_driver != 'none' or egress_driver != 'none'):
+            raise BackendError('program runtime requires rootfs and Wiring-only networking')
+        if egress_driver == "veth-out":
+            egress_driver = "split-veth"
+        if ingress_driver not in {"authorized-veth", "unlimited-veth", "none"}:
+            raise BackendError("unsupported ingress network driver")
+        if egress_driver not in {"split-veth", "on-a-stick", "tuntom-via", "none"}:
             raise BackendError("unsupported egress network driver")
+        if ingress_driver != "authorized-veth":
+            if egress_driver not in {"split-veth", "none"}:
+                raise BackendError("passive ingress requires veth out or no egress")
+            return self._start_passive(
+                instance_id, config_path, ingress_driver, egress_driver,
+                smithproxy_binary, rootfs_path, config_mode, assets_path,
+                auto_restart, hard_runtime_seconds, egress_mode, sas_interface,
+                preserve_allocations_on_failure,
+                program,
+            )
         try:
             source = str(ipaddress.ip_address(source_ip))
         except ValueError as exc:
@@ -813,17 +843,14 @@ class NamespaceBackend:
                 allocations[instance_id] = asdict(allocation)
                 allocations[ingress_id] = asdict(ingress)
                 self.network_settings.save_allocations(allocations)
-        if egress_mode or sas_interface:
+        if egress_mode or sas_interface or egress_driver == "none":
             allocation = replace(
                 allocation,
                 egress_mode=egress_mode or allocation.egress_mode,
                 sas_interface=sas_interface or allocation.sas_interface,
                 topology=egress_driver,
             )
-            if self.network_settings:
-                allocations = self.network_settings.allocations()
-                allocations[instance_id] = asdict(allocation)
-                self.network_settings.save_allocations(allocations)
+            self._remember_allocation(instance_id, allocation)
         source_address = ipaddress.ip_address(source)
         if source_address.version == 6 and not ingress.guest_ip_v6:
             raise BackendError("IPv6 requires a dual-stack network allocation")
@@ -956,7 +983,7 @@ class NamespaceBackend:
                     if explicit else ""
                 )
                 snat_rule = ""
-                if allocation.egress_mode == "masquerade":
+                if allocation.egress_mode == "masquerade" and egress_driver != "none":
                     interface_match = (
                         f'oifname "{allocation.sas_interface}" '
                         if allocation.sas_interface else ""
@@ -1020,64 +1047,10 @@ class NamespaceBackend:
                 if completed.returncode:
                     raise BackendError(completed.stderr.strip() or "namespace nft failed")
 
-            unit = self.unit_name(instance_id)
-            # Smithproxy uses the fixed /var/run/smithproxy.default.pid path.
-            # Give every transient unit its own /run mount; /var/run is a
-            # symlink to it on modern distributions.  A network namespace
-            # alone does not isolate PID files.
-            private_run = config_path.parent / "run"
-            effective_binary = Path(smithproxy_binary or self.smithproxy_binary).resolve()
-            rootfs_properties = []
-            executable = str(effective_binary)
-            if rootfs_path:
-                rootfs_properties, executable = self._rootfs_execution_properties(
-                    config_path, rootfs_path
-                )
-            command = [
-                "systemd-run", "--quiet", f"--unit={unit}",
-                f"--slice={self.slice_name(instance_id)}",
-                "--property=Type=simple", "--property=KillMode=control-group",
-                "--property=TimeoutStopSec=10s",
-                "--property=MemoryMax=1G", "--property=TasksMax=256",
-                f"--property=NetworkNamespacePath=/run/netns/{allocation.namespace}",
-                *rootfs_properties,
-                *self._instance_storage_properties(
-                    config_path, private_run, effective_binary,
-                ),
-            ]
-            if tuntom_unit:
-                command.extend([
-                    f"--property=BindsTo={tuntom_unit}",
-                    f"--property=After={tuntom_unit}",
-                ])
-            if hard_runtime_seconds:
-                command.insert(5, f"--property=RuntimeMaxSec={hard_runtime_seconds}s")
-            if auto_restart:
-                # The runner performs bounded restarts so TTL remains
-                # authoritative. Keep the failed transient unit loaded long
-                # enough to restart it and let systemd enforce a second limit.
-                command.extend([
-                    "--property=StartLimitIntervalSec=60s",
-                    "--property=StartLimitBurst=5",
-                ])
-            else:
-                command.insert(2, "--collect")
-            if config_mode == "ro":
-                command.append(f"--property=ReadOnlyPaths={config_path}")
-            if assets_path:
-                asset_root = Path(assets_path).resolve()
-                if not asset_root.is_dir():
-                    raise BackendError("configuration assets are unavailable")
-                # Normal instances receive a private copy below their runtime
-                # workspace. The workspace bind above already exposes it and
-                # ReadWritePaths permits Smithproxy's generated cert caches.
-                if not asset_root.is_relative_to(config_path.parent.resolve()):
-                    raise BackendError("instance assets must be private to its runtime workspace")
-            command.extend([
-                "--", executable, "--config-file", str(config_path),
-            ])
-            self._run(command)
-            return unit
+            return self._launch_proxy(
+                instance_id, allocation, config_path, smithproxy_binary, rootfs_path,
+                config_mode, assets_path, auto_restart, hard_runtime_seconds, tuntom_unit,
+            )
         except Exception:
             self._cleanup_network(ingress)
             self._cleanup_network(allocation)
@@ -1086,8 +1059,181 @@ class NamespaceBackend:
                 self.network_settings.release(ingress_id)
             raise
 
+    def _remember_allocation(self, key: str, allocation: NetworkAllocation) -> None:
+        if self.network_settings:
+            with self.network_settings.lock:
+                values = self.network_settings.allocations()
+                values[key] = asdict(allocation)
+                self.network_settings.save_allocations(values)
+        else:
+            self._ephemeral_allocations[key] = allocation
+
+    def _routed_veth(self, link: NetworkAllocation) -> None:
+        """A routed link, not a selector or a firewall exception."""
+        self._run(["ip", "link", "add", link.host_if, "type", "veth",
+                   "peer", "name", link.guest_if, "netns", link.namespace])
+        for family, host, guest, prefix in (
+            ([], link.host_ip, link.guest_ip, 30),
+            (["-6"], link.host_ip_v6, link.guest_ip_v6, 126),
+        ):
+            if not host or not guest:
+                continue
+            self._run(["ip", *family, "addr", "add", f"{host}/{prefix}", "dev", link.host_if])
+            self._run(["ip", "-n", link.namespace, *family, "addr", "add",
+                       f"{guest}/{prefix}", "dev", link.guest_if])
+        self._run(["ip", "link", "set", link.host_if, "up"])
+        self._run(["ip", "-n", link.namespace, "link", "set", link.guest_if, "up"])
+        for family, gateway in (([], link.host_ip), (["-6"], link.host_ip_v6)):
+            if gateway:
+                self._run(["ip", "-n", link.namespace, *family, "route", "add",
+                           "default", "via", gateway, "dev", link.guest_if])
+        if link.egress_mode == "masquerade":
+            uplink = f'oifname "{link.sas_interface}" ' if link.sas_interface else ""
+            rules = [f'table inet {link.table} {{',
+                     ' chain postrouting { type nat hook postrouting priority srcnat; policy accept;']
+            for family, address in (("ip", link.guest_ip), ("ip6", link.guest_ip_v6)):
+                if address:
+                    rules.append(f'  iifname "{link.host_if}" {uplink}{family} saddr {address} masquerade')
+            rules.append(' }\n}')
+            result = subprocess.run(["nft", "-f", "/dev/stdin"], input="\n".join(rules),
+                                    capture_output=True, text=True, timeout=10, check=False)
+            if result.returncode:
+                raise BackendError(result.stderr.strip() or "veth NAT setup failed")
+
+    def _start_passive(
+        self, instance_id: str, config_path: Path, ingress_driver: str, egress_driver: str,
+        smithproxy_binary: str, rootfs_path: str, config_mode: str, assets_path: str,
+        auto_restart: bool, hard_runtime_seconds: int, egress_mode: str,
+        sas_interface: str, preserve_allocations_on_failure: bool, program: dict | None = None,
+    ) -> str:
+        # Keep identities in the same durable lease store used by restart/stop.
+        ingress_id = self.ingress_id(instance_id)
+        allocation = self._allocate(instance_id, "egress", instance_id)
+        ingress = None
+        try:
+            ingress = self._allocate(ingress_id, "ingress", instance_id)
+            allocation = replace(allocation, topology=egress_driver,
+                                 egress_mode=egress_mode or allocation.egress_mode,
+                                 sas_interface=sas_interface or allocation.sas_interface)
+            if ingress_driver == "unlimited-veth":
+                suffix = instance_id.replace("-", "")[:8]
+                ingress = replace(ingress, namespace=f"czt-{suffix}",
+                                  host_if=f"czt{suffix}", guest_if="transport0",
+                                  table=f"czt_{suffix}", topology="unlimited-veth")
+            else:
+                ingress = replace(ingress, topology="none")
+            self._remember_allocation(instance_id, allocation)
+            self._remember_allocation(ingress_id, ingress)
+            self._cleanup_network(ingress)
+            self._cleanup_network(allocation)
+            self._run(["ip", "netns", "add", allocation.namespace])
+            self._run(["ip", "-n", allocation.namespace, "link", "set", "lo", "up"])
+            if egress_driver != "none":
+                self._routed_veth(allocation)
+            if ingress_driver == "unlimited-veth":
+                self._run(["ip", "netns", "add", ingress.namespace])
+                self._run(["ip", "-n", ingress.namespace, "link", "set", "lo", "up"])
+                self._routed_veth(ingress)
+            # No source selector, host policy route, DNAT or interception here.
+            # Host forwarding/firewall and upstream return routing remain explicit
+            # operator prerequisites; this path never overrides them.
+            return self._launch_proxy(
+                instance_id, allocation, config_path, smithproxy_binary, rootfs_path,
+                config_mode, assets_path, auto_restart, hard_runtime_seconds,
+                program=program,
+            )
+        except Exception:
+            self._run(["systemctl", "stop", self.unit_name(instance_id)], tolerate_missing=True)
+            if ingress is not None:
+                self._cleanup_network(ingress)
+            self._cleanup_network(allocation)
+            if not preserve_allocations_on_failure:
+                for key in (instance_id, ingress_id):
+                    if self.network_settings:
+                        self.network_settings.release(key)
+                    self._ephemeral_allocations.pop(key, None)
+            raise
+
+    def _launch_proxy(
+        self, instance_id: str, allocation: NetworkAllocation, config_path: Path,
+        smithproxy_binary: str, rootfs_path: str, config_mode: str, assets_path: str,
+        auto_restart: bool, hard_runtime_seconds: int, tuntom_unit: str = "", program: dict | None = None,
+    ) -> str:
+        system_start = getattr(self, 'system_start', None)
+        if system_start:
+            instance = system_start.manager.peek(instance_id)
+            if instance:
+                wiring = getattr(self, 'wiring', None)
+                if wiring:
+                    wiring.prepare_instance(instance, apply_addressing=False)
+                system_start.check(instance, starting=True)
+        if program:
+            from .program_runtime import launch
+            return launch(self, instance_id, allocation, config_path.parent, Path(rootfs_path),
+                          program, auto_restart, hard_runtime_seconds)
+        unit = self.unit_name(instance_id)
+        # Smithproxy uses the fixed /var/run/smithproxy.default.pid path.
+        # Give every transient unit its own /run mount; /var/run is a
+        # symlink to it on modern distributions.  A network namespace
+        # alone does not isolate PID files.
+        private_run = config_path.parent / "run"
+        effective_binary = Path(smithproxy_binary or self.smithproxy_binary).resolve()
+        rootfs_properties = []
+        executable = str(effective_binary)
+        if rootfs_path:
+            rootfs_properties, executable = self._rootfs_execution_properties(
+                config_path, rootfs_path
+            )
+        command = [
+            "systemd-run", "--quiet", f"--unit={unit}",
+            f"--slice={self.slice_name(instance_id)}",
+            "--property=Type=simple", "--property=KillMode=control-group",
+            "--property=TimeoutStopSec=10s",
+            "--property=MemoryMax=1G", "--property=TasksMax=256",
+            f"--property=NetworkNamespacePath=/run/netns/{allocation.namespace}",
+            *rootfs_properties,
+            *self._instance_storage_properties(
+                config_path, private_run, effective_binary,
+            ),
+        ]
+        if tuntom_unit:
+            command.extend([
+                f"--property=BindsTo={tuntom_unit}",
+                f"--property=After={tuntom_unit}",
+            ])
+        if hard_runtime_seconds:
+            command.insert(5, f"--property=RuntimeMaxSec={hard_runtime_seconds}s")
+        if auto_restart:
+            # The runner performs bounded restarts so TTL remains
+            # authoritative. Keep the failed transient unit loaded long
+            # enough to restart it and let systemd enforce a second limit.
+            command.extend([
+                "--property=StartLimitIntervalSec=60s",
+                "--property=StartLimitBurst=5",
+            ])
+        else:
+            command.insert(2, "--collect")
+        if config_mode == "ro":
+            command.append(f"--property=ReadOnlyPaths={config_path}")
+        if assets_path:
+            asset_root = Path(assets_path).resolve()
+            if not asset_root.is_dir():
+                raise BackendError("configuration assets are unavailable")
+            # Normal instances receive a private copy below their runtime
+            # workspace. The workspace bind above already exposes it and
+            # ReadWritePaths permits Smithproxy's generated cert caches.
+            if not asset_root.is_relative_to(config_path.parent.resolve()):
+                raise BackendError("instance assets must be private to its runtime workspace")
+        command.extend([
+            "--", executable, "--config-file", str(config_path),
+        ])
+        self._run(command)
+        return unit
+
     def stop(self, unit: str) -> None:
         instance_id = unit.removeprefix("capture-zone-smithproxy-").removesuffix(".service")
+        if getattr(self, 'microservices', None):
+            self.microservices.stop_instance(instance_id)
         ingress_id = self.ingress_id(instance_id)
         self.stop_debug(instance_id)
         completed = subprocess.run(["systemctl", "stop", unit], capture_output=True, text=True,
@@ -1099,12 +1245,16 @@ class NamespaceBackend:
         if self.network_settings:
             self.network_settings.release(instance_id)
             self.network_settings.release(ingress_id)
+        self._ephemeral_allocations.pop(instance_id, None)
+        self._ephemeral_allocations.pop(ingress_id, None)
 
     def attach_source(self, instance_id: str, source_ip: str, profile: str,
                       socks_port: int = 1080, http_port: int = 3128,
                       tls_port: int = 50443, plaintext_port: int = 50080) -> None:
         allocation = self.allocation(instance_id)
         ingress = self.ingress_allocation(instance_id)
+        if ingress.topology in {"unlimited-veth", "none"}:
+            raise BackendError("source attachment requires Authorized veth")
         source = ipaddress.ip_address(source_ip)
         if source.version == 6 and not ingress.guest_ip_v6:
             raise BackendError("IPv6 attachment requires a dual-stack instance")
@@ -1256,6 +1406,10 @@ class NamespaceBackend:
             if completed.returncode:
                 raise BackendError(completed.stderr.strip() or "test drive nft failed")
             unit = self.test_drive_unit_name(drive_id)
+            system_start = getattr(self, 'test_drive_system_start', None)
+            if system_start:
+                from types import SimpleNamespace
+                system_start.check(SimpleNamespace(id=drive_id, namespace=allocation.namespace), starting=True)
             self._start_test_drive_service(
                 unit, allocation.namespace, binary, config_path,
                 private_run, resolver_path, ttl_seconds, config_mode,
@@ -1275,6 +1429,12 @@ class NamespaceBackend:
                                   config_mode: str = "ro") -> None:
         if config_mode not in {"ro", "rw"}:
             raise BackendError("invalid Test Drive config mode")
+        system_start = getattr(self, 'test_drive_system_start', None)
+        if system_start:
+            match = TEST_DRIVE_UNIT_RE.fullmatch(unit)
+            drive = system_start.manager.peek(match.group(1)) if match else None
+            if drive:
+                system_start.check(drive, starting=True)
         self._clear_test_drive_runtime_override(unit)
         command = [
                 "systemd-run", "--quiet", "--collect", f"--unit={unit}",
@@ -1623,6 +1783,10 @@ class NamespaceBackend:
     def slice_processes(self, instance_id: str, smithproxy_unit: str) -> list[dict]:
         """Return live process members of one logical SAS Slice."""
         members = [("smithproxy", smithproxy_unit)]
+        if getattr(self, 'microservices', None):
+            members.extend((f"microservice:{record['prefix']}", record['unit'])
+                           for record in self.microservices.runs(instance_id)
+                           if record['state'] != 'stopped')
         try:
             if self.allocation(instance_id).topology == "tuntom-via":
                 members.append(("tuntom-relay", self.tuntom_relay_unit_name(instance_id)))

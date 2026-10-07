@@ -1,0 +1,3 @@
+#!/bin/sh
+# Install as /usr/local/bin/sas_which_instance on a standard SAS deployment.
+exec /opt/smithproxy-appliance/console/.venv/bin/python /opt/smithproxy-appliance/sas_which_instance "$@"

@@ -21,6 +21,7 @@ from .output import emit
 
 
 INSTANCE_COLUMNS = [
+    ("alias", "ALIAS"),
     ("id", "ID"), ("state", "STATE"), ("desired_state", "DESIRED"), ("source_ip", "SOURCE"),
     ("user_id", "USER"), ("profile", "CONFIG PROFILE"),
     ("slice_unit", "SLICE"), ("slice_rss_bytes", "SLICE RSS"),
@@ -143,7 +144,14 @@ def terminal(client: RunnerClient, instance_id: str, kind: str) -> None:
     old = termios.tcgetattr(sys.stdin.fileno())
     try:
         tty.setraw(sys.stdin.fileno())
+        previous_size = None
         while not finished.is_set():
+            if kind == 'netns':
+                size = os.get_terminal_size(sys.stdout.fileno())
+                if size != previous_size:
+                    if not _terminal_send(connection, json.dumps({'type': 'resize', 'cols': size.columns, 'rows': size.lines}).encode()):
+                        break
+                    previous_size = size
             readable, _, _ = select.select([sys.stdin.fileno()], [], [], 0.1)
             if not readable:
                 continue
@@ -152,6 +160,8 @@ def terminal(client: RunnerClient, instance_id: str, kind: str) -> None:
                 break
             if data == b"\x1d":  # Ctrl+]
                 break
+            if kind == 'netns':
+                data = json.dumps({'type': 'input', 'data': data.decode('utf-8', 'replace')}).encode()
             if not _terminal_send(connection, data):
                 break
     except KeyboardInterrupt:
@@ -188,6 +198,36 @@ def build_parser() -> argparse.ArgumentParser:
     groups.add_parser("health", help="check the unauthenticated health endpoint")
     groups.add_parser("status", help="show runner status")
     groups.add_parser("openapi", help="print runner OpenAPI document")
+    drive = groups.add_parser('test-drive', help='Test Drive system microservices')
+    drive_sub = drive.add_subparsers(dest='command', required=True)
+    drive_check = drive_sub.add_parser('check-microservices')
+    drive_check.add_argument('instance')
+    drive_start = drive_sub.add_parser('system-start')
+    drive_start.add_argument('instance')
+    drive_start.add_argument('operation', choices=('status', 'enable', 'disable'))
+
+    l2 = groups.add_parser("l2", help="Wiring: isolated cables, switches and port addressing")
+    l2_sub = l2.add_subparsers(dest="command", required=True)
+    l2_sub.add_parser("list")
+    l2_sub.add_parser('addressing')
+    create_l2 = l2_sub.add_parser("create")
+    create_l2.add_argument("kind", choices=("virtual-cable", "virtual-switch"))
+    create_l2.add_argument("name")
+    for command in ("show", "delete", "attach", "detach", "configure-port"):
+        sub = l2_sub.add_parser(command)
+        sub.add_argument("segment", help="UUID, unique prefix, or exact name")
+        if command == "attach":
+            sub.add_argument("instance", help="managed instance ID or alias")
+            sub.add_argument("interface", help="new unaddressed interface, e.g. cable0")
+        elif command == "detach":
+            sub.add_argument("endpoint", help="endpoint UUID")
+        elif command == 'configure-port':
+            sub.add_argument('endpoint', help='endpoint UUID')
+            sub.add_argument('--mode', required=True, choices=['sas', 'guest', 'none'])
+            sub.add_argument('--address', action='append', default=[], help='IP/prefix; repeat for dual stack')
+            sub.add_argument('--route', action='append', default=[], help='"destination/prefix [gateway]"; repeatable')
+        if command in {"delete", "detach"}:
+            sub.add_argument("--yes", action="store_true")
 
     source = groups.add_parser("source", help="authorized source IP pool")
     source_sub = source.add_subparsers(dest="command", required=True)
@@ -203,7 +243,26 @@ def build_parser() -> argparse.ArgumentParser:
     instance = groups.add_parser("instance", help="Smithproxy instances")
     instance_sub = instance.add_subparsers(dest="command", required=True)
     instance_sub.add_parser("list")
-    for name in ("show", "diagnostics", "config", "cli", "gdb"):
+    check_services = instance_sub.add_parser("check-microservices", help="queue a check of this instance only")
+    check_services.add_argument("instance")
+    start_service = instance_sub.add_parser('system-start', help='show, enable or disable reserved 00-start')
+    start_service.add_argument('instance')
+    start_service.add_argument('operation', choices=('status', 'enable', 'disable'))
+    alias = instance_sub.add_parser("alias", help="set a unique persistent alias; empty name clears it")
+    alias.add_argument("instance")
+    alias.add_argument("name")
+    microservice = instance_sub.add_parser('microservice', help='Fabric V3 service status / verified stop')
+    microservice.add_argument('instance')
+    microservice.add_argument('prefix')
+    microservice.add_argument('operation', choices=('status', 'stop'))
+    microservice.add_argument('--run-id')
+    microservice.add_argument('--owner')
+    location = instance_sub.add_parser("location", help="host coordinates (read-only)")
+    location.add_argument("instance")
+    fields = location.add_mutually_exclusive_group()
+    for field in ("namespace", "namespace-path", "transport-namespace", "transport-namespace-path", "work-dir", "microservices-dir", "unit", "slice", "state", "origin"):
+        fields.add_argument("--" + field, dest="location_field", action="store_const", const=field.replace("-", "_"))
+    for name in ("show", "diagnostics", "config", "cli", "gdb", "netns"):
         item = instance_sub.add_parser(name)
         item.add_argument("instance")
     logs = instance_sub.add_parser("logs")
@@ -215,10 +274,14 @@ def build_parser() -> argparse.ArgumentParser:
     selection.add_argument("--build", help="standalone build ID or prefix")
     spawn.add_argument("--config-id", help="standalone config ID or prefix")
     spawn.add_argument("--cert-bundle", default="", help="certificate bundle for standalone mode")
-    spawn.add_argument("--source-ip", required=True)
+    spawn.add_argument("--source-ip", default="", help="required for Authorized veth only")
+    spawn.add_argument("--ingress-driver", choices=("authorized-veth", "unlimited-veth", "none"))
+    spawn.add_argument("--egress-driver", choices=("veth-out", "none"))
     spawn.add_argument("--user", required=True)
     spawn.add_argument("--ttl", type=lambda value: duration(value), default=1800)
     spawn.add_argument("--config-mode", choices=("ro", "rw"), default="ro")
+    spawn.add_argument('--no-system-start', action='store_true', help='disable reserved 00-start reconciliation')
+    spawn.add_argument('--wiring-file', type=Path, help='JSON list of Wiring bindings; overrides profile, [] clears')
     spawn.add_argument("--set", action="append", default=[], metavar="NAME=VALUE")
     spawn.add_argument("--workers", type=int, default=1)
     spawn.add_argument("--pcap-quota-mb", type=int, default=100)
@@ -263,19 +326,26 @@ def build_parser() -> argparse.ArgumentParser:
     show.add_argument("profile")
     create = profile_sub.add_parser("create")
     create.add_argument("name")
-    create.add_argument("--build", required=True)
-    create.add_argument("--config-id", required=True)
+    create.add_argument("--build")
+    create.add_argument("--config-id")
+    create.add_argument('--application', choices=('smithproxy', 'router', 'webfsd'), default='smithproxy')
+    create.add_argument('--http-port', type=int, default=8000)
+    create.add_argument('--rootfs-variant', choices=('barebone', 'utils', 'network'), default='barebone')
     create.add_argument("--cert-bundle", default="")
     create.add_argument("--ttl", type=ttl_duration, default=1800)
     create.add_argument("--auto-restart", action="store_true")
+    create.add_argument('--wiring-file', type=Path, help='JSON list of segment_id/interface bindings, no addresses')
     update = profile_sub.add_parser("update")
     update.add_argument("profile")
     update.add_argument("--name")
+    update.add_argument('--http-port', type=int)
+    update.add_argument('--rootfs-variant', choices=('barebone', 'utils', 'network'))
     update.add_argument("--build")
     update.add_argument("--config-id")
     update.add_argument("--cert-bundle")
     update.add_argument("--ttl", type=ttl_duration)
     update.add_argument("--auto-restart", choices=("yes", "no"))
+    update.add_argument('--wiring-file', type=Path, help='JSON list replacing Wiring bindings; [] clears')
     delete = profile_sub.add_parser("delete")
     delete.add_argument("profile")
     delete.add_argument("--yes", action="store_true")
@@ -412,7 +482,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _id(client: RunnerClient, kind: str, value: str) -> str:
     if kind == "instance":
-        return resolve(client.get("/v1/instances")["instances"], value, "id", "id")["id"]
+        return resolve(client.get("/v1/instances")["instances"], value, "id", "alias")["id"]
     if kind == "profile":
         return resolve(client.get("/v1/runtime-profiles")["profiles"], value, "profile_id")["profile_id"]
     if kind == "config":
@@ -436,15 +506,56 @@ def _id(client: RunnerClient, kind: str, value: str) -> str:
 
 def _instance(client: RunnerClient, args: argparse.Namespace) -> tuple[Any, Any]:
     command = args.command
+    if command == "location":
+        from urllib.parse import quote
+        result = client.get(f"/v1/instances/{quote(args.instance, safe='')}/location")
+        field = args.location_field
+        if field:
+            if field in {"namespace", "namespace_path"} and not result.get("namespace_exists"):
+                raise ValueError("instance network namespace is unavailable")
+            if field in {"transport_namespace", "transport_namespace_path"} and not result.get("transport_namespace_exists"):
+                raise ValueError("instance transport namespace is unavailable")
+            if field == "work_dir" and not result.get("work_dir_exists"):
+                raise ValueError("instance work directory is unavailable")
+            if field == "microservices_dir" and not result.get("microservices_dir_exists"):
+                raise ValueError("instance microservices directory has not been provisioned")
+            if not result.get(field):
+                raise ValueError(f"instance {field} is unavailable")
+            return result[field], None
+        return result, None
     if command == "list":
         values = client.get("/v1/instances")["instances"]
         return values, INSTANCE_COLUMNS
-    instance_id = _id(client, "instance", getattr(args, "instance", "")) if command != "spawn" else ""
+    # Historical service runs remain queryable after the instance was deleted.
+    instance_id = (args.instance if command == 'microservice' and re.fullmatch(
+        r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', args.instance)
+        else _id(client, "instance", getattr(args, "instance", "")) if command != "spawn" else "")
+    if command == "alias":
+        return client.post(f"/v1/instances/{instance_id}/alias", {"alias": args.name}), None
+    if command == 'check-microservices':
+        return complete(client, client.post(f'/v1/instances/{instance_id}/microservices/check', {}), args), None
+    if command == 'system-start':
+        path = f'/v1/instances/{instance_id}/microservices/00'
+        if args.operation == 'status':
+            return client.get(path), None
+        return complete(client, client.post(path + '/configure', {'enabled': args.operation == 'enable'}), args), None
+    if command == 'microservice':
+        if not re.fullmatch(r'[1-9][0-9]{0,8}', args.prefix):
+            raise ValueError('invalid microservice prefix')
+        path = f'/v1/instances/{instance_id}/microservices/{args.prefix}'
+        if args.operation == 'status':
+            return client.get(path, {'run_id': args.run_id} if args.run_id else {}), None
+        if not args.owner or not args.run_id:
+            raise ValueError('stop requires --owner and --run-id; withdraw registration first')
+        return client.request('POST', path + '/stop',
+            {'contract_version': 3, 'owner': args.owner, 'run_id': args.run_id}, timeout=35), None
     if command == "show": return client.get(f"/v1/instances/{instance_id}"), None
     if command == "diagnostics": return client.get(f"/v1/instances/{instance_id}/diagnostics"), None
     if command == "logs": return client.get(f"/v1/instances/{instance_id}/logs", {"lines": args.lines})["output"], None
     if command == "config": return client.get(f"/v1/instances/{instance_id}/config")["content"], None
-    if command in {"cli", "gdb"}:
+    if command in {"cli", "gdb", "netns"}:
+        if command == 'netns':
+            print('WARNING: root shell on HOST filesystem; only networking is isolated.', file=sys.stderr)
         terminal(client, instance_id, command)
         return None, None
     if command == "spawn":
@@ -454,6 +565,7 @@ def _instance(client: RunnerClient, args: argparse.Namespace) -> tuple[Any, Any]
         payload: dict[str, Any] = {
             "source_ip": args.source_ip, "user_id": args.user,
             "runtime_seconds": args.ttl, "config_mode": args.config_mode,
+            "system_start_enabled": not args.no_system_start,
             "template_values": assignments(args.set),
             "parameters": {
                 "workers": args.workers, "pcap_quota_mb": args.pcap_quota_mb,
@@ -462,6 +574,12 @@ def _instance(client: RunnerClient, args: argparse.Namespace) -> tuple[Any, Any]
                 "cli_port": args.cli_port,
             },
         }
+        for side in ("ingress", "egress"):
+            driver = getattr(args, f"{side}_driver", None)
+            if driver:
+                payload[f"network_{side}_driver"] = driver
+        if args.wiring_file:
+            payload['wiring'] = json.loads(args.wiring_file.read_text())
         payload["network_runtime"] = {
             name: value
             for name, value in (
@@ -524,18 +642,30 @@ def _profile(client: RunnerClient, args: argparse.Namespace) -> tuple[Any, Any]:
                                f"Delete profile {profile_id[:12]}", "profile-delete")
         return complete(client, value, args), None
     if args.command == "create":
+        if args.application == 'smithproxy' and (not args.build or not args.config_id):
+            raise ValueError('Smithproxy requires --build and --config-id')
+        if args.application != 'smithproxy' and (args.build or args.config_id or args.cert_bundle):
+            raise ValueError('program profiles do not use Smithproxy artifacts')
         payload = {
-            "name": args.name, "build_id": _id(client, "build", args.build),
-            "config_id": _id(client, "config", args.config_id),
+            "name": args.name, "build_id": _id(client, "build", args.build) if args.build else '',
+            "config_id": _id(client, "config", args.config_id) if args.config_id else '',
             "cert_bundle_id": _id(client, "bundle", args.cert_bundle) if args.cert_bundle else "",
             "ttl_seconds": args.ttl, "auto_restart": args.auto_restart,
+            "rootfs_variant": args.rootfs_variant,
         }
+        if args.application != 'smithproxy':
+            payload.update(application=args.application, filesystem_mode='rootfs',
+                           program_settings={'port': args.http_port} if args.application == 'webfsd' else {})
+        if args.wiring_file:
+            payload['wiring'] = json.loads(args.wiring_file.read_text())
         value = client.enqueue("POST", "/v1/runtime-profiles", payload,
                                f"Create profile {args.name}", "profile-create")
         return complete(client, value, args), None
     current = client.get(f"/v1/runtime-profiles/{profile_id}")
     payload = {
         "name": args.name if args.name is not None else current["name"],
+        "rootfs_variant": args.rootfs_variant or current.get('rootfs_variant', 'barebone'),
+        "filesystem_mode": current.get('filesystem_mode', 'host'),
         "build_id": _id(client, "build", args.build) if args.build else current["build_id"],
         "config_id": _id(client, "config", args.config_id) if args.config_id else current["config_id"],
         "cert_bundle_id": (_id(client, "bundle", args.cert_bundle) if args.cert_bundle else "")
@@ -544,6 +674,13 @@ def _profile(client: RunnerClient, args: argparse.Namespace) -> tuple[Any, Any]:
         "auto_restart": (args.auto_restart == "yes") if args.auto_restart is not None
         else current.get("auto_restart", False),
     }
+    if args.wiring_file:
+        payload['wiring'] = json.loads(args.wiring_file.read_text())
+    if current.get('application', 'smithproxy') != 'smithproxy':
+        payload.update(application=current['application'], filesystem_mode='rootfs',
+                       program_settings=current.get('program_settings', {}))
+        if args.http_port is not None:
+            payload['program_settings'] = {'port': args.http_port}
     value = client.enqueue("PUT", f"/v1/runtime-profiles/{profile_id}", payload,
                            f"Update profile {profile_id[:12]}", "profile-update")
     return complete(client, value, args), None
@@ -708,6 +845,52 @@ def _cert(client: RunnerClient, args: argparse.Namespace) -> tuple[Any, Any]:
 
 
 def dispatch(client: RunnerClient, args: argparse.Namespace) -> tuple[Any, Any]:
+    if args.group == 'test-drive':
+        items = client.get('/v1/test-drives')['test_drives']
+        item = resolve(items, args.instance, 'id')
+        path = f"/v1/test-drives/{item['id']}/microservices"
+        if args.command == 'check-microservices':
+            return complete(client, client.post(path + '/check', {}), args), None
+        if args.operation == 'status':
+            return client.get(path + '/00'), None
+        return complete(client, client.post(path + '/00/configure', {'enabled': args.operation == 'enable'}), args), None
+    if args.group == "l2":
+        base = "/v1/l2-segments"
+        if args.command == 'addressing':
+            return client.get(base + '/addressing'), None
+        if args.command == "create":
+            value = client.post(base, {"kind": args.kind, "name": args.name})
+        else:
+            items = client.get(base)["segments"]
+            if args.command == "list":
+                return items, [("id", "ID"), ("kind", "KIND"), ("name", "NAME"), ("state", "STATE"), ("error", "ERROR")]
+            segment = resolve(items, args.segment, "id")
+            path = base + "/" + segment["id"]
+            if args.command == "show":
+                return segment, None
+            if args.command == 'configure-port':
+                endpoint = resolve(segment['endpoints'], args.endpoint, 'id')
+                routes = []
+                for route in args.route:
+                    fields = route.split()
+                    if len(fields) not in {1, 2}:
+                        raise ValueError('route must be destination/prefix [gateway]')
+                    routes.append({'destination': fields[0], 'gateway': fields[1] if len(fields) == 2 else ''})
+                value = client.post(path + '/endpoints/' + endpoint['id'] + '/addressing',
+                                    {'mode': args.mode, 'addresses': args.address, 'routes': routes})
+                return complete(client, value, args), None
+            if args.command == "attach":
+                value = client.post(path + "/endpoints", {
+                    "instance_id": _id(client, "instance", args.instance),
+                    "interface": args.interface,
+                })
+            else:
+                confirm(args, "disconnect endpoint" if args.command == "detach" else "delete L2 segment")
+                if args.command == "detach":
+                    endpoint = resolve(segment["endpoints"], args.endpoint, "id")
+                    path += "/endpoints/" + endpoint["id"]
+                value = client.delete(path)
+        return complete(client, value, args), None
     if args.group == "health": return client.get("/healthz"), None
     if args.group == "status": return client.get("/v1/status"), None
     if args.group == "openapi": return client.get("/v1/openapi.json"), None

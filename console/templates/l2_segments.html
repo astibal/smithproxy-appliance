@@ -1,0 +1,88 @@
+{% extends 'base.html' %}
+{% block content %}
+<link rel="stylesheet" href="{{ url_for('static',filename='wiring.css',v='3') }}">
+<div class="headline"><div><h1>{{ _('l2.title') }}</h1><p>{{ _('l2.intro') }}</p></div><a class="button-link secondary" href="{{ url_for('l2_segments') }}">↻ {{ _('l2.refresh') }}</a></div>
+{% if error %}<div class="flash error">{{ error }}</div>{% endif %}
+<div class="wiring-toolbar"><label>{{ _('wiring.search') }}<input type="search" data-wiring-filter></label><span>{{ segments|length }} · {{ _('wiring.connections') }}</span></div>
+<details class="panel wiring-create" {% if not segments %}open{% endif %}><summary>{{ _('wiring.new') }}</summary>
+<form method="post" class="stack">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <label>{{ _('l2.name') }}<input name="name" required maxlength="128"></label>
+  <label>{{ _('l2.kind') }}<select name="kind"><option value="virtual-cable">{{ _('wiring.cable') }} · 2</option><option value="virtual-switch">{{ _('wiring.switch') }} · N</option></select></label>
+  <button>{{ _('l2.create') }}</button>
+</form>
+</details>
+<p class="hint">{{ _('l2.reserve_help') }}</p>
+<p class="hint">{{ _('wiring.scope') }}</p>
+{% macro tree(nodes) %}
+<ul class="wiring-tree">{% for node in nodes %}<li>
+  <details><summary><code>{{ node.prefix }}</code> <small>{{ _('wiring.summary') if node.summary else _('wiring.configured') }}</small></summary>
+  {% for usage in node.usages %}<div class="wiring-usage {{ 'wiring-declared' if not usage.managed else '' }}">
+    <code>{{ usage.address }}</code> · {{ usage.interface }}<br>
+    {% if usage.segment_id %}<a href="#endpoint-{{ usage.endpoint_id }}">{{ usage.segment_name }}</a>{% else %}{{ _('wiring.disconnected') }}{% endif %}
+    · <code>{{ usage.instance_id }}</code> · {{ _('wiring.sas') if usage.managed else _('wiring.guest') }}
+  </div>{% endfor %}
+  {{ tree(node.children) if node.children else '' }}
+  </details>
+</li>{% endfor %}</ul>
+{% endmacro %}
+<div class="wiring-workspace"><aside class="panel wiring-inventory"><details open><summary>{{ _('wiring.used_networks') }}</summary>
+<p class="hint">{{ _('wiring.inventory_help') }}</p>
+{% for version in [4,6] %}<h3>IPv{{ version }}</h3>{{ tree((inventory|default({})).get('tree', [])|selectattr('version','equalto',version)|list) }}{% endfor %}
+</details></aside><div class="wiring-connections">
+<p data-wiring-no-match hidden>{{ _('wiring.no_match') }}</p>
+{% for segment in segments %}
+{% set search = namespace(text=segment.name ~ ' ' ~ segment.id ~ ' ' ~ segment.kind) %}
+{% for ep in segment.endpoints %}{% set target = instances|selectattr('id','equalto',ep.instance_id)|first %}{% set search.text = search.text ~ ' ' ~ ep.instance_id ~ ' ' ~ ep.interface ~ ' ' ~ (target.alias if target and target.alias else '') %}{% endfor %}
+<section class="panel stack wiring-segment" data-wiring-segment="{{ search.text }}">
+  <div class="section-head"><div><h2>{{ segment.name }}</h2><code>{{ _('wiring.cable') if segment.kind == 'virtual-cable' else _('wiring.switch') }} · {{ segment.id }}</code></div><strong>{{ segment.endpoints|length }} / {{ 2 if segment.kind == 'virtual-cable' else '∞' }} · {{ _('wiring.state.' ~ segment.state) }}</strong></div>
+  <code>{{ segment.namespace }} / br0</code>
+  {% if segment.error %}<div class="flash error">{{ segment.error }}</div>{% endif %}
+  <div class="wiring-ends">
+  {% for ep in segment.endpoints %}
+  {% set target = instances|selectattr('id','equalto',ep.instance_id)|first %}
+  <article class="wiring-end" data-state="{{ ep.state }}" id="endpoint-{{ ep.id }}">
+    <div class="section-head"><span>{{ _('wiring.end') }} {{ loop.index }}</span><strong>{{ _('wiring.state.' ~ ep.state) }}</strong></div>
+    <h3>{{ target.alias if target and target.alias else ep.instance_id }}</h3>
+    <div class="wiring-identity"><code>{{ ep.instance_id }}</code></div>
+    <div>{{ _('l2.port') }}: <code>{{ ep.interface }}</code> · {{ ep.type }}</div>
+    {% if ep.error %}<div class="flash error">{{ ep.error }}</div>{% endif %}
+    {% set config = ep.get('addressing', {}) %}
+    {% set desired = config.get('desired', {'mode':'none','addresses':[],'routes':[]}) %}
+    <details class="wiring-address-editor"><summary>{{ _('wiring.ip_configuration') }} · {{ _('wiring.' ~ desired.mode) }}</summary>
+      <p>{{ _('l2.state') }}: {{ _('wiring.status.' ~ config.get('state', 'unmanaged')) }}</p>
+      {% if config.get('checked_at') %}<small>{{ config.checked_at }}</small>{% endif %}
+      {% if config.get('error') %}<div class="flash error">{{ config.error }}</div>{% endif %}
+      <form method="post" action="{{ url_for('l2_segments') }}" class="stack" data-wiring-address-form data-preview-url="{{ url_for('wiring_preview') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="action" value="addressing">
+        <input type="hidden" name="segment_id" value="{{ segment.id }}">
+        <input type="hidden" name="endpoint_id" value="{{ ep.id }}">
+        <label>{{ _('wiring.mode') }}<select name="mode">{% for mode in ['none','sas','guest'] %}<option value="{{ mode }}" {{ 'selected' if desired.mode == mode else '' }}>{{ _('wiring.' ~ mode) }}</option>{% endfor %}</select></label>
+        <label>{{ _('wiring.addresses') }}<textarea name="addresses" rows="3" spellcheck="false" placeholder="192.168.50.1/24&#10;fd42:1::1/64">{{ desired.addresses|join('\n') }}</textarea></label>
+        <label>{{ _('wiring.routes') }}<textarea name="routes" rows="3" spellcheck="false" placeholder="10.20.0.0/16 192.168.50.254">{% for route in desired.routes %}{{ route.destination }} {{ route.gateway }}{{ '\n' }}{% endfor %}</textarea></label>
+        <p class="hint">{{ _('wiring.apply_help') }}</p>
+        <div data-wiring-warnings aria-live="polite"></div>
+        <button>{{ _('wiring.save') }}</button><output data-wiring-result aria-live="polite"></output>
+      </form>
+    </details>
+    <footer><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="action" value="detach"><input type="hidden" name="segment_id" value="{{ segment.id }}"><input type="hidden" name="endpoint_id" value="{{ ep.id }}"><button class="danger compact">{{ _('l2.disconnect') }}</button></form></footer>
+  </article>{% endfor %}
+  {% if segment.kind == 'virtual-cable' %}{% for slot in range(2 - segment.endpoints|length) %}<div class="wiring-end wiring-empty">{{ _('wiring.free_end') }}</div>{% endfor %}{% endif %}
+  </div>
+  {% if segment.kind == 'virtual-switch' or segment.endpoints|length < 2 %}
+  <details class="wiring-connect"><summary>＋ {{ _('l2.connect') }}</summary>
+  <form method="post" class="stack">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="action" value="attach"><input type="hidden" name="segment_id" value="{{ segment.id }}">
+    <label>{{ _('l2.instance') }}<select name="instance_id" required><option value="">{{ _('wiring.choose') }}</option>{% for instance in instances if instance.state != 'orphaned' %}<option value="{{ instance.id }}">{{ instance.alias or instance.id }} · {{ instance.state }}</option>{% endfor %}</select></label>
+    <label>{{ _('l2.port') }}<input name="interface" value="cable0" required maxlength="15" pattern="[A-Za-z][A-Za-z0-9_-]{0,14}"><small>{{ _('l2.port_help') }}</small></label>
+    <button>{{ _('l2.connect') }}</button>
+  </form>
+  </details>
+  {% endif %}
+  {% if not segment.endpoints %}<form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="action" value="delete"><input type="hidden" name="segment_id" value="{{ segment.id }}"><button class="danger compact">{{ _('l2.delete') }}</button></form>{% endif %}
+</section>
+{% endfor %}
+</div></div>
+{% endblock %}
+{% block scripts %}<script src="{{ url_for('static',filename='wiring.js',v='3') }}" defer></script>{% endblock %}

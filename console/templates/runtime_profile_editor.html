@@ -4,6 +4,7 @@
 <form method="post" class="panel profile-edit-form">
   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
   <div class="config-editor-meta">
+    {% include '_rootfs_variant.html' %}
     <label>{{ _('ui.11002cd1dcb7') }}<input name="name" maxlength="128" value="{{ profile.name }}" required></label>
     <label>{{ _('ui.ef9b8b9ef8e5') }}<select name="build_id" id="profile-build-id" required>{% for artifact in status.build.artifacts|default([]) %}{% set id = artifact.build_id|default(artifact.commit_id) %}<option value="{{ id }}" title="{{ artifact.choice_title }}" {{ 'selected' if id == profile.build_id }}>{{ artifact.choice_label }}</option>{% endfor %}</select><small>{{ _('ui.b2f048205d61') }}</small></label>
     <label>{{ _('nav.configs') }}<select name="config_id" required>{% for config in status.build.configs|default([]) %}<option value="{{ config.config_id }}" {{ 'selected' if config.config_id == profile.config_id }} {{ 'disabled' if not config.native else '' }}>{{ config.name }} · {{ config.profile|default('custom') }} · {{ config.sha256[:12] }}{% if not config.native %} · legacy{% endif %}</option>{% endfor %}</select></label>
@@ -15,6 +16,7 @@
     <label class="check"><input type="checkbox" name="ttl_unlimited" {{ 'checked' if profile.ttl_seconds is none }}><span>Unlimited <small>{{ _('ui.c6b7a79cc893') }}</small></span></label>
     <label class="check"><input type="checkbox" name="auto_restart" {{ 'checked' if profile.auto_restart }}><span>{{ _('ui.62d3a1874a93') }} <small>{{ _('ui.af86ee18f74f') }}</small></span></label>
   </div>
+  {% include '_wiring_bindings.html' %}
   {% if profile.network_start_parameters %}<div class="network-start-contract"><b>{{ _('ui.28e9f1bf18e8') }}</b><code>{{ profile.network_start_parameters|join(' · ') }}</code><small>{{ _('ui.75f5c524ab8e') }}</small></div>{% endif %}
   {% if profile.newer_build_available %}<div class="flash warning profile-build-upgrade"><span>{{ _('ui.f58ebd648602') }} <code>{{ profile.newer_commit_id[:12] }}</code>{{ _('ui.55e131e404dd') }}</span><button type="button" class="compact" data-use-profile-build="{{ profile.newer_build_id }}">{{ _('ui.190439bbc358') }}</button></div>{% endif %}
   {% set instances = profile.usage.instances|default([]) %}
@@ -35,3 +37,4 @@
   </div>
 </section>
 {% endblock %}
+{% block scripts %}<script src="{{ url_for('static', filename='wiring-bindings.js', v='1') }}" defer></script>{% endblock %}

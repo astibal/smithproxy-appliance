@@ -98,6 +98,7 @@ class TestDriveManager:
         self.state_dir = state_dir
         self.runtime_root = runtime_root
         self.backend = backend
+        self.system_start = None
         self.default_ttl = default_ttl
         self.max_ttl = max_ttl
         if expired_retention_seconds < 0:
@@ -303,6 +304,15 @@ class TestDriveManager:
             if drive:
                 result.append(drive)
         return result
+
+    def check_microservices(self, drive_id: str) -> dict:
+        with self.lock:
+            drive = self.peek(drive_id)
+            if not drive or not self.system_start:
+                raise BackendError('Test Drive or 00-start unavailable')
+            return {'instance_id': drive_id, 'state': 'checked',
+                    'system_start': self.system_start.check(drive),
+                    'external_microservices': 'not_supported'}
 
     def peek(self, drive_id: str) -> TestDrive | None:
         """Read one last-reconciled Test Drive without taking the lifecycle lock."""

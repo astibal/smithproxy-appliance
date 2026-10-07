@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .systemd import BackendError
+from .wiring import bindings
 
 
 class RuntimeProfileLibrary:
@@ -138,6 +139,8 @@ class RuntimeProfileLibrary:
                 item.setdefault("ingress_network_profile_id", "")
                 item.setdefault("egress_network_profile_id", "")
                 item.setdefault("filesystem_mode", "host")
+                item.setdefault('wiring', [])
+                item.setdefault('application', 'smithproxy')
                 valid.append(item)
             return sorted(valid, key=lambda item: item.get("created_at", ""), reverse=True)
 
@@ -154,7 +157,9 @@ class RuntimeProfileLibrary:
                auto_restart: bool = False, ttl_seconds: int | None = 1800,
                ingress_network_profile_id: str = "",
                egress_network_profile_id: str = "",
-               filesystem_mode: str = "host") -> dict:
+               filesystem_mode: str = "host", wiring: list | None = None,
+               rootfs_variant: str = 'barebone', rootfs_image: str = '') -> dict:
+        wiring = bindings([] if wiring is None else wiring, profile=True)
         clean_name = name.strip()[:128]
         if not clean_name or any(ord(char) < 32 for char in clean_name):
             raise BackendError("runtime profile name is invalid")
@@ -173,6 +178,8 @@ class RuntimeProfileLibrary:
                 "ingress_network_profile_id": ingress_network_profile_id,
                 "egress_network_profile_id": egress_network_profile_id,
                 "filesystem_mode": filesystem_mode,
+                'rootfs_variant': rootfs_variant, 'rootfs_image': rootfs_image,
+                'wiring': wiring,
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
             items.append(item)
@@ -195,7 +202,10 @@ class RuntimeProfileLibrary:
                ttl_seconds: int | None = 1800,
                ingress_network_profile_id: str = "",
                egress_network_profile_id: str = "",
-               filesystem_mode: str = "host") -> dict:
+               filesystem_mode: str = "host", wiring: list | None = None,
+               rootfs_variant: str = 'barebone', rootfs_image: str = '') -> dict:
+        if wiring is not None:
+            wiring = bindings(wiring, profile=True)
         clean_name = name.strip()[:128]
         if not clean_name or any(ord(char) < 32 for char in clean_name):
             raise BackendError("runtime profile name is invalid")
@@ -206,6 +216,8 @@ class RuntimeProfileLibrary:
             item = next((candidate for candidate in items if candidate["profile_id"] == profile_id), None)
             if not item:
                 raise BackendError("runtime profile is unavailable")
+            if wiring is not None:
+                item['wiring'] = wiring
             item.update({
                 "name": clean_name,
                 "build_id": build_id,
@@ -217,6 +229,7 @@ class RuntimeProfileLibrary:
                 "egress_network_profile_id": egress_network_profile_id,
                 "filesystem_mode": filesystem_mode,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
+                'rootfs_variant': rootfs_variant, 'rootfs_image': rootfs_image,
             })
             self._save(items)
             return item
@@ -229,4 +242,71 @@ class RuntimeProfileLibrary:
                 return None
             self._save([candidate for candidate in items if candidate["profile_id"] != profile_id])
             shutil.rmtree(self.work_root / profile_id, ignore_errors=True)
+            return item
+
+    def save_program(self, payload: dict, profile_id: str = '', *, image_id: str = '') -> dict:
+        """Persist an application profile, independently of Smithproxy artifacts.
+
+        Runtime support is deliberately not implied by a saved definition.
+        """
+        application = payload.get('application')
+        if application not in {'router', 'webfsd'}:
+            raise BackendError('application must be router or webfsd')
+        name = payload.get('name', '')
+        if not isinstance(name, str) or not name.strip() or len(name) > 128 or any(ord(c) < 32 for c in name):
+            raise BackendError('runtime profile name is invalid')
+        ttl = payload.get('ttl_seconds', 1800)
+        if ttl is not None and (type(ttl) is not int or not 5 <= ttl <= 86400):
+            raise BackendError('ttl_seconds must be 5..86400 or null')
+        restart = payload.get('auto_restart', False)
+        if type(restart) is not bool:
+            raise BackendError('auto_restart must be a boolean')
+        settings = payload.get('program_settings', {})
+        if not isinstance(settings, dict):
+            raise BackendError('program_settings must be an object')
+        if application == 'router':
+            if settings:
+                raise BackendError('router has no configurable program settings')
+            settings = {}
+        else:
+            if set(settings) - {'port'}:
+                raise BackendError('webfsd only accepts port; document root is /work')
+            port = settings.get('port', 8000)
+            if type(port) is not int or not 1 <= port <= 65535:
+                raise BackendError('webfsd port must be 1..65535')
+            settings = {'port': port}
+        if any(payload.get(k) for k in ('build_id', 'config_id', 'cert_bundle_id',
+                                        'ingress_network_profile_id', 'egress_network_profile_id')):
+            raise BackendError('program profiles use Wiring, not Smithproxy artifacts or uplink profiles')
+        if payload.get('filesystem_mode', 'rootfs') != 'rootfs':
+            raise BackendError('program profiles require rootfs')
+        with self.lock:
+            items = self.list()
+            current = self.get(profile_id) if profile_id else None
+            if current and current.get('application') != application:
+                raise BackendError('profile application type cannot be changed')
+            links = bindings(payload.get('wiring', current.get('wiring', []) if current else []), profile=True)
+            item = dict(current or {})
+            item.update({
+                'profile_id': profile_id or str(uuid.uuid4()), 'name': name.strip(),
+                'application': application, 'program_settings': settings,
+                'filesystem_mode': 'rootfs', 'build_id': '', 'config_id': '',
+                'cert_bundle_id': '', 'ingress_network_profile_id': '',
+                'egress_network_profile_id': '', 'wiring': links,
+                'ttl_seconds': ttl, 'auto_restart': restart,
+                'rootfs_variant': payload.get('rootfs_variant', 'barebone'),
+                'rootfs_image': image_id,
+            })
+            item['updated_at' if current else 'created_at'] = datetime.now(timezone.utc).isoformat()
+            self._save([i for i in items if i['profile_id'] != item['profile_id']] + [item])
+            return item
+
+    def set_image(self, profile_id, selected, image_id):
+        from .runtime_images import variant
+        variant(selected)
+        with self.lock:
+            items = self.list()
+            item = next(i for i in items if i['profile_id'] == profile_id)
+            item.update(rootfs_variant=selected, rootfs_image=image_id)
+            self._save(items)
             return item

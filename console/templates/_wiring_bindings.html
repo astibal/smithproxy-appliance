@@ -1,0 +1,12 @@
+{% set wiring_spawn = wiring_spawn|default(false) %}
+<details class="panel" data-wiring-bindings data-spawn="{{ 'true' if wiring_spawn else 'false' }}"
+  {% if wiring_spawn %}data-target-form="spawn-form" hidden{% endif %}
+  data-choices='{{ wiring_choices()|tojson }}'
+  data-existing='{{ (profile.wiring|default([]) if profile is defined else [])|tojson }}'>
+  <summary>Wiring · {{ _('wiring.start_title') }}</summary>
+  <p class="hint">{{ _('wiring.start_help') }}</p>
+  {% if wiring_spawn %}<label class="check"><input type="checkbox" name="wiring_override"><span>{{ _('wiring.override') }}</span></label>{% endif %}
+  <div data-binding-rows></div>
+  <button type="button" class="secondary" data-binding-add>＋ {{ _('wiring.add_port') }}</button>
+  <a href="{{ url_for('l2_segments') }}" target="_blank" rel="noopener">Wiring ↗</a>
+</details>
