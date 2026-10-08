@@ -1,0 +1,20 @@
+<!doctype html><html lang="{{ locale }}"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="csrf-token" content="{{ csrf_token }}"><title>SAS · Workspace</title>
+<link rel="stylesheet" href="{{ url_for('static',filename='vendor/xterm/xterm.css') }}">
+<link rel="stylesheet" href="{{ url_for('static',filename='next/workspace.css') }}">
+<link rel="stylesheet" href="{{ url_for('static',filename='next/workflows.css') }}">
+<script src="{{ url_for('static',filename='vendor/xterm/xterm.js') }}" defer></script>
+<script src="{{ url_for('static',filename='vendor/xterm/addon-fit.js') }}" defer></script>
+<script type="module" src="{{ url_for('static',filename='next/workspace.js') }}"></script>
+</head><body>
+<aside class="sidebar" id="sidebar"><a href="#instances" class="brand"><span>S_</span><div>SAS<small>SOFTWARE APPLIANCE SERVER</small></div></a>
+<nav id="navigation" aria-label="Navigation"></nav>
+<footer><span>{{ g.admin.email }}</span><div class="languages">{% for code in ['cs','en','fr'] %}<button type="button" data-language="{{ code }}">{{ 'CZ' if code == 'cs' else code|upper }}</button>{% endfor %}</div>
+<form action="/logout" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button>{{ _('nav.logout') }}</button></form></footer></aside>
+<div class="workspace"><header class="topbar"><button id="menu-toggle" aria-label="Menu">☰</button><div><small>SAS / <span id="breadcrumb">Runtime</span></small><h1 id="page-title">Runtime</h1></div><span id="connection" role="status"></span><button id="refresh">↻</button></header>
+<div id="notice" role="status" hidden></div><main id="views"></main>
+<section class="terminal-dock" id="terminal-dock" hidden><header><strong id="terminal-title"></strong><button id="terminal-reconnect">Reconnect</button><button id="terminal-close">×</button></header><div id="terminal-screen"></div></section>
+<section class="task-dock"><button id="task-toggle" aria-expanded="false"><span id="task-label"></span><strong id="task-count">0</strong><span id="task-summary"></span><span>⌃</span></button><div id="task-list" hidden></div></section></div>
+<dialog id="editor"><form id="editor-form"><header><h2 id="editor-title"></h2><button type="button" id="editor-close">×</button></header><div id="editor-fields"></div><p id="editor-error" role="alert"></p><footer><button type="submit" id="editor-save"></button></footer></form></dialog>
+</body></html>

@@ -5,6 +5,8 @@ node_modules/
 console/.venv/
 console/node_modules/
 console/instance/
+console_next/instance/
+instance/
 console/__pycache__/
 .env
 .env.*

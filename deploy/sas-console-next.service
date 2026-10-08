@@ -1,0 +1,32 @@
+[Unit]
+Description=SAS responsive workspace preview
+After=network-online.target sas-runner.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=sas-console
+Group=sas-console
+WorkingDirectory=/opt/smithproxy-appliance
+EnvironmentFile=/etc/smithproxy-appliance/console.env
+EnvironmentFile=/etc/smithproxy-appliance/runner-client.env
+Environment=SMITHPROXY_APPLIANCE_CONSOLE_STATE=/var/lib/sas-console
+ExecStart=/opt/smithproxy-appliance/console/.venv/bin/gunicorn --workers 2 --threads 8 --worker-class gthread --bind [::]:6001 --access-logfile - --error-logfile - --timeout 120 "console_next.app:create_app()"
+Restart=on-failure
+RestartSec=2s
+KillMode=mixed
+UMask=0077
+ReadWritePaths=/var/lib/sas-console
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

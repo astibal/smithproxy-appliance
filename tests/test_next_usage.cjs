@@ -1,0 +1,22 @@
+const assert=require('node:assert/strict');
+const fs=require('node:fs');
+const url=file=>'data:text/javascript;base64,'+Buffer.from(fs.readFileSync(file,'utf8')).toString('base64');
+const el=(tag,attrs={},...children)=>({tag,attrs,children,append(...items){this.children.push(...items);}});
+(async()=>{
+  const {usagePanel}=await import(url('console_next/static/next/usage.js'));
+  assert.equal(usagePanel({}, {el}),null);
+  const item={usage:{runtime_profiles:[{profile_id:'a/b',name:'<example>'}],instances:[{id:'instance-id'}]}};
+  const panel=usagePanel(item,{el,language:'fr',instances:false,newTab:true});
+  assert.equal(panel.children[0].children[0],'Utilisation');
+  assert.equal(panel.children.length,2,'binary usage must list profiles only');
+  const link=panel.children[1].children[1];
+  assert.equal(link.attrs.href,'#profiles/a%2Fb');
+  assert.equal(link.attrs.rel,'noopener');assert.equal(link.attrs.target,'_blank');
+  assert.equal(link.children[0],'<example>','names are text, not markup');
+  assert.equal(usagePanel(item,{el}).children.length,3);
+  const {fieldLabel,choiceLabel}=await import(url('console_next/static/next/field-labels.js'));
+  assert.equal(fieldLabel('Destination CIDRs','fr'),'Préfixes de destination');
+  assert.equal(choiceLabel('barebone','barebone','en'),'Barebone · runtime only');
+  assert.equal(choiceLabel('arbitrary','User title','cs'),'User title');
+  console.log('Usage links and shared form labels tests passed');
+})().catch(error=>{console.error(error);process.exitCode=1;});

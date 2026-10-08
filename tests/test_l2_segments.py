@@ -287,7 +287,7 @@ class ConsoleTests(unittest.TestCase):
                     stream = io.BytesIO(json.dumps(value).encode())
                     stream.__enter__ = lambda: stream
                     return stream
-                with patch("console.app.urlopen", side_effect=response):
+                with patch("console_shared.runner_client.urlopen", side_effect=response):
                     result = client.get("/l2-segments")
                     self.assertEqual(result.status_code, 200)
                     self.assertIn(title, result.text)

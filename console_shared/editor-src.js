@@ -41,6 +41,7 @@ function initializeEditor() {
   const mount = document.querySelector("#config-editor");
   const source = document.querySelector("#config-editor-content");
   if (!mount || !source) return;
+  if (!mount.isConnected || mount.sasEditor) return;
   const wrap = new Compartment();
   const font = new Compartment();
   let wrapped = false;
@@ -58,6 +59,7 @@ function initializeEditor() {
       EditorView.updateListener.of(update => {
         if (!update.docChanged) return;
         source.value = update.state.doc.toString();
+        source.dispatchEvent(new Event("input", {bubbles: true}));
         if (stateLabel) {
           stateLabel.textContent = source.value === initial ? window.sasTr("ui.314b7f35e20f") : window.sasTr("ui.eb98d79c9feb");
           stateLabel.classList.toggle("dirty", source.value !== initial);
@@ -65,6 +67,11 @@ function initializeEditor() {
       }),
     ],
   });
+  mount.sasEditor = view;
+  mount.closest("dialog")?.addEventListener("close", () => {
+    view.destroy();
+    delete mount.sasEditor;
+  }, {once: true});
   document.querySelector("#editor-find")?.addEventListener("click", () => {
     openSearchPanel(view); view.focus();
   });

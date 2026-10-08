@@ -1,23 +1,22 @@
 from __future__ import annotations
 
 import json
+import sys
 import base64
 import os
 import secrets
-import threading
 from io import BytesIO
 from datetime import datetime, timezone
-from functools import wraps
 from pathlib import Path
-from urllib.error import HTTPError, URLError
-from urllib.parse import quote
-from urllib.request import Request, urlopen
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from console_shared.auth import install as install_auth
+from console_shared.runner_client import client as runner_client
+from console_shared.terminals import install as install_terminals
+from console_shared.assets import install as install_vendor
 
-import click
+from urllib.parse import quote
+
 from flask import Flask, Response, abort, flash, g, jsonify, redirect, render_template, request, send_file, session, stream_with_context, url_for
-from flask_sock import Sock
-from websockets.sync.client import connect as websocket_connect
-from werkzeug.security import check_password_hash, generate_password_hash
 
 try:
     from .i18n import LANGUAGES, translate
@@ -74,7 +73,6 @@ def create_app(test_config=None):
     )
     if test_config:
         app.config.update(test_config)
-    sock = Sock(app)
     Path(app.instance_path).mkdir(parents=True, exist_ok=True)
     app.secret_key = (
         app.config.get("SECRET_KEY")
@@ -82,91 +80,6 @@ def create_app(test_config=None):
         or os.getenv("SMITHPROXY_APPLIACE_CONSOLE_SECRET")
         or secrets.token_hex(32)
     )
-
-    admin_lock = threading.RLock()
-
-    def tr(key):
-        return translate(getattr(g, "locale", session.get("locale", "cs")), key)
-
-    def load_admins():
-        path = Path(app.config["ADMIN_FILE"])
-        try:
-            document = json.loads(path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            return []
-        except (OSError, json.JSONDecodeError) as exc:
-            raise RuntimeError(f"cannot read admin JSON: {exc}") from exc
-        admins = document.get("admins") if isinstance(document, dict) else None
-        if not isinstance(admins, list):
-            raise RuntimeError("admin JSON must contain an admins array")
-        return [item for item in admins if isinstance(item, dict)]
-
-    def save_admins(admins):
-        path = Path(app.config["ADMIN_FILE"])
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(".tmp")
-        temporary.write_text(json.dumps({"admins": admins}, indent=2) + "\n", encoding="utf-8")
-        os.chmod(temporary, 0o600)
-        temporary.replace(path)
-
-    def api(method, path, payload=None, request_timeout=None):
-        token = app.config["RUNNER_TOKEN"]
-        if not token:
-            raise RuntimeError("CZ_RUNNER_TOKEN is not configured")
-        body = json.dumps(payload).encode() if payload is not None else None
-        req = Request(app.config["RUNNER_URL"].rstrip("/") + path, data=body, method=method,
-                      headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
-        try:
-            # Namespace creation and graceful systemd shutdown can legitimately
-            # take longer than status polling.  Keep GET failures responsive,
-            # but do not abandon a mutating operation while it is still being
-            # completed by the runner.
-            timeout = (
-                float(request_timeout) if request_timeout is not None
-                else app.config["RUNNER_TIMEOUT"] if method == "GET"
-                else max(90, app.config["RUNNER_TIMEOUT"])
-            )
-            with urlopen(req, timeout=timeout) as response:
-                result = json.load(response)
-                if method == "GET" and path == "/v1/status":
-                    build = result.setdefault("build", {})
-                    build["artifacts"] = artifact_library_view(
-                        build.get("artifacts", [])
-                    )
-                return result
-        except HTTPError as exc:
-            try:
-                message = json.load(exc).get("error", str(exc))
-            except Exception:
-                message = str(exc)
-            raise RuntimeError(message) from exc
-        except (URLError, OSError, TimeoutError) as exc:
-            raise RuntimeError(f"runner unavailable: {exc}") from exc
-
-    def enqueue(method, path, payload, label, kind="runner-action"):
-        return api("POST", "/v1/task-actions", {
-            "method": method, "path": path, "payload": payload,
-            "label": label, "kind": kind,
-        })
-
-    def runner_download(path):
-        token = app.config["RUNNER_TOKEN"]
-        if not token:
-            raise RuntimeError("CZ_RUNNER_TOKEN is not configured")
-        req = Request(
-            app.config["RUNNER_URL"].rstrip("/") + path, method="GET",
-            headers={"Authorization": f"Bearer {token}", "Accept": "application/gzip"},
-        )
-        try:
-            return urlopen(req, timeout=max(90, app.config["RUNNER_TIMEOUT"]))
-        except HTTPError as exc:
-            try:
-                message = json.load(exc).get("error", str(exc))
-            except Exception:
-                message = str(exc)
-            raise RuntimeError(message) from exc
-        except (URLError, OSError, TimeoutError) as exc:
-            raise RuntimeError(f"runner unavailable: {exc}") from exc
 
     def flash_queued(result, message=None):
         message = message or tr('ui.84a30942b38b')
@@ -176,6 +89,19 @@ def create_app(test_config=None):
     def audit(action, detail=""):
         app.logger.info("audit admin=%s action=%s detail=%s",
                         session.get("admin_id", "-"), action, str(detail)[:1000])
+
+    auth = install_auth(app, audit)
+    tr, login_required = auth.tr, auth.login_required
+    transport = runner_client(app)
+    enqueue, runner_download = transport.enqueue, transport.download
+    def api(method, path, payload=None, request_timeout=None):
+        result = transport.api(method, path, payload, request_timeout)
+        if method == 'GET' and path == '/v1/status':
+            build = result.setdefault('build', {})
+            build['artifacts'] = artifact_library_view(build.get('artifacts', []))
+        return result
+    install_terminals(app, audit)
+    install_vendor(app)
 
     def artifact_time_view(item):
         result = dict(item)
@@ -261,31 +187,7 @@ def create_app(test_config=None):
             )
         return artifacts
 
-    def login_required(view):
-        @wraps(view)
-        def wrapped(*args, **kwargs):
-            if not g.admin:
-                return redirect(url_for("login"))
-            return view(*args, **kwargs)
-        return wrapped
 
-    @app.before_request
-    def security():
-        requested_locale = session.get("locale")
-        if requested_locale not in LANGUAGES:
-            best = request.accept_languages.best_match(list(LANGUAGES))
-            requested_locale = best or "cs"
-        g.locale = requested_locale
-        g.admin = None
-        if session.get("admin_id"):
-            g.admin = next(
-                (item for item in load_admins()
-                 if str(item.get("id")) == str(session["admin_id"])), None
-            )
-        if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.endpoint != "login":
-            supplied = request.form.get("csrf_token") or request.headers.get("X-CSRF-Token", "")
-            if not secrets.compare_digest(supplied, session.get("csrf_token", "")):
-                abort(400, "invalid CSRF token")
 
     def wiring_choices():
         try:
@@ -322,84 +224,10 @@ def create_app(test_config=None):
             'wiring_choices': wiring_choices,
         }
 
-    @app.after_request
-    def headers(response):
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
-        response.headers["Referrer-Policy"] = "no-referrer"
-        # xterm.js computes glyph dimensions at runtime and applies them through
-        # generated <style> blocks and style attributes. Scripts remain
-        # restricted to same-origin files; only CSS needs inline permission.
-        response.headers["Content-Security-Policy"] = "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; form-action 'self'; frame-ancestors 'none'"
-        return response
 
-    @app.route("/login", methods=["GET", "POST"])
-    def login():
-        if request.method == "POST":
-            admin = next((item for item in load_admins()
-                          if item.get("email") == request.form.get("email", "").lower()), None)
-            if admin and check_password_hash(admin["password_hash"], request.form.get("password", "")):
-                locale = g.locale
-                session.clear(); session["locale"] = locale
-                session["admin_id"] = admin["id"]; session["csrf_token"] = secrets.token_urlsafe(24)
-                audit("admin.login", admin["email"])
-                return redirect(url_for("console"))
-            flash(tr("login.invalid"), "error")
-        return render_template("login.html")
 
-    @app.post("/language/<locale_code>")
-    def set_language(locale_code):
-        if locale_code not in LANGUAGES:
-            abort(404)
-        session["locale"] = locale_code
-        target = request.form.get("next", "/")
-        if not target.startswith("/") or target.startswith("//"):
-            target = url_for("console") if g.admin else url_for("login")
-        return redirect(target)
 
-    @app.post("/logout")
-    def logout():
-        locale = g.locale
-        session.clear()
-        session["locale"] = locale
-        return redirect(url_for("login"))
 
-    @app.route("/preferences", methods=["GET", "POST"])
-    @login_required
-    def preferences():
-        if request.method == "POST":
-            current = request.form.get("current_password", "")
-            new = request.form.get("new_password", "")
-            confirmation = request.form.get("confirm_password", "")
-            if not check_password_hash(g.admin.get("password_hash", ""), current):
-                flash(tr("preferences.wrong_password"), "error")
-            elif len(new) < 12:
-                flash(tr("preferences.password_short"), "error")
-            elif new != confirmation:
-                flash(tr("preferences.password_mismatch"), "error")
-            elif check_password_hash(g.admin.get("password_hash", ""), new):
-                flash(tr("preferences.password_same"), "error")
-            else:
-                with admin_lock:
-                    admins = load_admins()
-                    admin = next((item for item in admins
-                                  if str(item.get("id")) == str(g.admin.get("id"))), None)
-                    if not admin:
-                        abort(409, "administrator account no longer exists")
-                    # Revalidate under the same lock used for the write. This
-                    # avoids overwriting a concurrent password change.
-                    if not check_password_hash(admin.get("password_hash", ""), current):
-                        flash(tr("preferences.wrong_password"), "error")
-                        return render_template("preferences.html"), 400
-                    admin["password_hash"] = generate_password_hash(new)
-                    admin["password_changed_at"] = datetime.now(timezone.utc).isoformat()
-                    save_admins(admins)
-                audit("admin.password.change", g.admin.get("email", ""))
-                session["csrf_token"] = secrets.token_urlsafe(24)
-                flash(tr("preferences.password_changed"), "success")
-                return redirect(url_for("preferences"))
-            return render_template("preferences.html"), 400
-        return render_template("preferences.html")
 
     @app.get("/")
     @login_required
@@ -2058,151 +1886,15 @@ def create_app(test_config=None):
                                 "action": payload.get("action", "command")}))
         except RuntimeError as exc: return jsonify(error=str(exc)), 503
 
-    @sock.route("/ws/instances/<instance_id>/<terminal_kind>")
-    def terminal_websocket(ws, instance_id, terminal_kind):
-        if terminal_kind not in {"cli", "gdb", "netns"}:
-            ws.close()
-            return
-        if not g.admin or not secrets.compare_digest(
-            request.args.get("csrf", ""), session.get("csrf_token", "")
-        ):
-            ws.close()
-            return
-        upstream_url = (
-            app.config["RUNNER_WS_URL"].rstrip("/")
-            + f"/v1/instances/{quote(instance_id, safe='')}/{terminal_kind}"
-        )
-        if terminal_kind == 'netns':
-            audit('instance.netns-shell', instance_id)
-        try:
-            with websocket_connect(
-                upstream_url,
-                additional_headers={"Authorization": f"Bearer {app.config['RUNNER_TOKEN']}"},
-                compression=None, max_size=64 * 1024, proxy=None,
-            ) as upstream:
-                finished = threading.Event()
 
-                def copy_output():
-                    try:
-                        for message in upstream:
-                            if finished.is_set(): break
-                            ws.send(message)
-                    except Exception as exc:
-                        app.logger.warning("%s upstream %s closed: %s", terminal_kind, instance_id, exc)
-                        try:
-                            ws.send(f"\r\n\x1b[31m{terminal_kind.upper()} upstream closed: {exc}\x1b[0m\r\n")
-                        except Exception:
-                            pass
-                    finally:
-                        finished.set()
-                        try: ws.close()
-                        except Exception: pass
 
-                reader = threading.Thread(target=copy_output, daemon=True, name=f"admin-{terminal_kind}-output")
-                reader.start()
-                try:
-                    while not finished.is_set():
-                        message = ws.receive()
-                        if message is None: break
-                        upstream.send(message)
-                finally:
-                    finished.set()
-                    try: upstream.close()
-                    except Exception: pass
-                    reader.join(timeout=2)
-        except Exception as exc:
-            app.logger.warning("%s bridge %s failed: %s", terminal_kind, instance_id, exc)
-            try:
-                ws.send(f"\r\n\x1b[31m{terminal_kind.upper()} connection failed: {exc}\x1b[0m\r\n")
-            except Exception:
-                pass
-            try: ws.close()
-            except Exception: pass
-
-    @sock.route("/ws/test-drives/<drive_id>/<terminal_kind>")
-    def test_drive_websocket(ws, drive_id, terminal_kind):
-        if terminal_kind not in {"cli", "shell"}:
-            ws.close()
-            return
-        if not g.admin or not secrets.compare_digest(
-            request.args.get("csrf", ""), session.get("csrf_token", "")
-        ):
-            ws.close()
-            return
-        upstream_url = (
-            app.config["RUNNER_WS_URL"].rstrip("/")
-            + f"/v1/test-drives/{quote(drive_id, safe='')}/{terminal_kind}"
-        )
-        try:
-            with websocket_connect(
-                upstream_url,
-                additional_headers={"Authorization": f"Bearer {app.config['RUNNER_TOKEN']}"},
-                compression=None, max_size=64 * 1024, proxy=None,
-            ) as upstream:
-                finished = threading.Event()
-
-                def copy_output():
-                    try:
-                        for message in upstream:
-                            if finished.is_set():
-                                break
-                            ws.send(message)
-                    except Exception as exc:
-                        app.logger.warning("test drive %s %s closed: %s", drive_id, terminal_kind, exc)
-                    finally:
-                        finished.set()
-                        try:
-                            ws.close()
-                        except Exception:
-                            pass
-
-                reader = threading.Thread(
-                    target=copy_output, daemon=True,
-                    name=f"test-drive-{terminal_kind}-output",
-                )
-                reader.start()
-                try:
-                    while not finished.is_set():
-                        message = ws.receive()
-                        if message is None:
-                            break
-                        upstream.send(message)
-                finally:
-                    finished.set()
-                    try:
-                        upstream.close()
-                    except Exception:
-                        pass
-                    reader.join(timeout=2)
-        except Exception as exc:
-            app.logger.warning("test drive bridge %s failed: %s", drive_id, exc)
-            try:
-                ws.send(f"\r\n\x1b[31m{terminal_kind.upper()} connection failed: {exc}\x1b[0m\r\n")
-            except Exception:
-                pass
-            try:
-                ws.close()
-            except Exception:
-                pass
-
-    @app.cli.command("create-admin")
-    @click.option("--email", required=True)
-    @click.password_option()
-    def create_admin(email, password):
-        if len(password) < 12: raise click.ClickException("heslo musí mít alespoň 12 znaků")
-        normalized = email.lower().strip()
-        with admin_lock:
-            admins = load_admins()
-            if any(item.get("email") == normalized for item in admins):
-                raise click.ClickException("admin už existuje")
-            admins.append({
-                "id": secrets.token_hex(16), "email": normalized,
-                "password_hash": generate_password_hash(password),
-            })
-            save_admins(admins)
-        click.echo("Admin vytvořen.")
 
     return app
+
+
+def create_next_app(test_config=None):
+    from console_next.app import create_app as create_modern_app
+    return create_modern_app(test_config)
 
 
 if __name__ == "__main__":

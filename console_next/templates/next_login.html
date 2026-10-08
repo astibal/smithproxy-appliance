@@ -1,0 +1,4 @@
+<!doctype html><html lang="{{ locale }}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SAS · Login</title><link rel="stylesheet" href="{{ url_for('static',filename='next/workspace.css') }}"></head>
+<body class="login-page"><main class="login"><div class="brand"><span>S_</span><div>SAS<small>SOFTWARE APPLIANCE SERVER</small></div></div><h1>{{ _('login.title') }}</h1>
+{% for category,message in get_flashed_messages(with_categories=true) %}<p role="alert">{{ message }}</p>{% endfor %}
+<form method="post"><label>{{ _('login.email') }}<input type="email" name="email" autocomplete="username" required autofocus></label><label>{{ _('login.password') }}<input type="password" name="password" autocomplete="current-password" required></label><button>{{ _('login.submit') }}</button></form></main></body></html>

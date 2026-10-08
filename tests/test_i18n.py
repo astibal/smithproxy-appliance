@@ -14,7 +14,7 @@ from i18n import CATALOGUE, translate
 
 class LocalizationTests(unittest.TestCase):
     def test_literal_catalogue_has_complete_languages_and_placeholders(self):
-        catalog = json.loads((CONSOLE / 'ui-translations.json').read_text())
+        catalog = json.loads((CONSOLE.parent / 'console_shared' / 'ui-translations.json').read_text())
         self.assertEqual({'cs', 'en', 'fr'}, set(catalog))
         for lang in ('en', 'fr'):
             self.assertEqual(set(catalog['cs']), set(catalog[lang]))
