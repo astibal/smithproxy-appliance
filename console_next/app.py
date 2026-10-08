@@ -8,6 +8,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from flask import Flask, Response, abort, jsonify, render_template, request, send_file, session, stream_with_context
+from werkzeug.exceptions import HTTPException
 from console_shared.assets import install as install_assets
 from console_shared.auth import install as install_auth
 from console_shared.runner_client import client
@@ -118,5 +119,12 @@ def create_app(test_config=None):
     @app.errorhandler(RuntimeError)
     def runner_error(error):
         return jsonify(error=str(error)), 503
+
+    @app.errorhandler(HTTPException)
+    def api_http_error(error):
+        if request.path.startswith(('/next-api/', '/api/instances/')):
+            code = 'csrf' if error.code == 400 and error.description == 'invalid CSRF token' else 'http_error'
+            return jsonify(error=error.description, error_code=code), error.code
+        return error
 
     return app

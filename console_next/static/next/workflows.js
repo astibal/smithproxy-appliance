@@ -4,6 +4,7 @@ import {firewallWorkflows} from './firewall-workflows.js';
 import {libraryWorkflows} from './library-workflows.js';
 import {fieldLabel,choiceLabel} from './field-labels.js';
 import {usagePanel} from './usage.js';
+import {downloadDraft} from './draft-download.js';
 // Stateful workflows: dialogs are not part of polled resource views.
 export function workflows({el, button, request, action, fetchItems, identity, notice, terminal, language, setCsrf}) {
   const labels={
@@ -17,7 +18,10 @@ export function workflows({el, button, request, action, fetchItems, identity, no
     copy:['Název kopie (prázdné = uložit původní)','Copy name (empty = replace original)','Nom de copie (vide = remplacer)'],
     approve:['Schválit a uložit','Approve and save','Approuver et enregistrer'],reject:['Zamítnout','Reject','Rejeter'],
     saved:['Uloženo','Saved','Enregistré'],
+    succeeded:['Dokončeno','Completed','Terminée'],failed:['Chyba','Failed','Échec'],cancelled:['Zrušeno','Cancelled','Annulée'],
     dirty:['Zahodit rozepsané změny?','Discard unsaved changes?','Abandonner les modifications ?'],
+    unsaved:['Neuložené změny','Unsaved changes','Modifications non enregistrées'],
+    draft:['Stáhnout rozepsané','Download draft','Télécharger le brouillon'],
     name:['Název','Name','Nom'],ref:['Git větev / ref','Git branch / ref','Branche / référence Git'],
     validating:['Úloha běží; editor zůstává otevřený.','Task running; editor remains open.','Tâche en cours ; l’éditeur reste ouvert.'],
     refresh:['Obnovit','Refresh','Actualiser'],newInstance:['Spustit instanci','Start instance','Démarrer une instance'],
@@ -33,21 +37,26 @@ export function workflows({el, button, request, action, fetchItems, identity, no
   const pending=new Map();
   function dialog(title) {
     const d=el('dialog',{class:'workflow-dialog'}),body=el('div',{class:'workflow-fields'}),status=el('p',{role:'status'}),footer=el('footer');
+    const badge=el('small',{class:'unsaved-indicator',hidden:''},tr('unsaved'));
     let dirty=false, revision=0;
+    const touch=()=>{dirty=true;revision++;badge.hidden=false;d.dataset.dirty='true';};
     const close=()=>{if(dirty&&!confirm(tr('dirty')))return;d.close();d.remove();};
-    d.append(el('header',{},el('h2',{},title),button('×',close)),body,status,footer);
-    d.addEventListener('input',()=>{dirty=true;revision++;});d.addEventListener('cancel',event=>{event.preventDefault();close();});
+    d.append(el('header',{},el('h2',{},title),badge,button('×',close)),body,status,footer);
+    d.addEventListener('input',touch);d.addEventListener('cancel',event=>{event.preventDefault();close();});
     document.body.append(d);d.showModal();
+    d.addEventListener('close',()=>window.dispatchEvent(new Event('sas:dialog-closed')),{once:true});
     const watch=refresh=>{const update=()=>{if(d.isConnected&&!window.getSelection()?.toString())refresh();};window.addEventListener('sas:task-completed',update);d.addEventListener('close',()=>window.removeEventListener('sas:task-completed',update),{once:true});};
     const unload=event=>{if(d.isConnected&&dirty){event.preventDefault();event.returnValue='';}};window.addEventListener('beforeunload',unload);d.addEventListener('close',()=>window.removeEventListener('beforeunload',unload),{once:true});
-    return {d,body,status,footer,revision:()=>revision,clean:()=>dirty=false,watch};
+    return {d,body,status,footer,revision:()=>revision,clean:()=>{dirty=false;badge.hidden=true;d.dataset.dirty='false';},touch,watch};
   }
   function field(w,name,value='',choices=null,type='text') {
     name=fieldLabel(name,language());
     const c=choices?el('select'):el('input',{type});
     if(choices)for(const [id,label]of choices)c.append(el('option',{value:id},choiceLabel(id,label,language())));
     if(choices&&value!==''&&!choices.some(([id])=>String(id)===String(value)))c.append(el('option',{value,disabled:''},'⚠ '+value));
-    c.value=value;c.setAttribute('aria-label',name);w.body.append(el('label',{},name,c));return c;
+    c.value=value;c.setAttribute('aria-label',name);w.body.append(el('label',{},name,c));
+    if(w.d)queueMicrotask(()=>{if(w.d.open&&document.activeElement===w.d.querySelector('header button'))w.body.querySelector('input:not([disabled]),select:not([disabled]),textarea:not([disabled])')?.focus();});
+    return c;
   }
   function commit(w,resource,command,id,payload,label=tr('submit')) {
     const b=button(label,async()=>{b.disabled=true;try{
@@ -91,6 +100,7 @@ export function workflows({el, button, request, action, fetchItems, identity, no
       const copy=item?field(w,tr('copy')):null;
       const tools=el('div',{class:'toolbar'});for(const [id,label]of [['editor-find',tr('find')],['editor-wrap',tr('wrap')],['editor-font-down','A−'],['editor-font-up','A+']])tools.append(el('button',{type:'button',id},label));w.body.append(tools);
       const mount=el('div',{id:'config-editor'}),source=el('textarea',{id:'config-editor-content',hidden:''});source.value=original.content;
+      tools.append(button(tr('draft'),()=>{try{downloadDraft(source.value,copy?.value||name.value);}catch(error){w.status.textContent=error.message;}}));
       w.body.append(mount,source);
       const validator=field(w,'Build',original.normalized_build_id||identity(builds[0]||{}),buildChoices(builds));
       const script=el('script',{src:'/static/vendor/codemirror/config-editor.js'});w.d.append(script);
@@ -116,7 +126,7 @@ export function workflows({el, button, request, action, fetchItems, identity, no
   function tasks(items) {
     for(const task of items){const entry=pending.get(task.task_id);if(!entry||!['succeeded','failed','cancelled'].includes(task.state))continue;
       pending.delete(task.task_id);const {w,b,preview}=entry;b.disabled=false;
-      w.status.textContent=task.state==='succeeded'?'✓ '+task.state:task.error||task.state;
+      w.status.textContent=task.state==='succeeded'?'✓ '+tr(task.state):task.error||tr(task.state);
       if(task.state==='succeeded'){if(w.revision()===entry.revision&&!preview)w.clean();w.afterSuccess?.();if(preview&&w.d.isConnected)result(task,{w,revision:entry.revision}).catch(e=>w.status.textContent=e.message);}
     }
   }
@@ -180,7 +190,7 @@ export function workflows({el, button, request, action, fetchItems, identity, no
     library.details(resource,item,bar);
     const id=identity(item),run=(cmd,payload={})=>action(resource,cmd,id,payload).catch(e=>notice(e.message,true));
     if(['binaries','tuntom'].includes(resource)) {
-      bar.append(button(tr('remove'),()=>{if(confirm(tr('confirm')))run('delete');}));
+      bar.append(button(tr('remove'),()=>{if(confirm(`${tr('remove')} · ${item.ref||item.name||id}\nID: ${id}\n\n${tr('confirm')}`))run('delete');}));
       if(resource==='binaries')bar.append(button(tr('extract'),()=>{const w=dialog(tr('extract'));commit(w,resource,'extract',id,()=>({}));}),button(tr('rootfs'),()=>run('rootfs')),button('Test Drive',()=>startDrive(item)));
     }
     if(resource==='instances'){
@@ -191,7 +201,7 @@ export function workflows({el, button, request, action, fetchItems, identity, no
         if(item.debug_unit)bar.append(button('GDB server ■',()=>run('debug-stop')));
       }
     }
-    if(resource==='configs')bar.append(button(tr('edit'),()=>configEditor(item)),button(tr('metadata'),()=>simple(resource,'metadata',item,[['name',tr('name'),item.name],['description',tr('description'),item.description||'']])),el('a',{href:`/configs/${id}/download`,class:'download-link'},tr('download')),button(tr('remove'),()=>{if(confirm(tr('confirm')))run('delete');}));
+    if(resource==='configs')bar.append(button(tr('edit'),()=>configEditor(item)),button(tr('metadata'),()=>simple(resource,'metadata',item,[['name',tr('name'),item.name],['description',tr('description'),item.description||'']])),el('a',{href:`/configs/${id}/download`,class:'download-link'},tr('download')),button(tr('remove'),()=>{if(confirm(`${tr('remove')} · ${item.name||id}\nID: ${id}\n\n${tr('confirm')}`))run('delete');}));
     if(resource==='tasks'&&item.state==='succeeded')bar.append(button(tr('result'),()=>result(item).catch(e=>notice(e.message,true))));
     if(resource==='test-drives'){
       bar.append(
@@ -200,7 +210,7 @@ export function workflows({el, button, request, action, fetchItems, identity, no
         button(tr('configMode'),()=>simple(resource,'config-mode',item,[['config_mode',tr('configMode'),item.config_mode||'ro',[['ro','RO'],['rw','RW']]]])),
         button(tr('extract'),()=>simple(resource,'extract',item,[['name',tr('name'),id]])),
         button(tr('upgrade'),async()=>{try{const builds=await fetchItems('binaries');simple(resource,'upgrade',item,[['build_id','Build',item.build_id,buildChoices(builds)]]);}catch(e){notice(e.message,true);}}),
-        button(tr('remove'),()=>{if(confirm(tr('confirm')))run('delete');})
+        button(tr('remove'),()=>{if(confirm(`${tr('remove')} · Test Drive ${id}\n\n${tr('confirm')}`))run('delete');})
       );
       if(item.state==='running')bar.append(button('CLI',()=>terminal(item,'cli','test-drives')),button('Shell',()=>terminal(item,'shell','test-drives')));
     }

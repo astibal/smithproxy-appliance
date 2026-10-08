@@ -137,9 +137,9 @@ export function networkWorkflows({el,button,request,action,fetchItems,identity,n
       const segment=field(nested,'Cable / switch',binding.segment_id||'',choices),port=field(nested,'Interface',binding.interface||`cable${entries.length}`);
       let mode=null,addresses=null;
       if(spawn){mode=field(nested,t('mode'),binding.addressing?.mode||'none',[['none',t('none')],['sas',t('sas')],['guest',t('guest')]]);addresses=area(nested,t('addresses'),(binding.addressing?.addresses||[]).join('\n'));addresses.oninput=()=>mode.value='sas';}
-      box.append(button('×',()=>box.remove()));entries.push({box,segment,port,mode,addresses});update();
+      box.append(button('×',()=>{box.remove();w.touch?.();}));entries.push({box,segment,port,mode,addresses});update();
     }
-    const addButton=button('+ '+fieldLabel('Cable / switch',language()),()=>add());panel.append(addButton);
+    const addButton=button('+ '+fieldLabel('Cable / switch',language()),()=>{add();w.touch?.();});panel.append(addButton);
     function update(){const disabled=override&&override.value!=='true';for(const c of rows.querySelectorAll('input,select,textarea,button'))c.disabled=disabled;addButton.disabled=disabled;}
     if(override)override.onchange=update;for(const binding of existing)add(binding);update();
     const read=()=>{

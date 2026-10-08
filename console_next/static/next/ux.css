@@ -1,0 +1,81 @@
+/* Small, independent workspace refinements; no runner/runtime styling. */
+#notice {
+  position:fixed;right:20px;bottom:62px;z-index:12;
+  margin:0;max-width:min(560px,calc(100vw - 28px));
+  display:flex;align-items:flex-start;gap:14px;
+  box-shadow:0 5px 24px #0008;
+}
+.notice-message {display:block;white-space:pre-wrap;overflow-wrap:anywhere;max-height:30vh;overflow:auto}
+#notice>div {min-width:0;flex:1}
+.notice-link {display:block;color:var(--accent);text-decoration:underline;margin-top:8px}
+#notice>button {flex-shrink:0;padding:0 5px;border:0;background:none}
+#notice.error {border-color:#ffaaa8;background:#382322}
+#connection.error {color:#ffaaa8}
+#refresh[aria-busy=true] {border-color:var(--accent);color:var(--accent)}
+#menu-toggle {display:block;flex-shrink:0}
+@media(min-width:721px){
+  .nav-collapsed .sidebar {visibility:hidden;transform:translateX(-100%)}
+  .nav-collapsed .workspace {margin-left:0}
+  .nav-collapsed .task-dock {left:0}
+}
+.resource-view th {padding:0}
+.resource-view th>button {width:100%;padding:13px 12px;text-align:left;border:0;border-radius:0;background:none;color:var(--muted)}
+.resource-view th>button::after {content:' ↕';opacity:.45}
+.resource-view th[aria-sort=ascending]>button,.resource-view th[aria-sort=descending]>button {color:var(--accent)}
+.resource-view th[aria-sort=ascending]>button::after {content:' ↑';opacity:1}
+.resource-view th[aria-sort=descending]>button::after {content:' ↓';opacity:1}
+.resource-view th {position:sticky;top:0;z-index:1}
+.resource-view td {font-size:14px}
+.resource-view tr[data-state=failed] td:nth-child(2) {color:#ffaaa8}
+.resource-view tr[data-state=running] td:nth-child(2),.resource-view tr[data-state=succeeded] td:nth-child(2) {color:var(--accent)}
+.resource-view tr[data-state=pending] td:nth-child(2),.resource-view tr[data-state=starting] td:nth-child(2),.resource-view tr[data-state=orphaned] td:nth-child(2) {color:#ecd69f}
+.resource-view .inactive {background:#142019}
+.selection-filter-note {border-left:2px solid #b39b59;padding:8px 12px;margin:12px 0;color:#ecd69f;font-size:12px}
+.selection-filter-note p {margin:0 0 6px}
+.selection-filter-note button {margin:0}
+.unsaved-indicator {font-size:11px;color:#ecd69f;max-width:160px;flex-shrink:0}
+#editor-error:not(.error) {color:var(--muted)}
+.auth-recovery {padding:16px;background:#2c2a1b;border:1px solid #b39b59;font-size:13px;overflow-wrap:anywhere}
+.auth-recovery p {margin:0 0 10px}
+.auth-recovery p:empty {display:none}
+.auth-recovery>div {display:flex;gap:10px;flex-wrap:wrap}
+.auth-recovery .download-link {margin:0}
+body>.auth-recovery {position:fixed;top:16px;right:16px;z-index:15;max-width:min(520px,calc(100vw - 32px));box-shadow:0 5px 24px #0008}
+dialog>.auth-recovery {margin-bottom:16px}
+.workflow-dialog>header,#editor header {position:sticky;top:-24px;background:var(--panel);z-index:3;margin:-24px -24px 18px;padding:18px 24px;border-bottom:1px solid var(--line);gap:16px}
+.workflow-dialog>header h2,#editor header h2 {margin:0;min-width:0;overflow-wrap:anywhere;flex:1}
+.workflow-dialog>footer,#editor footer {position:sticky;bottom:-24px;background:var(--panel);z-index:3;margin:20px -24px -24px;padding:16px 24px;border-top:1px solid var(--line)}
+@media(max-width:520px){
+  .workflow-dialog>header,#editor header {top:-16px;margin:-16px -16px 16px;padding:14px 16px;gap:8px}
+  .workflow-dialog>footer,#editor footer {bottom:-16px;margin:16px -16px -16px;padding:12px 16px}
+  .unsaved-indicator {max-width:95px;font-size:10px}
+}
+.actions [aria-pressed=true],.log-toolbar [aria-pressed=true] {border-color:var(--accent);color:var(--accent)}
+.task-dock #task-list>div {display:block;padding:0;border:0}
+.task-list-toolbar {margin-bottom:8px}
+.task-rows .task-row {display:flex;gap:14px;padding:10px 4px;border-top:1px solid var(--line)}
+.task-row>a {flex:2;min-width:160px;color:var(--accent);overflow-wrap:anywhere}
+.task-row>a:hover {text-decoration:underline}
+.task-row[data-state=failed]>b {color:#ffaaa8}
+.task-row[data-state=pending]>b,.task-row[data-state=running]>b {color:#ecd69f}
+.task-row[data-state=succeeded]>b {color:var(--accent)}
+.task-row>small {min-width:140px}
+.task-row>.task-duration {flex:none;font-variant-numeric:tabular-nums;font-size:12px;color:var(--muted);white-space:nowrap}
+#task-toggle.error,#task-toggle.error #task-summary {color:#ffaaa8}
+.log-toolbar {display:flex;flex-wrap:wrap;gap:6px;margin:18px 0 8px}
+.log-toolbar button {margin:0;padding:6px 9px;font-size:12px}
+.inspector .log-buffer,.workflow-dialog .log-buffer {padding:14px;background:#050c09;white-space:pre;overflow:auto;min-height:150px;max-height:55vh;tab-size:4}
+.inspector .log-buffer.wrap-lines,.workflow-dialog .log-buffer.wrap-lines {white-space:pre-wrap}
+.terminal-maximized {position:fixed;inset:10px 10px 56px!important;margin:0!important;z-index:10;display:flex;flex-direction:column;box-shadow:0 0 0 20px #0008}
+.terminal-maximized .terminal-panels {flex:1;min-height:0}
+.terminal-maximized .terminal-screen {height:100%;min-height:0;resize:none}
+.terminal-maximized .terminal-tabs {max-height:25vh;overflow:auto}
+.terminal-dock button:focus-visible,button:focus-visible,a:focus-visible {outline:2px solid var(--accent)}
+@media(max-width:720px){
+  #notice {right:10px;bottom:56px;font-size:12px}
+  #connection {display:block;max-width:100%;flex-basis:100%;order:5;margin-left:0;font-size:10px}
+  .resource-view th>button {padding:10px}
+  .terminal-maximized {inset:4px 4px 52px!important}
+  .terminal-dock header button {padding:6px 8px;font-size:12px}
+}
+@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}

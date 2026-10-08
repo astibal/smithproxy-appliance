@@ -18,6 +18,14 @@ const fs=require('node:fs');
   assert.equal(count,2);assert.equal(prevented,true);
   handlers.keydown({target:row,key:' ',preventDefault:()=>{}});assert.equal(count,3);
   handlers.keydown({target:cell,key:'Enter'});assert.equal(count,3);
-  handlers.keydown({target:row,key:'ArrowDown'});assert.equal(count,3);
+  let focused='';const next={focus:()=>focused='next'},previous={focus:()=>focused='previous'};
+  row.nextElementSibling=next;row.previousElementSibling=previous;
+  row.parentElement={firstElementChild:previous,lastElementChild:next};
+  for(const [key,expected]of [['ArrowDown','next'],['ArrowUp','previous'],['Home','previous'],['End','next']]){
+    handlers.keydown({target:row,key,preventDefault:()=>{}});assert.equal(focused,expected);assert.equal(count,3);
+  }
+  row.nextElementSibling=null;
+  handlers.keydown({target:row,key:'ArrowDown',preventDefault:()=>{}});assert.equal(count,3);
+  focused='';handlers.keydown({target:row,key:'Home',ctrlKey:true});assert.equal(focused,'');
   console.log('Row selection tests passed');
 })().catch(error=>{console.error(error);process.exitCode=1;});

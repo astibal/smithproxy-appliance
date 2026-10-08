@@ -78,3 +78,21 @@ class StandaloneConsoleTests(unittest.TestCase):
             session.clear()
         self.assertEqual(self.client.get('/next-api/catalog/profiles').status_code, 401)
         self.assertEqual(self.client.get('/configs/cfg/download').status_code, 302)
+
+    def test_expired_csrf_is_structured_and_never_reaches_runner(self):
+        response = self.client.post('/next-api/action', json={
+            'resource': 'instances', 'action': 'stop', 'id': 'test-only'},
+            headers={'X-CSRF-Token': 'old-token'})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json['error_code'], 'csrf')
+        self.assertEqual(self.calls, [])
+        session = self.client.get('/next-api/session').json
+        self.assertEqual(session['csrf'], 'csrf')
+        self.assertEqual(session['id'], 'admin')
+        self.assertIn(b'data-admin-id="admin"', self.client.get('/').data)
+
+    def test_http_errors_are_json_only_for_api_routes(self):
+        response = self.client.get('/api/instances/i/unsupported')
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json['error_code'], 'http_error')
+        self.assertEqual(self.client.get('/unknown-page').mimetype, 'text/html')

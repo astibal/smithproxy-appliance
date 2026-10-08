@@ -5,8 +5,13 @@ export function completed(previous, tasks) {
 }
 export function changed(previous, next) { return JSON.stringify(previous) !== JSON.stringify(next); }
 export function filtered(items, query) {
-  const words = query.toLocaleLowerCase().trim().split(/\s+/).filter(Boolean);
-  return items.filter(item => words.every(word => JSON.stringify(item).toLocaleLowerCase().includes(word)));
+  const normalize=value=>String(value).normalize('NFKD').replace(/\p{M}/gu,'').toLowerCase();
+  const words = normalize(query).trim().split(/\s+/).filter(Boolean);
+  if(!words.length)return items;
+  // Search values, not JSON property names (e.g. "failed" must not match a
+  // healthy item merely because it has a failed_count field).
+  const values=value=>value==null?'':typeof value==='object'?Object.values(value).map(values).join(' '):String(value);
+  return items.filter(item => {const haystack=normalize(values(item));return words.every(word=>haystack.includes(word));});
 }
 export function sortedBranches(branches, artifacts, now=Date.now()) {
   const built=new Set(artifacts.map(item=>item.ref));
@@ -43,6 +48,7 @@ export function resourceScope(items, resource, scope='all') {
     }
     if(resource==='profiles')return scope==='smithproxy'?(item.application||'smithproxy')==='smithproxy':item.application&&item.application!=='smithproxy';
     if(resource==='instances')return scope==='active'?['running','starting'].includes(item.state):scope==='problems'?item.orphaned||['failed','orphaned'].includes(item.state):['stopped','expired'].includes(item.state);
+    if(resource==='tasks')return scope==='active'?['pending','running'].includes(item.state):scope==='problems'?item.state==='failed':['succeeded','failed','cancelled'].includes(item.state);
     return true;
   });
 }

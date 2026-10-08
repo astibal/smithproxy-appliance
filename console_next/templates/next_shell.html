@@ -4,10 +4,11 @@
 <link rel="stylesheet" href="{{ url_for('static',filename='vendor/xterm/xterm.css') }}">
 <link rel="stylesheet" href="{{ url_for('static',filename='next/workspace.css') }}">
 <link rel="stylesheet" href="{{ url_for('static',filename='next/workflows.css') }}">
+<link rel="stylesheet" href="{{ url_for('static',filename='next/ux.css') }}">
 <script src="{{ url_for('static',filename='vendor/xterm/xterm.js') }}" defer></script>
 <script src="{{ url_for('static',filename='vendor/xterm/addon-fit.js') }}" defer></script>
 <script type="module" src="{{ url_for('static',filename='next/workspace.js') }}"></script>
-</head><body>
+</head><body data-admin-id="{{ g.admin.id }}">
 <aside class="sidebar" id="sidebar"><a href="#instances" class="brand"><span>S_</span><div>SAS<small>SOFTWARE APPLIANCE SERVER</small></div></a>
 <nav id="navigation" aria-label="Navigation"></nav>
 <footer><span>{{ g.admin.email }}</span><div class="languages">{% for code in ['cs','en','fr'] %}<button type="button" data-language="{{ code }}">{{ 'CZ' if code == 'cs' else code|upper }}</button>{% endfor %}</div>

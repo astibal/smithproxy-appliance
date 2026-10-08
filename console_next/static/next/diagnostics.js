@@ -3,6 +3,14 @@ export function formatRoutes(items=[]){return items.map(r=>[r.dst||'default',r.g
 export function renderDiagnostics(root,data,{el,button,copy,language}) {
   const labels={execution:['Běh a procesy','Execution and processes','Exécution et processus'],paths:['Cesty a izolace','Paths and isolation','Chemins et isolation'],binding:['Profily a síť','Profiles and networking','Profils et réseau'],network:['Rozhraní a routy','Interfaces and routes','Interfaces et routes'],crash:['Poslední pád','Last crash','Dernier plantage'],debug:['Remote GDB','Remote GDB','GDB distant']};
   const title=k=>labels[k][Math.max(0,['cs','en','fr'].indexOf(language))];
+  const fieldLabels={
+    model:['Model běhu','Execution model','Modèle d’exécution'],unit:['Systemd unita','Systemd unit','Unité systemd'],slice:['Slice','Slice','Slice'],auto_restart:['Automatický restart','Auto restart','Redémarrage automatique'],last_restart:['Poslední restart','Last restart','Dernier redémarrage'],
+    rootfs:['Rootfs','Rootfs','Rootfs'],mode:['Izolace','Isolation','Isolation'],namespace:['Namespace','Namespace','Namespace'],namespace_path:['Cesta namespace','Namespace path','Chemin du namespace'],binary:['Binárka','Binary','Binaire'],runtime_dir:['Pracovní adresář instance','Instance runtime directory','Répertoire d’exécution'],live_config:['Aktuální config','Live configuration','Configuration active'],snapshot:['Uložený config','Saved configuration','Configuration enregistrée'],private_run:['Privátní /run','Private /run','/run privé'],
+    profile:['Profil','Profile','Profil'],build:['Build','Build','Build'],config:['Konfigurace','Configuration','Configuration'],config_mode:['Režim konfigurace','Configuration mode','Mode de configuration'],ingress:['Ingress','Ingress','Entrée'],egress:['Egress','Egress','Sortie'],source:['Zdrojová IP','Source IP','IP source'],user:['Uživatel','User','Utilisateur'],deadline:['Konec platnosti','Deadline','Échéance'],endpoint:['Fabric endpoint','Fabric endpoint','Endpoint Fabric'],
+    ingress_pool:['Ingress rozsah','Ingress pool','Plage d’entrée'],ingress_host_to_namespace:['Ingress · host → namespace','Ingress · host → namespace','Entrée · hôte → namespace'],ingress_host:['Ingress rozhraní hosta','Host ingress interfaces','Interfaces d’entrée de l’hôte'],egress_pool:['Egress rozsah','Egress pool','Plage de sortie'],egress_host_to_namespace:['Egress · host → namespace','Egress · host → namespace','Sortie · hôte → namespace'],egress_host:['Egress rozhraní hosta','Host egress interfaces','Interfaces de sortie de l’hôte'],namespace_interfaces:['Rozhraní namespace','Namespace interfaces','Interfaces du namespace'],namespace_routes:['Routy namespace (IPv4)','Namespace routes (IPv4)','Routes du namespace (IPv4)'],namespace_routes_v6:['Routy namespace (IPv6)','Namespace routes (IPv6)','Routes du namespace (IPv6)'],host_routes:['Routy hosta','Host routes','Routes de l’hôte'],policy:['Policy routing','Policy routing','Routage par politique'],transport_interfaces:['Transportní rozhraní','Transport interfaces','Interfaces de transport'],transport_routes:['Transportní routy','Transport routes','Routes de transport'],
+    time:['Čas','Time','Heure'],trace:['Stack trace','Stack trace','Trace de pile'],build_type:['Typ buildu','Build type','Type de build'],ssh_tunnel:['SSH tunel','SSH tunnel','Tunnel SSH'],copy_binary:['Zkopírování binárky','Copy binary','Copier le binaire'],gdb:['Příkazy GDB','GDB commands','Commandes GDB'],
+  };
+  const fieldTitle=name=>fieldLabels[name]?.[Math.max(0,['cs','en','fr'].indexOf(language))]||name.replaceAll('_',' ');
   const execution=data.execution||{},instance=data.instance||{};
   const net=execution.network||{},ingress=net.ingress||{},egress=net.egress||{};
   const link=i=>[i.host_interface,i.expected_host_address,i.expected_host_address_v6,'→',i.guest_interface,i.expected_guest_address,i.expected_guest_address_v6].filter(Boolean).join(' ');
@@ -24,7 +32,8 @@ export function renderDiagnostics(root,data,{el,button,copy,language}) {
     for(const [name,value]of Object.entries(fields)){
       let row=[...dl.children].find(row=>row.dataset.key===name);
       if(value==null||value===''){row?.remove();continue;}
-      if(!row){const control=button('',()=>copy(control.dataset.value));row=el('div',{'data-key':name},el('dt',{},name.replaceAll('_',' ')),el('dd',{},control));dl.append(row);}
+      if(!row){const control=button('',()=>copy(control.dataset.value));row=el('div',{'data-key':name},el('dt',{},fieldTitle(name)),el('dd',{},control));dl.append(row);}
+      if(row.querySelector('dt').textContent!==fieldTitle(name))row.querySelector('dt').textContent=fieldTitle(name);
       const control=row.querySelector('button'),content=String(value);control.dataset.value=content;if(control.textContent!==content)control.textContent=content;
     }
   }

@@ -1,4 +1,6 @@
 import {buildChoices} from './model.js';
+import {logView} from './log-view.js';
+import {copyText} from './feedback.js';
 export function libraryWorkflows({el,button,request,action,fetchItems,identity,notice,dialog,field,commit,language,setCsrf}) {
   const words={
     exclusive:['Balíček může patřit právě jedné instanci. Obsazený balíček nejde znovu použít ani smazat.','A package belongs to exactly one instance. A claimed package cannot be reused or deleted.','Un paquet appartient à une seule instance. Un paquet réservé ne peut être réutilisé ni supprimé.'],
@@ -90,9 +92,9 @@ export function libraryWorkflows({el,button,request,action,fetchItems,identity,n
       const entry=(key,value='',options=null)=>row.controls[key]=field(nested,key,value,options);
       if(kind==='disk'){entry('source');entry('target',`vd${String.fromCharCode(97+disks.length)}`);entry('bus','virtio',['virtio','scsi','sata','ide'].map(v=>[v,v]));entry('role',disks.length?'data':'system',[['system','System'],['data','Data']]);}
       else{entry('model','virtio-net-pci',['virtio-net-pci','e1000','e1000e','rtl8139'].map(v=>[v,v]));entry('purpose','dataplane',[['dataplane','Dataplane'],['telemetry','Telemetry']]);}
-      box.append(button('×',()=>box.remove()));items.push(row);
+      box.append(button('×',()=>{box.remove();w.touch?.();}));items.push(row);
     };
-    w.body.append(el('div',{},button('+ Disk',()=>add('disk')),button('+ NIC',()=>add('nic'))));add('disk');
+    w.body.append(el('div',{},button('+ Disk',()=>{add('disk');w.touch?.();}),button('+ NIC',()=>{add('nic');w.touch?.();})));add('disk');
     const enabled=field(w,'Forensic', 'true',[['true','✓'],['false','—']]),hash=field(w,'Hash','sha256',[['sha256','SHA256'],['sha512','SHA512']]);
     const artifacts=['disk-overlays','memory','pcap','qemu-log','serial-log','manifest'].map(key=>{const c=field(w,key,key==='serial-log'?'false':'true',[['true','✓'],['false','—']]);return [key,c];});
     const serialize=rows=>rows.filter(r=>r.box.isConnected).map(r=>Object.fromEntries(Object.entries(r.controls).map(([k,c])=>[k,c.value])));
@@ -106,12 +108,12 @@ export function libraryWorkflows({el,button,request,action,fetchItems,identity,n
     commit(w,'test-drives','upload-file',identity(item),async()=>{const data=await readFile(file,16*1024*1024,true);return {path:path.value||data.file.name,content_base64:data.content};});w.watch(refresh);w.footer.append(button(t('refresh'),refresh));await refresh();
   }
   async function driveLogs(item) {
-    const w=dialog(t('logs')),output=el('pre');w.body.append(output);
+    const w=dialog(t('logs')),output=el('div');w.body.append(output);
+    const viewer=logView(output,{el,button,language,copy:value=>copyText(value).then(()=>notice('✓')).catch(e=>w.status.textContent=e.message)});
     let busy=false;
-    const refresh=async()=>{if(busy||!w.d.isConnected||window.getSelection()?.toString())return;busy=true;
+    const refresh=async()=>{if(busy||!w.d.isConnected||viewer.paused()||window.getSelection()?.toString())return;busy=true;
       try{const data=await request(`/next-api/detail/test-drives/${identity(item)}/logs`);if(w.d.isConnected&&!window.getSelection()?.toString()){
-        const tail=output.scrollHeight-output.scrollTop-output.clientHeight<40;
-        if(output.textContent!==(data.output||'')){output.textContent=data.output||'';if(tail)output.scrollTop=output.scrollHeight;}
+        viewer.update(data.output||'');
         w.status.textContent=new Date().toLocaleTimeString();
       }}catch(e){w.status.textContent=e.message;}finally{busy=false;}};
     const timer=setInterval(refresh,3500);w.d.addEventListener('close',()=>clearInterval(timer),{once:true});w.watch(refresh);

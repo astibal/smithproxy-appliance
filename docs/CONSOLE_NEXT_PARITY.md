@@ -47,12 +47,47 @@ See [Console Next deployment notes](../console_next/README.md). The service uses
 - Mobile drawer with an inert closed menu, backdrop and accessible expanded
   state; explicit row selection scrolls the narrow layout to its detail.
 - Network-driver explanatory overlays: click or 2-second hover, no layout jump.
+- Sortable catalogue columns (ascending/descending/original), natural name
+  ordering and numeric/date ordering where appropriate. Search reset, no-match
+  states and keyboard traversal do not activate a row until Enter/Space.
+  Search ignores diacritics and matches data values rather than JSON field names.
+  An explicit notice identifies a selected detail excluded by the current filter.
+- Resource-scoped connection health, explicit manual-refresh busy state, task
+  history filters, active-first queue, durations and direct task links.
+- Non-layout-shifting dismissible notifications. Errors stay visible; queued
+  messages link to their task rather than only presenting an opaque ID.
+- Read-only log controls: pause, follow tail, wrap and copy. Scrolling away
+  freezes the visible snapshot even when the server's rolling log window moves.
+- Expandable terminal area without reconnecting; remembered font size, linked
+  accessible tabs and independent socket lifetimes.
+- Unsaved-change indicators and sticky dialog controls. Wiring/QEMU row add and
+  remove operations participate in draft protection, not only text input.
+  Configuration drafts can be explicitly downloaded locally without a backend
+  request; this does not bypass native validation/approval for library saves.
+- Session recovery in place: sign in separately, explicitly resume with the same
+  admin account, renew the CSRF token and retain drafts. Failed operations are
+  never automatically replayed. API HTTP errors remain structured JSON.
+- Collapsible desktop navigation remembers only that UI preference; mobile
+  navigation remains independently controlled. No drafts or secrets are stored
+  in browser persistence.
 
 ## Verification on 2026-10-08
 
-- 245 Python tests completed successfully (3 skipped), JS syntax checks and six Node suites:
+- 252 Python tests completed successfully (3 skipped), JS syntax checks and seven Node suites:
   model/filtering, row selection, terminal isolation, workflow payload contracts,
   diagnostic formatting and usage links/shared form labels.
+- UX regression coverage adds list ordering, log snapshot/follow behaviour,
+  clipboard fallback focus/selection restoration, task durations and terminal
+  expansion/font persistence.
+- Browser UX acceptance: ascending/descending/original sort; catalogue failures
+  cannot be masked by successful queue polling; manual refresh reports busy;
+  copying does not shift page geometry; task links and failed-task filtering;
+  live log pause/wrap; language changes with diagnostics already open; terminal
+  expand/hide/reveal retains both CLI and NetNS sessions. No terminal commands
+  are sent and the appliance's member PIDs are compared before/after.
+- Real session-expiry acceptance removes only the temporary test browser's
+  cookies, signs back into the temporary test account in a separate tab, resumes
+  the existing form and verifies both its draft and the renewed CSRF token.
 - All 19 authenticated catalogue reads passed against Helmut's real runner.
 - Empty test cable create/read/queued deletion, with no network endpoints.
 - Temporary router profile create/read/update/delete.
