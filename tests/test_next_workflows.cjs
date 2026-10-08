@@ -28,7 +28,10 @@ function harness(catalogues={}){
   assert.deepEqual(payload.parameters,{HOST:'example.invalid'});assert.equal(payload.config_id,'cfg');assert.ok(!('template_values' in payload));
   assert.deepEqual(h.field('Config').choices,[['cfg','Native']]);
 
-  h=harness();libraryWorkflows(h.api).details('profiles',{profile_id:'p'},h.bar);await h.bar.children[0].click();
+  h=harness();const library=libraryWorkflows(h.api);library.details('profiles',{profile_id:'p'},h.bar);
+  assert.equal(h.bar.children.length,0,'profile files live inside the unified editor, not a separate launcher');
+  const embedded=h.api.dialog('Profile');await library.files({profile_id:'p'},embedded);
+  assert.equal(h.dialogs.length,1,'embedded files must not open another dialog');
   h.field('File').files=[{name:'fixture.bin',size:3,arrayBuffer:async()=>new Uint8Array([1,2,3]).buffer}];
   payload=await h.commits[0].payload();assert.deepEqual(payload,{path:'fixture.bin',mode:'0600',content_base64:'AQID'});
 

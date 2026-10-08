@@ -48,8 +48,8 @@ export function libraryWorkflows({el,button,request,action,fetchItems,identity,n
       commit(w,'exports','create','',()=>({name:name.value,build_id:build.value,config_id:config.value,filesystem_mode:mode.value,parameters:Object.fromEntries(placeholders.map(([key,c])=>[key,c.value]))}));
     }catch(e){w.status.textContent=e.message;}
   }
-  async function files(item) {
-    const w=dialog(t('work'));const list=el('div');w.body.append(list);
+  async function files(item,embedded=null) {
+    const w=embedded||dialog(t('work'));const list=el('div');w.body.append(list);
     const path=field(w,t('path')),mode=field(w,'Mode','0600',['0600','0640','0644','0700','0750','0755'].map(v=>[v,v])),file=field(w,t('file'),'',null,'file');
     const refresh=async()=>{try{const profile=await request(`/next-api/detail/profiles/${identity(item)}/profile`);if(!w.d.isConnected)return;
       list.replaceChildren(...(profile.work_files||[]).map(f=>el('div',{class:'branch-row'},el('code',{},`${f.path} · ${f.mode} · ${f.size??''}`),button(t('remove'),async()=>{if(!confirm(t('remove')+'?'))return;try{await action('profiles','delete-file',identity(item),{path:f.path});await refresh();}catch(e){w.status.textContent=e.message;}}))));
@@ -133,10 +133,9 @@ export function libraryWorkflows({el,button,request,action,fetchItems,identity,n
     if(resource==='certificates')bar.append(button(t('generate'),()=>bundle(item)),button(t('import'),()=>bundle(item,true)),el('a',{href:`/cert-bundles/${id}/ca.pem`,class:'download-link'},'CA.pem'));
     if(resource==='exports')bar.append(el('a',{href:`/appliance-exports/${id}/download`,class:'download-link'},t('download')));
     if(['certificates','endpoints','exports','qemu'].includes(resource)){const remove=button(t('remove'),()=>{if(confirm(t('remove')+'?'))action(resource,'delete',id).catch(e=>notice(e.message,true));});if(resource==='endpoints'&&item.state!=='available'){remove.disabled=true;remove.title=t('exclusive');}bar.append(remove);}
-    if(resource==='profiles')bar.append(button(t('work'),()=>files(item)));
     if(resource==='configs')bar.append(button(t('observer'),()=>observer(item)));
     if(resource==='test-drives')bar.append(button(t('file'),()=>driveFiles(item)),button(t('logs'),()=>driveLogs(item)));
     if(resource==='instances')bar.append(button(t('checkServices'),()=>action(resource,'check-services',id).catch(e=>notice(e.message,true))),button('00-start',()=>{const w=dialog('00-start');const enabled=field(w,'Enabled',String(item.system_start_enabled!==false),[['true','✓'],['false','—']]);commit(w,resource,'system-start',id,()=>({enabled:enabled.value==='true'}));}));
   }
-  return {toolbar,details};
+  return {toolbar,details,files};
 }

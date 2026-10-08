@@ -79,3 +79,58 @@ dialog>.auth-recovery {margin-bottom:16px}
   .terminal-dock header button {padding:6px 8px;font-size:12px}
 }
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
+
+/* Editors share the workspace width, rather than a small centered modal. */
+:root {--workspace-edge:234px}
+@media(min-width:721px) and (max-width:1100px){:root{--workspace-edge:220px}}
+body.nav-collapsed {--workspace-edge:0px}
+dialog#editor,dialog.workflow-dialog {
+  position:fixed;inset:12px 12px 58px calc(var(--workspace-edge) + 18px);
+  margin:0;width:auto;max-width:none;height:auto;max-height:none;border-radius:3px;
+  box-shadow:-12px 0 40px #0007;animation:drawer-enter .2s ease-out;
+  scrollbar-gutter:stable;overscroll-behavior:contain;
+}
+@keyframes drawer-enter {from{transform:translateX(48px);opacity:0}to{transform:translateX(0);opacity:1}}
+dialog::backdrop {background:#0005}
+#editor-fields,.workflow-fields {grid-template-columns:repeat(2,minmax(0,1fr));align-items:start}
+#editor-fields>*:not(label),.workflow-fields>*:not(label) {grid-column:1/-1}
+.editor-section {grid-column:1/-1;border-top:1px solid var(--line);margin-top:12px;padding-top:18px}
+.editor-section>h3 {margin:0 0 16px;font-size:15px;color:var(--accent)}
+.editor-section>.workflow-fields {margin-bottom:16px}
+.editor-section .workflow-fields label {display:grid;gap:6px}
+.editor-section .workflow-fields input,.editor-section .workflow-fields select {width:100%}
+.editor-section>footer {position:static!important;margin:12px 0!important;padding:0!important;border:0!important;background:none!important;justify-content:flex-start!important}
+.editor-section .branch-row {padding:10px 0}
+.config-workflow .cm-editor {height:55vh!important}
+@media(max-width:850px){#editor-fields,.workflow-fields {grid-template-columns:minmax(0,1fr)}}
+@media(max-width:720px){
+  :root{--workspace-edge:0px}
+  dialog#editor,dialog.workflow-dialog {inset:0 0 48px;border-radius:0;padding:16px}
+}
+@media(prefers-reduced-motion:reduce){dialog#editor,dialog.workflow-dialog {animation:none}}
+
+/* Floating terminals are outside polled views, with a persistent session tray. */
+#terminal-dock.terminal-dock {position:fixed;inset:0;z-index:10;margin:0;border:0;background:none;pointer-events:none;min-height:0}
+.terminal-float {position:fixed;display:flex;flex-direction:column;pointer-events:auto;background:#070e0d;border:1px solid #426052;box-shadow:0 12px 40px #0009;overflow:hidden;min-width:0}
+.terminal-float.focused {border-color:var(--accent)}
+#terminal-dock .terminal-titlebar {flex:none;display:flex;flex-wrap:nowrap;gap:4px;padding:5px 8px;border-bottom:1px solid var(--line);background:#142d24}
+.terminal-titlebar>button {padding:3px 10px;font-size:17px;flex-shrink:0}
+.terminal-mover {flex:1;min-width:0;cursor:move;touch-action:none;user-select:none;padding:5px}
+.terminal-mover strong {display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}
+.terminal-tools {display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:7px 12px;background:var(--panel);flex:none}
+.terminal-tools button {font-size:12px;padding:4px 8px}
+.terminal-status {font-size:11px}.terminal-status[data-state=error],.terminal-status[data-state=closed] {color:#ffaaa8}
+#terminal-dock .terminal-float .terminal-screen {flex:1;height:auto;min-height:0;width:100%;resize:none;padding:12px 14px 24px;overflow:hidden}
+.terminal-resizer {position:absolute;bottom:0;right:0;padding:0 3px;border:0;border-radius:0;background:transparent;color:var(--muted);cursor:nwse-resize;touch-action:none}
+#terminal-dock .terminal-float.terminal-maximized {inset:8px 8px 100px!important;width:auto!important;height:auto!important;margin:0!important;box-shadow:0 12px 40px #0009}
+.terminal-maximized .terminal-resizer {display:none}
+.terminal-tray {position:fixed;bottom:46px;left:var(--workspace-edge);right:0;display:flex;align-items:center;gap:10px;background:#10271e;border-top:1px solid var(--line);padding:5px 10px;pointer-events:auto;z-index:2147483647}
+.terminal-tray-caption {font-size:11px;color:var(--muted)}
+.terminal-tray-items {display:flex;gap:5px;overflow-x:auto;flex:1;min-width:0}
+.terminal-tray-items button {white-space:nowrap;padding:5px 10px;font-size:12px;border-left:3px solid #496455}
+.terminal-tray-items button[aria-pressed=true] {border-left-color:var(--accent);background:#244b3a}
+.terminal-tray-items button[data-state=closed],.terminal-tray-items button[data-state=error] {color:#ffaaa8;border-left-color:#ffaaa8}
+body:has(#terminal-dock:not([hidden])) .workspace {padding-bottom:100px}
+.terminal-window .terminal-tray {left:0;bottom:0}
+.terminal-window #terminal-dock .terminal-float.terminal-maximized {bottom:52px!important}
+@media(max-width:720px){.terminal-tray {left:0}.terminal-tray-caption {display:none}.terminal-tools{gap:5px}.terminal-mover strong{font-size:12px}}

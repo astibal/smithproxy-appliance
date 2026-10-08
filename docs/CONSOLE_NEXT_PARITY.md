@@ -121,6 +121,25 @@ The runner and existing appliance were not restarted for these deployments.
 
 ## Acceptance scope and remaining limits
 
+### Drawer editors and floating terminals (2026-10-08)
+
+- Editors now slide in from the right, using the workspace width up to the
+  sidebar. Mobile editors use the full width. Sticky headers/save controls and
+  unsaved-change protection remain in place.
+- The profile editor includes runtime settings, Wiring and `/work` files.
+  Wiring is part of the profile save; file upload/removal remains an explicitly
+  separate task in the same editor, preserving the existing API contract.
+- CLI, NetNS, GDB and Test Drive terminal sessions use independent floating
+  windows and a persistent tray above Tasks. Move/resize supports pointer and
+  keyboard; maximize and minimize never replace sockets or xterm buffers.
+- SPA navigation, language changes and minimizing preserve live connections.
+  Explicit Close disconnects only that session. Reloading/closing the browser
+  document still ends its connections and prompts before leaving live sessions.
+- Verified against Helmut: desktop and 390px mobile editor/window geometry,
+  profile dirty-close protection, two real terminal sockets across navigation,
+  minimize/restore, move/resize, font changes and independent disconnect.
+  Test accounts were removed; appliance services were not restarted.
+
 - Artifact import is covered by existing backend and route tests, not repeated
   against live immutable storage (no delete operation for safe test cleanup).
 - Existing build/compiler implementations were not changed; a fresh full

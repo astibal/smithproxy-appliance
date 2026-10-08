@@ -149,13 +149,8 @@ export function networkWorkflows({el,button,request,action,fetchItems,identity,n
     read.inherit=next=>{if(override&&override.value!=='true'){rows.replaceChildren();entries.length=0;for(const binding of next)add(binding);update();}};
     return read;
   }
-  async function profileBindings(item){const w=dialog('Wiring · '+item.name);try{
-    const profile=await request(`/next-api/detail/profiles/${identity(item)}/profile`);if(!w.d.isConnected)return;
-    const read=await bindings(w,profile.wiring||[]);commit(w,'profiles','save',identity(item),()=>({...profile,wiring:read()}));
-  }catch(e){w.status.textContent=e.message;}}
   function toolbar(resource,bar){if(resource==='wiring')bar.append(button(t('inventory'),inventory));if(resource==='networks')bar.append(button(t('newProfile'),()=>profile()));}
   function details(resource,item,bar){
-    if(resource==='profiles')bar.append(button('Wiring',()=>profileBindings(item)));
     if(resource==='wiring')bar.append(button(t('addressing'),()=>endpoints(item)));
     if(resource==='networks')bar.append(button(t('edit'),()=>profile(item)),button(t('deleted'),()=>{if(confirm(t('deleted')+'?'))action('networks','delete',identity(item)).catch(e=>notice(e.message,true));}));
   }

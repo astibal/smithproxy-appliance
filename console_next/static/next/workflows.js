@@ -218,5 +218,5 @@ export function workflows({el, button, request, action, fetchItems, identity, no
   const network=networkWorkflows({el,button,request,action,fetchItems,identity,notice,dialog,field,commit,language});
   const firewall=firewallWorkflows({el,button,request,action,fetchItems,identity,notice,dialog,field,commit,language});
   const library=libraryWorkflows({el,button,request,action,fetchItems,identity,notice,dialog,field,commit,language,setCsrf});
-  return {toolbar,details,tasks,result,startInstance};
+  return {toolbar,details,tasks,result,startInstance,profileBindings:network.bindings,profileFiles:library.files};
 }

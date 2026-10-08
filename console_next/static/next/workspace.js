@@ -397,6 +397,8 @@ setInterval(()=>{if(!document.hidden&&!sessionExpired){fetchItems(current).catch
 setInterval(()=>{if(!document.hidden&&['instances','test-drives','firewall'].includes(current))paint(current);},1000);
 
 let editorSave=null, editorGeneration=0, editorRevision=0, editorDirty=false, editorPending=null;
+const profileWords={runtime:['Program a provoz','Application and runtime','Application et exécution'],files:['Soubory v /work','Files in /work','Fichiers dans /work'],fileHint:['Soubory se ukládají samostatně pomocí tlačítka v této sekci. Uložení profilu je nenahrazuje.','Files are saved separately using the button in this section. Saving the profile does not replace them.','Les fichiers sont enregistrés séparément dans cette section. Enregistrer le profil ne les remplace pas.'],newFiles:['Nejprve ulož nový profil; potom zde můžeš přidat soubory.','Save the new profile first; then you can add files here.','Enregistrez d’abord le nouveau profil ; vous pourrez ensuite ajouter des fichiers ici.']};
+const profileText=key=>profileWords[key][Math.max(0,['cs','en','fr'].indexOf(lang))];
 const editorBadge=el('small',{class:'unsaved-indicator',hidden:''},t('unsaved'));$('editor-close').before(editorBadge);
 function markEditorDirty(value){editorDirty=value;editorBadge.hidden=!value;text(editorBadge,t('unsaved'));$('editor').dataset.dirty=String(value);}
 function editorStatus(value,error=false){text($('editor-error'),value);$('editor-error').classList.toggle('error',error);$('editor-error').setAttribute('role',error?'alert':'status');}
@@ -418,6 +420,7 @@ async function openEditor(resource,item=null) {
   $('editor-fields').replaceChildren();text($('editor-title'),`${t(item?'edit':'add')} · ${t(resource)}`);editorStatus(t('loading'));$('editor').showModal();
   $('editor-save').disabled=true; editorSave=null;
   try {
+    if(resource==='profiles'&&item){const fresh=await request(`/next-api/detail/profiles/${identity(item)}/profile`);if(!$('editor').open||generation!==editorGeneration)return;item={...item,...fresh,build_id:item.build_id};}
     const name=field('name',t('title'),item?.name || '');name.required=true;name.focus();
     if(item){const usage=usagePanel(item,{el,language:lang,newTab:true});if(usage)$('editor-fields').append(usage);}
     if(resource==='programs') {
@@ -446,11 +449,23 @@ async function openEditor(resource,item=null) {
       field('ttl',t('ttl'),item?.ttl_seconds ?? '', 'number');
       const restart=typeof item?.auto_restart==='object'?item.auto_restart:{on_failure:Boolean(item?.auto_restart)};
       field('exit',t('exit'),restart?.on_exit,'checkbox');field('failure',t('failure'),restart?.on_failure,'checkbox');
+      const runtime=el('section',{class:'editor-section'}),runtimeFields=el('div',{class:'workflow-fields'});
+      runtimeFields.append(...$('editor-fields').children);runtime.append(el('h3',{},profileText('runtime')),runtimeFields);$('editor-fields').append(runtime);
+      const wiringBody=el('div',{class:'workflow-fields'}),wiringSection=el('section',{class:'editor-section'},el('h3',{},'Wiring'),wiringBody);$('editor-fields').append(wiringSection);
+      const readWiring=await workflow.profileBindings({d:$('editor'),body:wiringBody,touch:()=>{editorRevision++;markEditorDirty(true);}},item?.wiring||[]);
+      if(!$('editor').open||generation!==editorGeneration)return;
+      const wiringDetails=wiringBody.querySelector('details');if(wiringDetails)wiringDetails.open=true;
+      const fileSection=el('section',{class:'editor-section'},el('h3',{},profileText('files')),el('p',{class:'muted'},profileText(item?'fileHint':'newFiles')));$('editor-fields').append(fileSection);
+      if(item){
+        const body=el('div',{class:'workflow-fields'}),status=el('p',{role:'status'}),footer=el('footer');fileSection.append(body,status,footer);
+        const w={d:$('editor'),body,status,footer,revision:()=>editorRevision,clean:()=>{},watch:refresh=>{const update=()=>{if(generation===editorGeneration&&$('editor').open)refresh();};window.addEventListener('sas:task-completed',update);$('editor').addEventListener('close',()=>window.removeEventListener('sas:task-completed',update),{once:true});}};
+        await workflow.profileFiles(item,w);if(!$('editor').open||generation!==editorGeneration)return;
+      }
       const update=()=>{artifact.parentElement.hidden=argv.parentElement.hidden=application.value!=='elf';port.parentElement.hidden=application.value!=='webfsd';build.parentElement.hidden=config.parentElement.hidden=certificate.parentElement.hidden=ingress.parentElement.hidden=egress.parentElement.hidden=filesystem.parentElement.hidden=application.value!=='smithproxy';};application.onchange=update;update();
       editorSave=form=>{const app=application.value;const payload={...(item || {}),name:form.name.value,application:app,filesystem_mode:app==='smithproxy'?filesystem.value:'rootfs',rootfs_variant:form.variant.value,refresh_rootfs:form.refresh_rootfs.checked,cert_bundle_id:certificate.value,ingress_network_profile_id:ingress.value,egress_network_profile_id:egress.value,ttl_seconds:form.ttl.value===''?null:Number(form.ttl.value),auto_restart:{on_exit:form.exit.checked,on_failure:form.failure.checked}};
         if(app==='smithproxy'){payload.build_id=form.build.value;payload.config_id=form.config.value;}
         else {payload.build_id='';payload.config_id='';payload.program_settings=app==='elf'?{artifact_id:form.artifact.value,argv:JSON.parse(form.argv.value)}:app==='webfsd'?{port:Number(form.port.value)}:{};}
-        return action(resource,item?'save':'create',item?identity(item):'',payload);};
+        payload.wiring=readWiring();return action(resource,item?'save':'create',item?identity(item):'',payload);};
     }
     if(generation===editorGeneration)editorStatus('');
   }catch(error){if(generation===editorGeneration)editorStatus(error.message,true);}finally{if(generation===editorGeneration)$('editor-save').disabled=!editorSave;}
