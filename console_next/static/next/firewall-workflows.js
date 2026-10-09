@@ -1,3 +1,4 @@
+import {fieldSection} from './detail-fields.js';
 export function firewallWorkflows({el,button,request,action,fetchItems,identity,notice,dialog,field,commit,language}) {
   const words={
     add:['Autorizovat IP','Authorize IP','Autoriser une IP'],edit:['Upravit','Edit','Modifier'],remove:['Odebrat','Remove','Retirer'],
@@ -11,6 +12,12 @@ export function firewallWorkflows({el,button,request,action,fetchItems,identity,
     newInstance:['Nebo spustit z profilu','Or start from profile','Ou démarrer depuis un profil'],
     saved:['Uložit','Save','Enregistrer'],yes:['Ano','Yes','Oui'],no:['Ne','No','Non'],
     topology:['Topologie přístupu','Access topology','Topologie d’accès'],effect:['Pouze indikace egress efektu','Egress effect indication only','Indication de l’effet de sortie uniquement'],
+    identity:['Identita zdroje','Source identity','Identité source'],traffic:['Povolený provoz','Allowed traffic','Trafic autorisé'],lifetime:['Platnost a source pool','Validity and source pool','Validité et pool source'],binding:['Vazba na instanci','Instance binding','Association à une instance'],
+    enforced:['Vynucování zapnuto','Enforcement enabled','Application activée'],audit:['Pouze evidence · nevynucuje','Audit only · not enforced','Observation seule · non appliquée'],
+    host:['Přístup ke službám SAS hosta','Access to SAS host services','Accès aux services de l’hôte SAS'],forward:['Provoz směrem k instancím','Traffic forwarded to instances','Trafic transféré vers les instances'],
+    scope:['Globální host policy. Povolení zde samo nezaručuje existenci routy ani dostupnost služby v instanci.','Global host policy. An authorization alone does not guarantee a route or an available service in an instance.','Politique globale de l’hôte. Une autorisation seule ne garantit ni route ni service disponible dans une instance.'],
+    stale:['Stav se nepodařilo obnovit','Could not refresh policy state','Impossible d’actualiser la politique'],
+    pools:['Adresní pooly IPv4 / IPv6','IPv4 / IPv6 address pools','Plages d’adresses IPv4 / IPv6'],transport:['Transport a rozhraní','Transport and interfaces','Transport et interfaces'],routing:['Směrování a egress','Routing and egress','Routage et sortie'],
   };
   const t=k=>(words[k]||[k,k,k])[Math.max(0,['cs','en','fr'].indexOf(language()))];
   const yesno=[['true',t('yes')],['false',t('no')]];
@@ -27,6 +34,9 @@ export function firewallWorkflows({el,button,request,action,fetchItems,identity,
       const profile=field(w,t('newInstance'),'',[['','—'],...profiles.map(p=>[identity(p),p.name])]);
       instance.onchange=()=>{if(instance.value)profile.value='';};profile.onchange=()=>{if(profile.value)instance.value='';};
       const user=field(w,'User ID','admin-console');
+      fieldSection(w.body,t('identity'),[source,label,system],{el});
+      fieldSection(w.body,t('traffic'),[input,forward,protocol,destination,ports],{el});
+      fieldSection(w.body,t('lifetime'),[ttl,pool],{el});fieldSection(w.body,t('binding'),[instance,profile,user],{el});
       commit(w,'firewall','create','',()=>({source:source.value,label:label.value,system:system.value,chains:[...(input.value==='true'?['input']:[]),...(forward.value==='true'?['forward']:[])],protocol:protocol.value,destination:destination.value,ports:ports.value,...(ttl.value?{ttl_seconds:Number(ttl.value)}:{}),register_source:pool.value==='true',instance_id:instance.value,runtime_profile_id:profile.value,user_id:user.value}));
     }catch(e){w.status.textContent=e.message;}
   }
@@ -55,6 +65,9 @@ export function firewallWorkflows({el,button,request,action,fetchItems,identity,
       fields.fabric_link_mode=field(w,'Fabric link mode',data.fabric_link_mode||'ipvlan-l3',[['ipvlan-l3','IPvlan L3'],['ipvlan-l2','IPvlan L2']]);
       fields.egress_mode=field(w,'Egress mode',data.egress_mode||'masquerade',[['masquerade','Masquerade'],['routed','Routed']]);
       const sources=el('textarea',{rows:'3'});sources.value=(data.authorized_source_ips||[]).join('\n');w.body.append(el('label',{},t('source'),sources));
+      fieldSection(w.body,t('pools'),['ingress_cidr','ingress_cidr_v6','namespace_cidr','namespace_cidr_v6','fabric_cidr','fabric_cidr_v6'].map(k=>fields[k]),{el});
+      fieldSection(w.body,t('transport'),['fabric_interface','sas_interface','fabric_link_mode'].map(k=>fields[k]),{el});
+      fieldSection(w.body,t('routing'),['sas_route_via','sas_route_via_v6','route_table_start','mark_start','egress_mode'].map(k=>fields[k]),{el});fieldSection(w.body,t('identity'),[sources],{el});
       commit(w,'settings','save','',()=>{if(!confirm(t('confirm')))throw Error('Cancelled');return {...Object.fromEntries(Object.entries(fields).map(([k,c])=>[k,['mark_start','route_table_start'].includes(k)?Number(c.value):c.value])),allocation_prefix:30,allocation_prefix_v6:126,authorized_source_ips:sources.value.split(/\s+/).filter(Boolean)};});
     }catch(e){w.status.textContent=e.message;}
   }
@@ -100,5 +113,13 @@ export function firewallWorkflows({el,button,request,action,fetchItems,identity,
   }
   function toolbar(resource,bar){if(resource==='firewall')bar.append(button(t('add'),authorize),button(t('policy'),policy),button(t('topology'),topology));if(resource==='settings')bar.append(button(t('edit'),settings));}
   function details(resource,item,bar){if(resource==='firewall')bar.append(button(t('extend'),()=>renew(item)),button(t('attach'),()=>attach(item)),button(t('remove'),()=>{if(confirm(t('remove')+'?'))action('firewall','delete',identity(item)).catch(e=>notice(e.message,true));}));}
-  return {toolbar,details};
+  function overview(section,toolbar){
+    const root=el('section',{class:'firewall-overview','aria-label':t('policy')}),cards=[];
+    for(const [chain,hint]of [['INPUT','host'],['FORWARD','forward']]){const state=el('strong'),card=el('article',{class:'policy-card'},el('h3',{},chain),el('p',{},t(hint)),state);cards.push({chain,state,card});root.append(card);}
+    const status=el('p',{class:'policy-status',role:'status'});root.append(el('p',{class:'policy-scope'},t('scope')),status);toolbar.after(root);
+    let busy=false;
+    const refresh=async()=>{if(busy||section.hidden||document.hidden||window.getSelection()?.toString())return;busy=true;try{const data=await request('/next-api/detail/firewall/current/state');if(!root.isConnected)return;for(const {chain,state,card}of cards){const enforced=data[chain.toLowerCase()+'_enforced'];state.textContent=enforced===true?t('enforced'):enforced===false?t('audit'):'—';card.dataset.enforced=String(enforced);}status.textContent='';}catch(e){status.textContent=t('stale')+' · '+e.message;}finally{busy=false;}};
+    const timer=setInterval(()=>{if(!root.isConnected){clearInterval(timer);window.removeEventListener('sas:task-completed',refresh);}else refresh();},5000);window.addEventListener('sas:task-completed',refresh);refresh();
+  }
+  return {toolbar,details,overview};
 }

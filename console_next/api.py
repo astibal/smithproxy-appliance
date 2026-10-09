@@ -24,6 +24,8 @@ CATALOG = {
 
 # Only named application operations are exposed, never arbitrary runner URLs.
 OPERATIONS = {
+    ('instances', 'build-warning'): ('POST', '/v1/instances/{id}/build-warning', True),
+    ('instances', 'alias'): ('POST', '/v1/instances/{id}/alias', True),
     ('qemu', 'create'): ('POST', '/v1/qemu-images', True),
     ('qemu', 'delete'): ('DELETE', '/v1/qemu-images/{id}', True),
     ('test-drives', 'upload-file'): ('POST', '/v1/test-drives/{id}/files', True),

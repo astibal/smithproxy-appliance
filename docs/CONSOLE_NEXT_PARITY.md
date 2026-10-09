@@ -121,6 +121,34 @@ The runner and existing appliance were not restarted for these deployments.
 
 ## Acceptance scope and remaining limits
 
+### Configuration, Wiring and detail UX (2026-10-08)
+
+- The parity audit remains open: route coverage alone is not acceptance of
+  every form field or state transition. The legacy console remains available.
+- Configuration editors separate identity, content and validation/save intent.
+  Updating the original and creating a copy are explicit choices. A missing
+  validation build or copy name is rejected locally without losing the draft;
+  the runner still performs native validation and requires diff approval.
+- Native diffs distinguish file headers from added/removed content, show
+  change counts, and support changes-only, wrapping and copying. These are
+  presentation controls only; the approved preview is unchanged.
+- Wiring address inventory supports IPv4/IPv6 filters, text search, usage
+  counts, address copying and links to cables/instances. Refresh preserves
+  expanded branches; search does not create an unsaved-edit warning.
+- Profile network selectors respect a duplex profile's `consumes` metadata:
+  selecting it binds both sides, and changing the owning side releases the
+  other selector rather than leaving a hidden duplex binding.
+- Instance/Test Drive details have a prominent runtime state and live TTL
+  strip. Stopped records do not continue displaying an active countdown.
+- Terminals explicitly select a monospace font with modest line spacing.
+  Boolean secret-presence indicators remain visible; secret values remain
+  redacted from generic detail rendering.
+- Helmut browser acceptance covered explicit save modes, missing build/name
+  validation, a real native preview and rejection without committing changes,
+  editor-asset failure fallback, inventory filters/expansion, 390px layouts,
+  and independent real CLI/NetNS connections across SPA navigation.
+  Temporary browser accounts were deleted. No appliance service was restarted.
+
 ### Drawer editors and floating terminals (2026-10-08)
 
 - Editors now slide in from the right, using the workspace width up to the
@@ -159,6 +187,19 @@ Current drafts remain in the open dialog on failed requests/tasks; closing or
 leaving a dirty editor asks for confirmation. Secrets are not cached in storage.
 
 ## Acceptance criteria
+
+### Task handoff audit (2026-10-08)
+
+- Workflow dialogs show a direct task link immediately after enqueueing,
+  rather than a generic validation message. The task opens separately so the
+  current draft is not displaced.
+- Terminal task states retain a task link; successful non-preview operations
+  offer the existing Result viewer. Native preview approval is unchanged.
+- Browser acceptance used real Helmut catalogues and browser-only intercepted
+  task responses to exercise queued → failed → explicit retry → succeeded →
+  result. Failure retained the selected profile and re-enabled submission.
+  No real instance was created by this test; this is UI-state coverage, not
+  renewed end-to-end runner lifecycle acceptance. All 19 Node suites passed.
 
 No polling-driven page reload, no discarded editor content on failed tasks,
 no terminal teardown on route changes. Do not substitute raw JSON forms or

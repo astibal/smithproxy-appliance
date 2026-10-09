@@ -22,7 +22,7 @@ export function terminalWorkspace({root,el,button,csrf,language,notice,onCount=(
   const windows=el('div',{class:'terminal-windows'}),tray=el('div',{class:'terminal-tray',role:'toolbar'}),tabs=el('div',{class:'terminal-tray-items'}),caption=el('span',{class:'terminal-tray-caption'},t('terminals'));
   const minimizeAll=button('−',()=>{for(const s of sessions.values())minimize(s,false);onHide();});
   tray.append(caption,tabs,minimizeAll);root.replaceChildren(windows,tray);
-  function resize(s){if(s&&!s.panel.hidden)requestAnimationFrame(()=>{if(sessions.has(s.key)&&!s.panel.hidden)s.fit.fit();});}
+  function resize(s){if(s&&!s.panel.hidden)requestAnimationFrame(()=>{if(sessions.has(s.key)&&!s.panel.hidden){s.fit.fit();if(s.kind==='netns'&&s.socket?.readyState===WebSocket.OPEN&&Number.isInteger(s.term.cols)&&Number.isInteger(s.term.rows))s.socket.send(JSON.stringify({type:'resize',cols:s.term.cols,rows:s.term.rows}));}});}
   function place(s){s.rect=clampWindow(s.rect,window.innerWidth,window.innerHeight);Object.assign(s.panel.style,{left:s.rect.x+'px',top:s.rect.y+'px',width:s.rect.width+'px',height:s.rect.height+'px'});resize(s);}
   function raise(s){active=s;for(const other of sessions.values())other.panel.classList.toggle('focused',other===s);s.panel.style.zIndex=String(++level);}
   function show(s){root.hidden=false;s.panel.hidden=false;s.tab.setAttribute('aria-pressed','true');raise(s);place(s);s.term.focus();}
@@ -32,7 +32,7 @@ export function terminalWorkspace({root,el,button,csrf,language,notice,onCount=(
   function connect(s){
     const old=s.socket;s.socket=null;old?.close();setState(s,'opening');
     const socket=new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws/${s.resource}/${encodeURIComponent(s.id)}/${s.kind}?csrf=${encodeURIComponent(csrf())}`);s.socket=socket;
-    socket.onopen=()=>{if(s.socket===socket)setState(s,'open');};socket.onmessage=event=>{if(s.socket===socket)s.term.write(event.data);};
+    socket.onopen=()=>{if(s.socket===socket){setState(s,'open');resize(s);}};socket.onmessage=event=>{if(s.socket===socket)s.term.write(event.data);};
     socket.onclose=()=>{if(s.socket===socket){setState(s,'closed');s.term.write('\r\n['+t('closed')+']\r\n');}};socket.onerror=()=>{if(s.socket===socket)setState(s,'error');};
   }
   function close(s){const socket=s.socket;s.socket=null;socket?.close();s.observer.disconnect();s.term.dispose();s.panel.remove();s.tab.remove();sessions.delete(s.key);onCount(sessions.size);if(active===s)active=[...sessions.values()].at(-1)||null;root.hidden=!sessions.size;onHide();}
@@ -53,14 +53,14 @@ export function terminalWorkspace({root,el,button,csrf,language,notice,onCount=(
     const header=el('header',{class:'terminal-titlebar'},mover,minButton,maxButton,closer),status=el('span',{class:'terminal-status',role:'status'}),font=el('span',{class:'terminal-font'});
     const toolbar=el('div',{class:'terminal-tools'},status,button('A−',()=>changeFont(-1)),font,button('A+',()=>changeFont(1)),control('reconnect','',()=>connect(s)),control('clear','',()=>s.term.clear()));
     const screen=el('div',{class:'terminal-screen'}),grip=control('resize','◢',()=>{});grip.className='terminal-resizer';panel.append(header,toolbar,screen,grip);windows.append(panel);root.hidden=false;
-    const term=new window.Terminal({cursorBlink:true,fontSize:fontSize(),scrollback:10000,theme:{background:'#070e0d',foreground:'#dbe8e3',selectionBackground:'#527d70',selectionInactiveBackground:'#527d70'}});
+    const term=new window.Terminal({cursorBlink:true,fontFamily:'"Cascadia Mono", "DejaVu Sans Mono", "Liberation Mono", Menlo, Consolas, monospace',fontSize:fontSize(),fontWeight:400,fontWeightBold:600,lineHeight:1.15,scrollback:10000,theme:{background:'#070e0d',foreground:'#dbe8e3',selectionBackground:'#527d70',selectionInactiveBackground:'#527d70'}});
     const fit=new window.FitAddon.FitAddon();term.loadAddon(fit);term.open(screen);
     const tab=button(title,()=>{if(!s.panel.hidden&&active===s)minimize(s);else show(s);});tab.setAttribute('aria-controls','terminal-window-'+n);tabs.append(tab);
     const observer=new ResizeObserver(()=>resize(s)),offset=(sessions.size%5)*28;
     s={key,id,kind,resource,panel,screen,term,fit,tab,observer,socket:null,state:'opening',status,font,controls,mover,maxButton,maximized:false,rect:{x:Math.max(8,window.innerWidth-940)+offset,y:88+offset,width:860,height:510}};
     sessions.set(key,s);onCount(sessions.size);observer.observe(screen);
     function changeFont(delta){term.options.fontSize=Math.max(10,Math.min(30,term.options.fontSize+delta));font.textContent=term.options.fontSize+' px';try{localStorage.setItem(preference,String(term.options.fontSize));}catch{}resize(s);}
-    term.onData(data=>{if(data&&s.socket?.readyState===WebSocket.OPEN)s.socket.send(data);});
+    term.onData(data=>{if(data&&s.socket?.readyState===WebSocket.OPEN)s.socket.send(kind==='netns'?JSON.stringify({type:'input',data}):data);});
     panel.addEventListener('pointerdown',()=>raise(s));panel.addEventListener('focusin',()=>raise(s));gesture(s,mover);gesture(s,grip,true);mover.addEventListener('dblclick',()=>maximize(s));
     tab.onkeydown=event=>{if(!['ArrowLeft','ArrowRight','Home','End'].includes(event.key))return;event.preventDefault();const items=[...sessions.values()],i=items.indexOf(s),next=event.key==='Home'?0:event.key==='End'?items.length-1:(i+(event.key==='ArrowRight'?1:-1)+items.length)%items.length;items[next].tab.focus();};
     relabelSession(s);show(s);connect(s);

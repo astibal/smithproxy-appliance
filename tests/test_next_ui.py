@@ -42,6 +42,13 @@ class NextApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(self.calls, [])
 
+    def test_instance_alias_preserves_canonical_route(self):
+        response = self.client.post('/next-api/action', json={
+            'resource': 'instances', 'action': 'alias', 'id': 'abc-123',
+            'payload': {'alias': 'lab-router'}})
+        self.assertIn(response.status_code, (200, 202))
+        self.assertEqual(self.calls[-1][:2], ('POST', '/v1/instances/abc-123/alias'))
+
     def test_all_declared_operations_have_exact_destinations(self):
         for (resource, action), (method, path, direct) in OPERATIONS.items():
             with self.subTest(resource=resource, action=action):

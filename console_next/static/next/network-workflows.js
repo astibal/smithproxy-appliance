@@ -1,4 +1,9 @@
 import {fieldLabel} from './field-labels.js';
+import {fieldSection} from './detail-fields.js';
+import {filterNetworks,networkUsageCount} from './address-inventory.js';
+import {copyText} from './feedback.js';
+import {endpointList} from './endpoint-list.js';
+import {formatRoutes,parseRoutes} from './route-fields.js';
 export function networkWorkflows({el,button,request,action,fetchItems,identity,notice,dialog,field,commit,language}) {
   const words={
     explain:['Jak to funguje?','How does this work?','Comment cela fonctionne ?'],
@@ -18,6 +23,7 @@ export function networkWorkflows({el,button,request,action,fetchItems,identity,n
     newProfile:['Nový síťový profil','New network profile','Nouveau profil réseau'],edit:['Upravit','Edit','Modifier'],
     name:['Název','Name','Nom'],description:['Popis','Description','Description'],confirm:['Opravdu odpojit?','Disconnect this endpoint?','Déconnecter ce point ?'],
     empty:['Žádné zaznamenané adresy','No recorded addresses','Aucune adresse enregistrée'],refresh:['Obnovit','Refresh','Actualiser'],
+    searchNetworks:['Hledat adresu, kabel, rozhraní nebo instanci','Search address, cable, interface or instance','Rechercher adresse, câble, interface ou instance'],allNetworks:['IPv4 + IPv6','IPv4 + IPv6','IPv4 + IPv6'],expand:['Rozbalit vše','Expand all','Tout développer'],collapse:['Sbalit vše','Collapse all','Tout réduire'],uses:['použití','uses','utilisations'],
     help:['Změna adres automaticky přepne na SAS managed. Guest pouze eviduje, Bez L3 odstraní dříve spravované adresy.','Changing addresses selects SAS managed. Guest only records addresses; No L3 removes previously managed addresses.','Modifier les adresses active SAS managed. Guest ne fait que déclarer ; Sans L3 retire les adresses précédemment gérées.'],
     deleted:['Smazat','Delete','Supprimer'],selector:['Výběr provozu','Traffic selector','Sélection du trafic'],
     authorization:['Vyžadovat autorizaci','Require authorization','Exiger une autorisation'],
@@ -34,11 +40,29 @@ export function networkWorkflows({el,button,request,action,fetchItems,identity,n
   }
   async function inventory() {
     const w=dialog(t('inventory'));
-    const refresh=async()=>{try{const data=await request('/next-api/detail/wiring/current/inventory');if(!w.d.isConnected)return;
-      function tree(nodes){return el('ul',{class:'address-tree'},...nodes.map(n=>el('li',{},el('details',{},el('summary',{},n.prefix),...n.usages.map(u=>el('p',{class:u.managed?'':'muted'},`${u.address} · ${u.segment_name||'—'} · ${u.interface} · ${u.instance_id}`)),tree(n.children||[])))));}
-      w.body.replaceChildren(data.tree.length?tree(data.tree):el('p',{},t('empty')));
-    }catch(e){w.status.textContent=e.message;}};
-    w.footer.append(button(t('refresh'),refresh));await refresh();
+    const search=el('input',{type:'search','aria-label':t('searchNetworks'),placeholder:t('searchNetworks')}),family=el('select',{'aria-label':'IP'},...['all','4','6'].map(v=>el('option',{value:v},v==='all'?t('allNetworks'):'IPv'+v))),count=el('span',{class:'muted'}),treeRoot=el('div');
+    let data=[],busy=false,signature='',filtered=false;const expanded=new Map();
+    const remember=()=>{if(!filtered)for(const d of treeRoot.querySelectorAll('details[data-prefix]'))expanded.set(d.dataset.prefix,d.open);};
+    function draw(){
+      remember();filtered=Boolean(search.value.trim());const visible=filterNetworks(data,search.value,family.value);
+      function tree(nodes){return el('ul',{class:'address-tree'},...nodes.map(n=>{
+        const detail=el('details',{'data-prefix':n.prefix},el('summary',{},`${n.prefix} · ${networkUsageCount([n])} ${t('uses')}`));detail.open=search.value.trim()?true:expanded.get(n.prefix)??true;
+        for(const u of n.usages||[]){
+          const address=button(u.address||n.prefix,()=>copyText(u.address||n.prefix).then(()=>notice('✓')).catch(e=>notice(e.message,true)));
+          const row=el('div',{class:'inventory-usage'+(u.managed?'':' muted')},address,el('span',{},u.interface||'—'));
+          if(u.segment_id)row.append(button(u.segment_name||u.segment_id,()=>endpoints({segment_id:u.segment_id,name:u.segment_name||u.segment_id})));
+          if(u.instance_id)row.append(el('a',{href:'#instances/'+encodeURIComponent(u.instance_id)},u.instance_id));
+          row.querySelector('a')?.addEventListener('click',()=>{w.clean();w.d.close();w.d.remove();});detail.append(row);
+        }
+        if(n.children?.length)detail.append(tree(n.children));return el('li',{},detail);
+      }));}
+      treeRoot.replaceChildren(visible.length?tree(visible):el('p',{class:'muted'},t('empty')));count.textContent=`${networkUsageCount(visible)} / ${networkUsageCount(data)} ${t('uses')}`;
+    }
+    search.addEventListener('input',event=>{event.stopPropagation();draw();});family.addEventListener('input',event=>event.stopPropagation());family.addEventListener('change',draw);
+    const toolbar=el('div',{class:'toolbar inventory-toolbar'},search,family,count);w.body.append(toolbar,treeRoot);
+    for(const [key,open]of [['expand',true],['collapse',false]])toolbar.append(button(t(key),()=>{for(const d of treeRoot.querySelectorAll('details')){d.open=open;expanded.set(d.dataset.prefix,open);}}));
+    const refresh=async()=>{if(busy)return;busy=true;try{const value=await request('/next-api/detail/wiring/current/inventory');if(!w.d.isConnected)return;const next=JSON.stringify(value.tree||[]);if(next!==signature){signature=next;data=value.tree||[];draw();}w.status.textContent='';}catch(e){w.status.textContent=e.message;}finally{busy=false;}};
+    w.watch(refresh);w.footer.append(button(t('refresh'),refresh));await refresh();
   }
   async function attach(segment) {
     const w=dialog(t('attach'));
@@ -76,22 +100,14 @@ export function networkWorkflows({el,button,request,action,fetchItems,identity,n
   }
   async function endpoints(segment) {
     const w=dialog(segment.name);let busy=false,signature='';
+    const grid=el('div',{class:'endpoint-grid'});w.body.append(grid);let latest=segment;
+    const render=endpointList(grid,{el,button,t,onAddress:addressing,onDetach:async(current,ep)=>{if(!confirm(t('confirm')))return;try{await action('wiring','detach',identity(current),{endpoint_id:ep.id});w.status.textContent='…';}catch(e){w.status.textContent=e.message;}}});
+    const attachButton=button(t('attach'),()=>attach(latest));attachButton.hidden=true;
     const refresh=async()=>{if(busy||!w.d.isConnected||window.getSelection()?.toString())return;busy=true;try{const current=await request(`/next-api/detail/wiring/${identity(segment)}/segment`);if(!w.d.isConnected||window.getSelection()?.toString())return;
       const next=JSON.stringify(current);if(next===signature)return;signature=next;
-      const cards=(current.endpoints||[]).map(ep=>{
-        const card=el('article',{class:'endpoint-card'},el('h3',{},ep.interface),el('code',{},ep.instance_id),el('p',{},`${ep.type} · ${ep.state}`));
-        if(ep.error)card.append(el('p',{class:'error'},ep.error));
-        const addressingState=ep.addressing||{};
-        card.append(el('p',{class:addressingState.error?'error':'muted'},t(addressingState.state||'unmanaged')));
-        if(addressingState.error)card.append(el('p',{class:'error'},addressingState.error));
-        if(addressingState.observed)card.append(el('small',{},`${t('observed')}: ${(addressingState.observed.addresses||[]).join(', ')}`));
-        card.append(el('p',{},`${t('desired')}: ${(addressingState.desired?.addresses||[]).join(', ')||'—'}`),button(t('addressing'),()=>addressing(current,ep)),button(t('detach'),async()=>{if(!confirm(t('confirm')))return;try{await action('wiring','detach',identity(current),{endpoint_id:ep.id});w.status.textContent='…';}catch(e){w.status.textContent=e.message;}}));
-        return card;
-      });
-      w.body.replaceChildren(el('div',{class:'endpoint-grid'},...cards));
-      w.footer.replaceChildren(button(t('refresh'),refresh));
-      if(current.kind==='virtual-switch'||current.endpoints.length<2)w.footer.append(button(t('attach'),()=>attach(current)));
+      latest=current;render(current);attachButton.hidden=current.kind!=='virtual-switch'&&(current.endpoints||[]).length>=2;
     }catch(e){w.status.textContent=e.message;}finally{busy=false;}};
+    w.footer.append(button(t('refresh'),refresh),attachButton);
     const timer=setInterval(refresh,3500);w.d.addEventListener('close',()=>clearInterval(timer),{once:true});w.watch(refresh);await refresh();
   }
   function profile(item=null) {
@@ -104,6 +120,11 @@ export function networkWorkflows({el,button,request,action,fetchItems,identity,n
     const destinations=area(w,'Destination CIDRs',(item?.destination_cidrs||[]).join('\n'));
     const mode=field(w,'Egress mode',item?.mode||'masquerade',[['masquerade','Masquerade'],['routed','Routed']]);
     const host=field(w,'Host interface',item?.host_interface||'');
+    const group=(titles,controls)=>fieldSection(w.body,titles[Math.max(0,['cs','en','fr'].indexOf(language()))],controls,{el});
+    group(['Identita profilu','Profile identity','Identité du profil'],[name,description]);
+    group(['Propojení a driver','Link and driver','Liaison et pilote'],[kind,driver,family]);
+    const selectionGroup=group(['Výběr provozu a autorizace','Traffic selection and authorization','Sélection du trafic et autorisation'],[selector,authorization,destinations]);
+    const egressGroup=group(['Odchozí cesta','Outbound path','Chemin de sortie'],[mode,host]);
     const diagram=el('pre',{class:'network-diagram'}),explanation=el('p'),help=el('details',{class:'diagram-help'},el('summary',{},'? '+t('explain')),explanation),illustration=el('div',{class:'network-illustration'},diagram,help);w.body.append(illustration);
     let helpTimer,pinned=false;
     help.querySelector('summary').addEventListener('click',event=>{event.preventDefault();pinned=!pinned;help.open=pinned;});
@@ -117,6 +138,7 @@ export function networkWorkflows({el,button,request,action,fetchItems,identity,n
       support.textContent=family.value!=='dual'||ing&&authorized&&selector.value!=='source'?t('planned'):'';
       selector.parentElement.hidden=authorization.parentElement.hidden=destinations.parentElement.hidden=!ing||!authorized;
       mode.parentElement.hidden=host.parentElement.hidden=ing||driver.value==='none';
+      selectionGroup.hidden=!ing||!authorized;egressGroup.hidden=ing||driver.value==='none';
       diagram.textContent=driver.value==='none'?`${kind.value}: ∅\n  Wiring → namespace`:
         ing?(authorized?`Source / destination\n   │ ${selector.value}\n   ▼\nHost veth ──── di0 [namespace]`:`Host veth ──── transport0 [namespace]`):`[namespace] do0 ──── Host\n                       │ ${mode.value}\n                       ▼\n                    Upstream`;
     }
@@ -135,16 +157,16 @@ export function networkWorkflows({el,button,request,action,fetchItems,identity,n
       const choices=[['','—'],...segments.map(s=>[identity(s),`${s.name} · ${s.endpoints.length}/${s.kind==='virtual-cable'?2:'∞'}`])];
       if(binding.segment_id&&!choices.some(([id])=>id===binding.segment_id))choices.push([binding.segment_id,'⚠ '+binding.segment_id]);
       const segment=field(nested,'Cable / switch',binding.segment_id||'',choices),port=field(nested,'Interface',binding.interface||`cable${entries.length}`);
-      let mode=null,addresses=null;
-      if(spawn){mode=field(nested,t('mode'),binding.addressing?.mode||'none',[['none',t('none')],['sas',t('sas')],['guest',t('guest')]]);addresses=area(nested,t('addresses'),(binding.addressing?.addresses||[]).join('\n'));addresses.oninput=()=>mode.value='sas';}
-      box.append(button('×',()=>{box.remove();w.touch?.();}));entries.push({box,segment,port,mode,addresses});update();
+      let mode=null,addresses=null,routes=null;
+      if(spawn){mode=field(nested,t('mode'),binding.addressing?.mode||'none',[['none',t('none')],['sas',t('sas')],['guest',t('guest')]]);addresses=area(nested,t('addresses'),(binding.addressing?.addresses||[]).join('\n'));routes=area(nested,t('routes'),formatRoutes(binding.addressing?.routes));for(const input of [addresses,routes])input.oninput=()=>mode.value='sas';}
+      box.append(button('×',()=>{box.remove();w.touch?.();}));entries.push({box,segment,port,mode,addresses,routes});update();
     }
     const addButton=button('+ '+fieldLabel('Cable / switch',language()),()=>{add();w.touch?.();});panel.append(addButton);
     function update(){const disabled=override&&override.value!=='true';for(const c of rows.querySelectorAll('input,select,textarea,button'))c.disabled=disabled;addButton.disabled=disabled;}
     if(override)override.onchange=update;for(const binding of existing)add(binding);update();
     const read=()=>{
       if(override&&override.value!=='true')return undefined;
-      return entries.filter(e=>e.box.isConnected).map(e=>({segment_id:e.segment.value,interface:e.port.value,...(spawn?{addressing:{mode:e.mode.value,addresses:lines(e.addresses.value),routes:[]}}:{})}));
+      return entries.filter(e=>e.box.isConnected).map(e=>({segment_id:e.segment.value,interface:e.port.value,...(spawn?{addressing:{mode:e.mode.value,addresses:lines(e.addresses.value),routes:parseRoutes(e.routes.value,t('routes'))}}:{})}));
     };
     read.inherit=next=>{if(override&&override.value!=='true'){rows.replaceChildren();entries.length=0;for(const binding of next)add(binding);update();}};
     return read;

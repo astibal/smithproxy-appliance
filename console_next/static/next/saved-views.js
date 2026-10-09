@@ -1,0 +1,15 @@
+export function savedViews({toolbar,view,paint,el,button,language,account}) {
+  const words={save:['Uložit pohled','Save view','Enregistrer la vue'],remove:['Smazat pohled','Delete view','Supprimer la vue'],name:['Název pohledu','View name','Nom de la vue'],choose:['Uložené pohledy','Saved views','Vues enregistrées'],cancel:['Zrušit','Cancel','Annuler'],error:['Prohlížeč neumožnil uložení. Pohledy zůstaly beze změny.','Browser storage failed. Views are unchanged.','Échec du stockage navigateur. Les vues sont inchangées.'],required:['Zadej název pohledu.','Enter a view name.','Saisissez un nom de vue.'],duplicate:['Tento název už existuje. Použij jiný název.','This name already exists. Choose another name.','Ce nom existe déjà. Choisissez un autre nom.'],hint:['Pouze pro tebe v tomto prohlížeči. Ukládá filtr a řazení.','Only for you in this browser. Saves filters and sorting.','Uniquement pour vous dans ce navigateur. Enregistre filtres et tri.']};
+  const t=k=>words[k][Math.max(0,['cs','en','fr'].indexOf(language))];
+  const key='sas-next-views:'+account;let values=[];
+  try{const data=JSON.parse(localStorage.getItem(key)||'[]');if(Array.isArray(data))values=data.filter(v=>v&&typeof v.name==='string'&&typeof v.query==='string').slice(0,30);}catch{}
+  const select=el('select',{'aria-label':t('choose')});
+  function draw(){select.replaceChildren(el('option',{value:''},t('choose')),...values.map((v,i)=>el('option',{value:String(i)},v.name)));}
+  const status=el('span',{role:'status'}),editor=el('div',{hidden:''}),name=el('input',{'aria-label':t('name'),placeholder:t('name'),maxlength:'80'});
+  function store(next){try{localStorage.setItem(key,JSON.stringify(next));values=next;draw();status.textContent='';return true;}catch{status.textContent=t('error');return false;}}
+  select.onchange=()=>{const item=values[Number(select.value)];if(select.value===''||!item)return;view.search.value=item.query;view.scope=['all','active','problems','stopped'].includes(item.scope)?item.scope:'all';view.sort=item.sort&&Number.isInteger(item.sort.column)&&item.sort.column>=0&&item.sort.column<4?{column:item.sort.column,direction:item.sort.direction==='desc'?'desc':'asc'}:null;paint();};
+  function save(){const title=name.value.trim();if(!title){status.textContent=t('required');name.focus();return;}if(values.some(v=>v.name===title)){status.textContent=t('duplicate');name.focus();return;}const entry={name:title.slice(0,80),query:view.search.value,scope:view.scope,sort:view.sort};if(store([...values,entry].slice(-30))){select.value=String(values.length-1);editor.hidden=true;select.focus();}}
+  editor.append(name,button(t('save'),save),button(t('cancel'),()=>{editor.hidden=true;status.textContent='';select.focus();}),el('small',{},t('hint')));
+  name.onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();save();}if(e.key==='Escape'){e.preventDefault();editor.hidden=true;select.focus();}};
+  toolbar.append(select,button(t('save'),()=>{editor.hidden=false;name.value='';status.textContent='';name.focus();}),button(t('remove'),()=>{if(select.value==='')return;store(values.filter((_,i)=>i!==Number(select.value)));}),editor,status);draw();
+}

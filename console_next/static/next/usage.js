@@ -10,7 +10,7 @@ export function usagePanel(item,{el,language='en',instances=true,newTab=false}) 
     const links=items.map(value=>{
       const id=route==='profiles'?(value.profile_id||value.id):value.id;
       if(!id)return el('span',{},value.name||'—');
-      return el('a',{href:'#'+route+'/'+encodeURIComponent(id),class:'download-link',...(newTab?{target:'_blank',rel:'noopener'}:{})},value.name||String(id).slice(0,12));
+      return el('a',{href:'#'+route+'/'+encodeURIComponent(id),title:String(id),class:'download-link',...(newTab?{target:'_blank',rel:'noopener'}:{})},value.alias||value.name||String(id).slice(0,12));
     });
     panel.append(el('div',{},el('small',{},label+': '),...links));
   }

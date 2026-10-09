@@ -120,7 +120,7 @@ dialog::backdrop {background:#0005}
 .terminal-tools {display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:7px 12px;background:var(--panel);flex:none}
 .terminal-tools button {font-size:12px;padding:4px 8px}
 .terminal-status {font-size:11px}.terminal-status[data-state=error],.terminal-status[data-state=closed] {color:#ffaaa8}
-#terminal-dock .terminal-float .terminal-screen {flex:1;height:auto;min-height:0;width:100%;resize:none;padding:12px 14px 24px;overflow:hidden}
+#terminal-dock .terminal-float .terminal-screen {flex:1;height:auto;min-height:0;width:auto;box-sizing:content-box;resize:none;padding:12px 14px 24px;overflow:hidden}
 .terminal-resizer {position:absolute;bottom:0;right:0;padding:0 3px;border:0;border-radius:0;background:transparent;color:var(--muted);cursor:nwse-resize;touch-action:none}
 #terminal-dock .terminal-float.terminal-maximized {inset:8px 8px 100px!important;width:auto!important;height:auto!important;margin:0!important;box-shadow:0 12px 40px #0009}
 .terminal-maximized .terminal-resizer {display:none}
@@ -134,3 +134,98 @@ body:has(#terminal-dock:not([hidden])) .workspace {padding-bottom:100px}
 .terminal-window .terminal-tray {left:0;bottom:0}
 .terminal-window #terminal-dock .terminal-float.terminal-maximized {bottom:52px!important}
 @media(max-width:720px){.terminal-tray {left:0}.terminal-tray-caption {display:none}.terminal-tools{gap:5px}.terminal-mover strong{font-size:12px}}
+
+/* Fabric-inspired quiet chrome: keep technical monospace and readable sizes.
+   Real 1px strokes stay crisp at every DPR; only decorative contrast is softer.
+   Focus rings and semantic error/warning colours remain deliberately strong. */
+:root {--line:#283c33;--ink:#d8e3dd;--muted:#a0b2a8}
+h1,h2,h3,.brand {font-weight:500}
+.brand small {font-weight:400}
+.terminal-mover strong,.editor-section>h3,.task-row>b {font-weight:500}
+button,input,select,textarea {font-weight:400}
+button {background:#142b22}
+button:hover:not(:disabled) {background:#1b362a;border-color:#5c8a73}
+.primary {background:var(--accent);color:#092119;font-weight:500}
+.primary:hover:not(:disabled) {background:#8be8c3;color:#092119}
+.resource-view th,.resource-view th>button {background:#11261d}
+.resource-view td {border-bottom-color:#20332a}
+.resource-view tr:last-child td {border-bottom:0}
+nav a.active {background:#183226;border-left-width:1px}
+nav a {border-left-width:1px}
+.inspector,.table-scroll {border-color:var(--line)}
+dialog#editor,dialog.workflow-dialog {border-color:#3b5748;box-shadow:-8px 0 28px #0005}
+.workflow-dialog>header,#editor header,.workflow-dialog>footer,#editor footer {border-color:var(--line)}
+.editor-section fieldset {border:1px solid var(--line);padding:14px;margin:8px 0;min-width:0}
+.terminal-float {border-color:#3b5748;box-shadow:0 8px 28px #0007}
+.terminal-float.focused {border-color:#648d77}
+#terminal-dock .terminal-titlebar {background:#12291f}
+#terminal-dock .terminal-float.terminal-maximized {box-shadow:0 8px 28px #0007}
+.terminal-tray-items button {border-left-width:1px}
+.task-dock {border-top-color:#395444}
+
+/* Full work views, not narrow inspector columns. Navigation stays reachable. */
+.inspector.detail-view {position:fixed;inset:96px 16px 102px calc(var(--workspace-edge) + 16px);width:auto;min-width:0;z-index:4;overflow:auto;overscroll-behavior:contain;scrollbar-gutter:stable;box-shadow:0 10px 30px #0006;padding:22px}
+.detail-view>header {position:sticky;top:-22px;z-index:2;background:var(--panel);margin:-22px -22px 20px;padding:18px 22px;border-bottom:1px solid var(--line)}
+.detail-view>.actions {padding-bottom:16px;margin-bottom:20px;border-bottom:1px solid var(--line)}
+.detail-view>.summary-fields {display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:32px}
+.detail-view .inspection-output {border-top:1px solid var(--line);margin-top:24px;padding-top:18px}
+.form-section {grid-column:1/-1;min-width:0;padding:18px;margin:10px 0;border:1px solid #3b5748;background:#091b15}
+.form-section>legend {padding:0 10px;color:var(--accent);font-size:14px;font-weight:500}
+.section-fields {display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;align-items:start}
+.section-fields>label {min-width:0;display:grid;gap:6px;color:var(--muted)}
+.section-fields>label>* {min-width:0;max-width:100%}
+.argument-list {display:grid;gap:8px}.argument-row {display:flex;gap:8px}.argument-row input {flex:1;min-width:0}
+.argument-editor {display:grid;gap:8px;min-width:0;color:var(--muted)}
+.inventory-toolbar input {flex:1;min-width:180px;max-width:100%}
+.inventory-usage {display:flex;flex-wrap:wrap;align-items:center;gap:12px;padding:12px 8px;border-bottom:1px solid var(--line);overflow-wrap:anywhere}
+.inventory-usage button,.inventory-usage a {font:inherit;font-size:12px;color:var(--accent)}
+.inventory-usage a:hover {text-decoration:underline}
+.workflow-fields .diff-view {font:13px/1.6 "Cascadia Mono","DejaVu Sans Mono","Liberation Mono",Consolas,monospace;white-space:pre;overflow-wrap:normal;border:1px solid var(--line);padding:12px;max-height:62vh;tab-size:4}
+.diff-view.wrap-lines {white-space:pre-wrap;overflow-wrap:anywhere}
+.diff-view .diff-added {color:#a1f0c7;background:#153b26}
+.diff-view .diff-removed {color:#ffbcb7;background:#412523}
+.diff-view .diff-header {color:var(--muted)}
+.diff-view .diff-hunk {color:#9fd5f2;background:#132a32;margin:8px 0;padding:4px 0}
+.diff-view.changes-only .diff-context {display:none}
+.diff-toolbar {margin:8px 0 0}.diff-counts {margin-right:auto;color:var(--muted)}
+.diff-toolbar button[aria-pressed=true] {border-color:var(--accent);color:var(--accent)}
+.config-fallback {width:100%;min-height:40vh;font:13px/1.6 "DejaVu Sans Mono",Consolas,monospace;white-space:pre;resize:vertical}
+.runtime-status {display:flex;flex-wrap:wrap;align-items:center;gap:20px;padding:12px 16px;margin:0 0 20px;border:1px solid #34594b;border-left:3px solid var(--accent);background:#10271e}
+.runtime-status strong {font-weight:500}.runtime-deadline {margin-left:auto;font-variant-numeric:tabular-nums}
+.runtime-status[data-active=false] {border-color:#805e4b;background:#291d15;color:#f0c5aa}
+.certificate-validity {color:var(--accent)}
+.certificate-entry[data-validity=expired] .certificate-validity,.certificate-entry[data-validity=future] .certificate-validity {color:#ffaaa8}
+.certificate-entry[data-validity=soon] .certificate-validity {color:#e9c576}
+.certificate-entry>button {text-align:left;overflow-wrap:anywhere;max-width:100%}
+.build-reference-info {padding:12px;border-left:2px solid var(--line);overflow-wrap:anywhere}
+.data-fields {display:grid;gap:0;min-width:0}
+.structured-detail {margin-top:24px;border-top:1px solid var(--line)}
+.data-value {display:grid;grid-template-columns:minmax(140px,30%) minmax(0,1fr);gap:16px;padding:10px 0;border-bottom:1px solid #20332a;align-items:start}
+.data-label {color:var(--muted);font-size:12px;overflow-wrap:anywhere}
+.data-value>button {border:0;background:none;text-align:left;padding:0;margin:0;color:var(--ink);white-space:pre-wrap;overflow-wrap:anywhere}
+.data-value>button:hover {color:var(--accent)}
+.data-group {border:1px solid var(--line);margin:12px 0;padding:14px;min-width:0}
+.data-group>summary {cursor:pointer;color:var(--accent);padding:3px 0}
+.data-group>.data-fields {margin-top:12px}
+.firewall-overview {display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin:18px 0 24px}
+.policy-card {border:1px solid #52735f;border-top:3px solid #52735f;padding:18px;background:#10231a}
+.policy-card h3 {margin:0 0 8px}.policy-card p {color:var(--muted);margin:0 0 14px}
+.policy-card[data-enforced=false] {border-color:#9f8651;background:#262317}.policy-card[data-enforced=false] strong {color:#ead39c}
+.policy-card strong {font-size:13px;font-weight:400}
+.policy-scope,.policy-status {grid-column:1/-1;margin:0;color:var(--muted);font-size:12px}.policy-status:not(:empty) {color:#ffaaa8}
+.topology-group {border:1px solid #52735f;border-left:3px solid #52735f;padding:20px;margin:14px 0;background:#091a14}
+.topology-lane {border-bottom:1px dashed var(--line);padding:14px 0}
+.topology-egress {border:1px solid #52735f;border-top:3px double #73927f;background:#11271e;margin-top:24px}
+.source-overview {border:1px solid var(--line);padding:12px 16px;display:flex;gap:16px;align-items:center;justify-content:space-between;margin:16px 0;color:var(--muted);font-size:12px}
+.source-overview>span {overflow-wrap:anywhere}.source-overview>button {flex-shrink:0}
+.source-overview.has-updates {border-left:3px solid #c2a15d;color:#ecd69f;background:#252317}
+.source-update {color:#ecd69f;border:1px solid #8d774a;padding:4px 8px;font-size:12px}.branch-build-state {color:var(--muted);font-size:12px}
+@media(max-width:850px){.section-fields,.detail-view>.summary-fields {grid-template-columns:1fr}}
+@media(max-width:720px){.inspector.detail-view {inset:145px 6px 102px;padding:16px}.detail-view>header{top:-16px;margin:-16px -16px 16px;padding:14px 16px}.firewall-overview{grid-template-columns:1fr}.data-value{grid-template-columns:1fr;gap:4px}.form-section{padding:12px}.source-overview{align-items:flex-start;flex-direction:column}}
+.quick-results { display: grid; gap: .4rem; padding: .7rem 0; }
+.quick-results button { text-align: left; overflow-wrap: anywhere; }
+.instance-profile { display:block; color:var(--muted); font-size:.85em; margin-top:4px; overflow-wrap:anywhere; }
+[data-density="compact"] .instance-profile { display:inline; margin-left:8px; }
+[data-density="compact"] .instance-profile::before { content:"["; }
+[data-density="compact"] .instance-profile::after { content:"]"; }
+[data-density="compact"] tbody td { padding-top:7px; padding-bottom:7px; }

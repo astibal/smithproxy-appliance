@@ -1,5 +1,6 @@
 import {identity, completed, changed, filtered, buildChoices, countdown, resourceScope, buildFreshness} from './model.js';
 import {workflows} from './workflows.js';
+import {renderFields,fieldSection,argumentFields} from './detail-fields.js';
 import {bindRowSelection} from './row-selection.js';
 import {terminalWorkspace} from './terminals.js';
 import {renderDiagnostics} from './diagnostics.js';
@@ -9,6 +10,13 @@ import {orderItems,nextOrder} from './list-order.js';
 import {feedback,copyText} from './feedback.js';
 import {logView} from './log-view.js';
 import {taskDuration} from './task-time.js';
+import {networkChoices,bindNetworkSides} from './network-bindings.js';
+import {certificateCard} from './certificate-info.js';
+import {savedViews} from './saved-views.js';
+import {quickSearch} from './quick-search.js';
+import {instanceContext,instanceEvents,instanceReferences} from './instance-context.js';
+import {instanceFreshness} from './instance-freshness.js';
+let instanceBuildStatus=null,instanceBuildFetched=0,instanceBuildPending=false;
 
 const $ = id => document.getElementById(id);
 let csrf = document.querySelector('meta[name="csrf-token"]').content;
@@ -64,6 +72,7 @@ const words = {
   refreshed:['Aktualizováno','Updated','Actualisé'], offline:['Obnova selhala','Refresh failed','Échec de l’actualisation'], preview:['Nová konzole · ověřovací provoz. Původní konzole zůstává dostupná na portu 5000.','New console · validation rollout. The original console remains available on port 5000.','Nouvelle console · déploiement de validation. La console originale reste disponible sur le port 5000.'],
   add:['Přidat','Add','Ajouter'], save:['Uložit','Save','Enregistrer'], edit:['Upravit','Edit','Modifier'], close:['Zavřít','Close','Fermer'],
   spawn:['Spustit','Start','Démarrer'], stop:['Zastavit','Stop','Arrêter'], restart:['Restartovat','Restart','Redémarrer'], delete:['Smazat','Delete','Supprimer'],
+  remaining:['Do zastavení','Until stop','Avant l’arrêt'],notRunning:['Neběží','Not running','À l’arrêt'],
   confirm:['Opravdu provést tuto operaci?','Perform this operation?','Effectuer cette opération ?'], queued:['Zařazeno do fronty','Queued','Mis en file'],
   idle:['Klid','Idle','Au repos'], active:['běžících / čekajících','running / pending','actives / en attente'], logs:['Logy','Logs','Journaux'], diag:['Diagnostika','Diagnostics','Diagnostic'],
   title:['Název','Name','Nom'], application:['Program','Application','Programme'], artifact:['Artefakt','Artifact','Artefact'], config:['Konfigurace','Configuration','Configuration'],
@@ -132,6 +141,8 @@ async function fetchItems(resource) {
     if(['binaries','tuntom'].includes(resource))data.items=buildFreshness(data.items);
     const view=views.get(resource);if(view)view.health.hidden=true;
     cache.set(resource,data.items); if(current===resource) paint(resource);
+    if(resource==='instances'&&!instanceBuildPending&&Date.now()-instanceBuildFetched>30000){instanceBuildPending=true;request('/next-api/detail/binaries/current/status').then(status=>{instanceBuildStatus=status;instanceBuildFetched=Date.now();paint('instances');}).catch(()=>{instanceBuildStatus=null;instanceBuildFetched=Date.now();paint('instances');}).finally(()=>instanceBuildPending=false);}
+    if(resource==='instances'&&Date.now()-(health.get('profiles')?.updated||0)>30000)fetchItems('profiles').then(()=>paint('instances')).catch(()=>{});
     health.set(resource,{updated:Date.now()});if(current===resource)connectionStatus();
     if(resource==='tasks'){$('task-toggle').classList.remove('error');$('task-toggle').removeAttribute('title');}
     if(resource==='tasks') taskUpdate(data.items);
@@ -142,6 +153,8 @@ async function fetchItems(resource) {
 const groups=[['runtime',['instances','profiles']],['library',['programs','binaries','tuntom','configs','certificates','qemu']],['network',['wiring','networks','firewall','endpoints','settings']],['adhoc',['test-drives','exports']],['administration',['tasks','preferences','admins']]];
 const icons={instances:'▦',profiles:'◇',programs:'⬡',binaries:'▤',tuntom:'⇆',configs:'≡',certificates:'♧',qemu:'▣',preferences:'⚙',admins:'♙',wiring:'⌁',networks:'⇄',firewall:'⊞',settings:'⚙',endpoints:'◎','test-drives':'▷',exports:'↗',tasks:'☷'};
 function navigation() {
+  if(!$('global-search')){const control=button('',()=>{if(!document.querySelector('dialog[open]'))quickSearch({el,button,fetchItems,identity,filtered,language:lang,label:t});});control.id='global-search';$('refresh').before(control);}
+  text($('global-search'),['Hledat','Search','Rechercher'][Math.max(0,['cs','en','fr'].indexOf(lang))]);$('global-search').title='Ctrl+K';
   const scroll=$('navigation').scrollTop;
   $('navigation').replaceChildren(...groups.flatMap(([group,items])=>[el('p',{class:'nav-label'},t(group)),...items.map(key=>el('a',{href:'#'+key,'data-route':key,class:current===key?'active':''},el('span',{'aria-hidden':'true'},icons[key]),t(key)))]));
   $('navigation').scrollTop=scroll;
@@ -149,6 +162,7 @@ function navigation() {
   $('refresh').setAttribute('aria-label',t('refresh'));$('refresh').title=t('refresh');
   if($('terminal-toggle'))text($('terminal-toggle'),`${t('terminals')} ${$('terminal-toggle').dataset.count||0}`);
   text($('task-label'),t('tasks')); text($('editor-save'),t('save'));
+  $('editor').setAttribute('aria-labelledby','editor-title');$('editor-close').setAttribute('aria-label',t('close'));$('editor-close').title=t('close');
   const logout=document.querySelector('form[action="/logout"] button');if(logout)text(logout,t('logout'));
   document.querySelectorAll('[data-language]').forEach(control=>control.setAttribute('aria-pressed',String(control.dataset.language===lang)));
 }
@@ -171,10 +185,18 @@ function createView(resource) {
   const body=el('tbody'), table=el('table',{},el('thead',{},el('tr',{},...headers)),body);
   const empty=el('p',{class:'empty'},t('loading'));
   const health=el('p',{class:'error',role:'status',hidden:''});
-  const inspector=el('aside',{class:'inspector',hidden:''});
+  const inspector=el('section',{class:'inspector detail-view',hidden:'',role:'region','aria-label':t('details'),tabindex:'-1'});
   section.append(toolbar,health,filters,el('div',{class:'resource-layout'},el('div',{class:'table-scroll'},table,empty),inspector));
   $('views').append(section);
+  if(resource==='firewall')workflow.firewallOverview(section,toolbar);
+  if(['binaries','tuntom'].includes(resource))workflow.sourceOverview(section,resource,toolbar);
   const view={section,search,reset,count,body,empty,health,inspector,filters,headers,sort:null,scope:'all',rows:new Map(),selected:null,lastDetail:null}; views.set(resource,view);
+  if(resource==='instances')savedViews({toolbar,view,paint:()=>paint(resource),el,button,language:lang,account:document.body.dataset.adminId||'local'});
+  if(resource==='instances'){
+    const key='sas-instance-density:'+(document.body.dataset.adminId||'local');let density='details';try{if(localStorage.getItem(key)==='compact')density='compact';}catch{}
+    const control=el('select',{'aria-label':['Zobrazení instancí','Instance view','Vue des instances'][Math.max(0,['cs','en','fr'].indexOf(lang))]},el('option',{value:'details'},['Detailní','Details','Détaillée'][Math.max(0,['cs','en','fr'].indexOf(lang))]),el('option',{value:'compact'},['Kompaktní','Compact','Compacte'][Math.max(0,['cs','en','fr'].indexOf(lang))]));control.value=density;section.dataset.density=density;
+    control.onchange=()=>{section.dataset.density=control.value;try{localStorage.setItem(key,control.value);}catch{}};toolbar.append(control);
+  }
   search.addEventListener('keydown',event=>{
     if(event.isComposing||event.ctrlKey||event.metaKey||event.altKey)return;
     if(event.key==='Escape'){event.preventDefault();search.value='';paint(resource);}
@@ -193,7 +215,7 @@ function columns(resource,item) {
   if(['binaries','tuntom'].includes(resource)){const age=key=>item[key]?Math.max(0,Math.floor((Date.now()-Date.parse(item[key]))/86400000))+' d':'?';return [`${item.ref||'detached'} · ${item.build_type||''}`,`${item.rootfs_ready?'rootfs ✓':'ELF'}${item.newer_build_available?' · ⚠ '+t('oldCode'):''}`,(item.commit_id||identity(item)).slice(0,12),`${item.built_at?new Date(item.built_at).toLocaleDateString(lang):'—'} · build ${age('built_at')} / code ${age('commit_at')}`];}
   if(resource==='wiring')return [item.name,`${item.kind} · ${item.state}`,(item.endpoints||[]).length+(item.kind==='virtual-cable'?' / 2':''),item.error||item.namespace];
   if(resource==='endpoints')return [item.name,item.state,`${item.switch_ip} · ${item.tunnel_id}`,item.bound_instance_id||'—'];
-  const name=item.name || item.alias || item.label || item.email || item.source || identity(item);
+  const name=item.alias || item.name || item.label || item.email || item.source || identity(item);
   const state=[item.state?stateLabel(item.state):item.application || item.kind || item.build_type || '',item.available===false?'unavailable':item.implemented===false?'unsupported':''].filter(Boolean).join(' · ');
   const ref=resource==='instances'?[item.source_ip,item.namespace].filter(Boolean).join(' · '):item.source_ip || item.ref || item.version || item.config_name || item.namespace || item.commit_id || item.rootfs_variant || '';
   const pids=(item.members||[]).filter(m=>m.pid).map(m=>m.pid);
@@ -214,13 +236,20 @@ function paint(resource) {
     const id=identity(item); let row=view.rows.get(id);
     if(!row) {
       row=el('tr',{'data-id':id});
-      const activate=()=>{if(selection())return;view.selected=id;view.lastDetail=null;history.replaceState(null,'','#'+resource+'/'+encodeURIComponent(id));paint(resource);if(matchMedia('(max-width:1100px)').matches)view.inspector.scrollIntoView({block:'start'});};
+      const activate=()=>{if(selection())return;view.selected=id;view.lastDetail=null;history.replaceState(null,'','#'+resource+'/'+encodeURIComponent(id));paint(resource);view.inspector.focus({preventScroll:true});};
       const select=button('',activate);select.tabIndex=-1;
       row.append(el('td',{},select),el('td'),el('td'),el('td'));
       bindRowSelection(row,activate,selection);
       view.rows.set(id,row);
     }
     const values=columns(resource,item); text(row.children[0].firstChild,values[0]); for(let n=1;n<4;n++) text(row.children[n],values[n]);
+    if(resource==='instances'){
+      let profile=row.querySelector('.instance-profile');if(!profile){profile=el('small',{class:'instance-profile'});row.children[0].append(profile);}
+      const linked=(cache.get('profiles')||[]).find(p=>identity(p)===item.runtime_profile_id);
+      const title=linked?.name||item.runtime_profile_id||['Bez profilu','Standalone','Sans profil'][Math.max(0,['cs','en','fr'].indexOf(lang))];text(profile,title);profile.title=item.runtime_profile_id||title;
+      let warning=row.querySelector('.instance-build-warning');if(!warning){warning=el('span',{class:'instance-build-warning',style:'color:#d7bb77;margin-left:8px'});row.children[0].append(warning);}
+      const update=instanceFreshness(item,instanceBuildStatus),i=Math.max(0,['cs','en','fr'].indexOf(lang));warning.hidden=!update;text(warning,update?'⚠':'');if(update){warning.title=(update.kind==='build'?['Novější build k dispozici','Newer build available','Build plus récent disponible']:['Jiný commit na větvi; build zatím není připraven','Branch head differs; build not ready yet','Commit de branche différent ; build pas encore prêt'])[i]+` · ${update.branch} · ${update.type} · ${update.commit.slice(0,12)}`;warning.setAttribute('aria-label',warning.title);}
+    }
     row.classList.toggle('selected',view.selected===id); row.classList.toggle('inactive',['stopped','expired','failed'].includes(item.state)||item.available===false||item.implemented===false);
     row.setAttribute('aria-selected',String(view.selected===id));
     row.dataset.state=item.state||'';
@@ -229,6 +258,12 @@ function paint(resource) {
   const item=data.find(item=>identity(item)===view.selected);
   if(item && changed(view.lastDetail,item)) { detail(resource,item,view); view.lastDetail=structuredClone(item); }
   else if(!item) { view.inspector.hidden=true; view.lastDetail=null; }
+  if(item&&['instances','test-drives'].includes(resource)){
+    let status=view.inspector.querySelector('.runtime-status');
+    if(!status){status=el('div',{class:'runtime-status'},el('strong'),el('span',{class:'runtime-deadline'}));view.inspector.querySelector('header').after(status);}
+    const running=['running','starting','orphaned'].includes(item.state);status.dataset.active=String(running);text(status.children[0],stateLabel(item.state));
+    text(status.children[1],running?(countdown(item.deadline)===null?t('unlimited'):`◷ ${t('remaining')}: ${countdown(item.deadline)}`):t('notRunning'));
+  }
   const filterNote=view.inspector.querySelector('.selection-filter-note');if(filterNote)filterNote.hidden=!item||wanted.has(view.selected);
 }
 async function action(resource,command,id='',payload={}) {
@@ -251,20 +286,23 @@ function detail(resource,item,view) {
     reloadInspection=resource==='instances'&&Boolean(view.inspectionKind);
   }
   if(!view.inspector.firstChild) {
-    view.inspector.append(el('header',{},el('h2'),button('×',()=>{const row=view.rows.get(view.selected);view.selected=null;view.inspector.hidden=true;history.replaceState(null,'','#'+resource);row?.focus({preventScroll:true});})),el('div',{class:'actions'}),el('dl',{class:'summary-fields'}),el('details',{},el('summary',{},'JSON'),el('pre',{class:'object-detail'})));
+    const close=()=>{const row=view.rows.get(view.selected);view.selected=null;view.inspector.hidden=true;history.replaceState(null,'','#'+resource);row?.focus({preventScroll:true});};
+    view.inspector.append(el('header',{},el('h2'),button('×',close)),el('div',{class:'actions'}),el('dl',{class:'summary-fields'}),el('section',{class:'structured-detail data-fields'}));
+    view.inspector.addEventListener('keydown',event=>{if(event.key==='Escape'&&!event.defaultPrevented&&!event.target.matches('input,textarea,select')){event.preventDefault();close();}});
     const showSelected=button(t('showInList'),()=>{
       view.search.value='';view.scope='all';paint(resource);
       const row=view.rows.get(view.selected);row?.focus();row?.scrollIntoView({block:'nearest'});
     });
     view.inspector.querySelector('header').after(el('div',{class:'selection-filter-note',hidden:''},el('p',{},t('selectedOutside')),showSelected));
   }
-  text(view.inspector.querySelector('h2'),item.name || item.alias || item.email || identity(item).slice(0,12));
+  text(view.inspector.querySelector('h2'),item.alias || item.name || item.email || identity(item).slice(0,12));
   const actions=view.inspector.querySelector('.actions');
   // Only rebuild controls when identity/state changes, never replace an open terminal.
   const sig=JSON.stringify([identity(item),item.state,resource==='instances'?null:item.updated_at,item.build_id,item.build_type,item.newer_build_id,item.debug_unit,item.system_start_enabled,item.usage,item.available,item.application,item.name,item.alias,item.email,lang]);
   if(actions.dataset.signature!==sig) {
     actions.dataset.signature=sig; actions.replaceChildren();
     if(resource==='instances') {
+      const warning=el('input',{type:'checkbox'});warning.checked=item.indicate_old_build!==false;warning.onchange=async()=>{warning.disabled=true;try{await action('instances','build-warning',identity(item),{indicate_old_build:warning.checked});}catch(e){warning.checked=!warning.checked;notice(e.message,true);}finally{warning.disabled=false;}};actions.append(el('label',{},warning,[' Upozorňovat na starší build',' Indicate outdated build',' Signaler un build ancien'][Math.max(0,['cs','en','fr'].indexOf(lang))]));
       if(['running','starting','orphaned'].includes(item.state)) actions.append(actionButton(resource,'stop',item,true));
       if(item.state==='running'){
         actions.append(actionButton(resource,'restart',item),button('NetNS',()=>terminal(item,'netns')));
@@ -278,18 +316,16 @@ function detail(resource,item,view) {
     if(resource==='wiring' && !(item.endpoints || []).length) actions.append(actionButton(resource,'delete',item,true));
     workflow.details(resource,item,actions);
   }
-  text(view.inspector.querySelector('pre'),JSON.stringify(item,null,2));
   let extra=view.inspector.querySelector('.library-extra');
-  const extraData=JSON.stringify([resource==='certificates'?item.certificates:null,resource==='tasks'?item.error:null,item.newer_build_available,item.newest_commit_id,lang]);
+  const extraData=JSON.stringify([resource==='instances'?[identity(item),item.state,item.result,instanceEvents(item),instanceReferences(item)]:null,resource==='certificates'?item.certificates:null,resource==='tasks'?item.error:null,item.newer_build_available,item.newest_commit_id,lang]);
   if(!extra){extra=el('section',{class:'library-extra'});view.inspector.append(extra);}
   if(extra.dataset.signature!==extraData){extra.dataset.signature=extraData;extra.replaceChildren();
+    if(resource==='instances')extra.append(instanceContext(item,{el,language:lang,cache,identity,label:t,stateLabel}));
     if(['binaries','tuntom'].includes(resource)&&item.newer_build_available)extra.append(el('p',{class:'warning'},`⚠ ${t('newerAvailable')} · ${item.newest_commit_id?.slice(0,12)}`));
     if(resource==='tasks'&&item.error)extra.append(el('h3',{class:'error'},t('failed')),el('pre',{class:'error'},item.error));
     if(resource==='certificates'){
       extra.append(el('h3',{},t('certContents')));
-      for(const cert of item.certificates||[]){const hash=button(cert.sha256||'SHA-256',()=>copyValue(cert.sha256||'').then(()=>notice('✓')).catch(e=>notice(e.message,true)));
-        extra.append(el('article',{class:'certificate-entry'},el('strong',{},cert.name||cert.filename),el('code',{},[cert.filename,cert.key_filename].filter(Boolean).join(' + ')),el('small',{},`${cert.kind} · ${cert.subject||''}${cert.has_private_key?' · '+t('privateKey'):''}`),el('small',{},`${cert.notbefore||'—'} → ${cert.notafter||'—'}`),hash));
-      }
+      for(const cert of item.certificates||[])extra.append(certificateCard(cert,{el,button,language:lang,copy:value=>copyValue(value).then(()=>notice('✓')).catch(e=>notice(e.message,true))}));
     }
   }
   const summary=view.inspector.querySelector('.summary-fields');
@@ -304,6 +340,8 @@ function detail(resource,item,view) {
     const timestamp=['created_at','built_at','deadline','started_at','finished_at'].includes(key)?Date.parse(value):NaN;
     text(copy,Number.isFinite(timestamp)?new Intl.DateTimeFormat(lang,{dateStyle:'medium',timeStyle:'medium'}).format(timestamp):key==='state'?stateLabel(value):value);
   }
+  const remaining=Object.fromEntries(Object.entries(item).filter(([key])=>!fields.includes(key)&&!['usage','certificates','name','alias','email'].includes(key)));
+  renderFields(view.inspector.querySelector('.structured-detail'),remaining,{el,button,language:lang,copy:value=>copyValue(value).then(()=>notice('✓')).catch(e=>notice(e.message,true))});
   if(reloadInspection)inspectRequest(item,view.inspectionKind);
 }
 async function inspectRequest(item,kind) {
@@ -387,6 +425,7 @@ const refreshVisible=()=>{if(document.hidden||sessionExpired)return;fetchItems(c
 document.addEventListener('visibilitychange',refreshVisible);
 window.addEventListener('online',refreshVisible);
 document.addEventListener('keydown',event=>{
+  if((event.ctrlKey||event.metaKey)&&event.key.toLowerCase()==='k'&&!document.querySelector('dialog[open]')&&!event.target.closest?.('.xterm')){event.preventDefault();quickSearch({el,button,fetchItems,identity,filtered,language:lang,label:t});return;}
   if(event.defaultPrevented||event.ctrlKey||event.metaKey||event.altKey||document.querySelector('dialog[open]'))return;
   if(event.target.closest?.('input,textarea,select,[contenteditable=true],.xterm'))return;
   if(event.key==='/'){event.preventDefault();views.get(current)?.search.focus();}
@@ -436,21 +475,26 @@ async function openEditor(resource,item=null) {
       if(!$('editor').open || generation!==editorGeneration)return;
       const application=field('application',t('application'),item?.application || 'elf','text',['elf','router','webfsd','smithproxy'].map(key=>[key,key])); application.disabled=Boolean(item);
       const artifact=field('artifact',t('artifact'),item?.program_settings?.artifact_id || '', 'text',artifacts.map(a=>[a.artifact_id,`${a.name} · ${a.version} · ${a.artifact_id.slice(0,12)}`]));
-      const argv=field('argv',t('args'),JSON.stringify(item?.program_settings?.argv || []));
+      const argv=argumentFields($('editor-fields'),item?.program_settings?.argv||[],{el,button,language:lang,touch:()=>{editorRevision++;markEditorDirty(true);}});
       const port=field('port','HTTP port',item?.program_settings?.port || 8000,'number');
       const build=field('build','Smithproxy build',item?.build_id || '', 'text',buildChoices(builds,lang));
       const config=field('config',t('config'),item?.config_id || '', 'text',configs.filter(c=>c.native).map(c=>[c.config_id,c.name]));
       field('variant','Rootfs',item?.rootfs_variant || 'barebone','text',['barebone','utils','network'].map(key=>[key,key]));
       const filesystem=field('filesystem','Filesystem',item?.filesystem_mode || 'rootfs','text',[['rootfs','Rootfs'],['host','Host sandbox']]);
       const certificate=field('certificate',t('certificates'),item?.cert_bundle_id || '', 'text',[['','—'],...bundles.map(b=>[identity(b),b.name])]);
-      const ingress=field('ingress','Ingress',item?.ingress_network_profile_id || '', 'text',[['','—'],...networks.filter(n=>n.kind==='ingress').map(n=>[identity(n),n.name])]);
-      const egress=field('egress','Egress',item?.egress_network_profile_id || '', 'text',[['','—'],...networks.filter(n=>n.kind==='egress').map(n=>[identity(n),n.name])]);
+      const ingress=field('ingress','Ingress',item?.ingress_network_profile_id || '', 'text',[['','—'],...networkChoices(networks,'ingress')]);
+      const egress=field('egress','Egress',item?.egress_network_profile_id || '', 'text',[['','—'],...networkChoices(networks,'egress')]);
+      bindNetworkSides(ingress,egress,networks,{el,language:lang});
       field('refresh_rootfs','Refresh rootfs',false,'checkbox');
       field('ttl',t('ttl'),item?.ttl_seconds ?? '', 'number');
       const restart=typeof item?.auto_restart==='object'?item.auto_restart:{on_failure:Boolean(item?.auto_restart)};
       field('exit',t('exit'),restart?.on_exit,'checkbox');field('failure',t('failure'),restart?.on_failure,'checkbox');
       const runtime=el('section',{class:'editor-section'}),runtimeFields=el('div',{class:'workflow-fields'});
       runtimeFields.append(...$('editor-fields').children);runtime.append(el('h3',{},profileText('runtime')),runtimeFields);$('editor-fields').append(runtime);
+      const groupLabels=[['Identita','Identity','Identité'],['Program a soubory','Application and files','Application et fichiers'],['Izolace a rootfs','Isolation and rootfs','Isolation et rootfs'],['Síť a certifikáty','Network and certificates','Réseau et certificats'],['Životní cyklus','Lifecycle','Cycle de vie']];
+      const controls=[['name','application'],['artifact','port','build','config'],['variant','filesystem','refresh_rootfs'],['certificate','ingress','egress'],['ttl','exit','failure']];
+      const formSections=controls.map((names,i)=>fieldSection(runtimeFields,groupLabels[i][Math.max(0,['cs','en','fr'].indexOf(lang))],names.map(name=>$('editor-form').elements.namedItem(name)),{el}));
+      formSections[1].querySelector('.section-fields').append(argv.root);
       const wiringBody=el('div',{class:'workflow-fields'}),wiringSection=el('section',{class:'editor-section'},el('h3',{},'Wiring'),wiringBody);$('editor-fields').append(wiringSection);
       const readWiring=await workflow.profileBindings({d:$('editor'),body:wiringBody,touch:()=>{editorRevision++;markEditorDirty(true);}},item?.wiring||[]);
       if(!$('editor').open||generation!==editorGeneration)return;
@@ -461,10 +505,10 @@ async function openEditor(resource,item=null) {
         const w={d:$('editor'),body,status,footer,revision:()=>editorRevision,clean:()=>{},watch:refresh=>{const update=()=>{if(generation===editorGeneration&&$('editor').open)refresh();};window.addEventListener('sas:task-completed',update);$('editor').addEventListener('close',()=>window.removeEventListener('sas:task-completed',update),{once:true});}};
         await workflow.profileFiles(item,w);if(!$('editor').open||generation!==editorGeneration)return;
       }
-      const update=()=>{artifact.parentElement.hidden=argv.parentElement.hidden=application.value!=='elf';port.parentElement.hidden=application.value!=='webfsd';build.parentElement.hidden=config.parentElement.hidden=certificate.parentElement.hidden=ingress.parentElement.hidden=egress.parentElement.hidden=filesystem.parentElement.hidden=application.value!=='smithproxy';};application.onchange=update;update();
+      const update=()=>{artifact.parentElement.hidden=argv.root.hidden=application.value!=='elf';port.parentElement.hidden=application.value!=='webfsd';build.parentElement.hidden=config.parentElement.hidden=certificate.parentElement.hidden=ingress.parentElement.hidden=egress.parentElement.hidden=filesystem.parentElement.hidden=application.value!=='smithproxy';for(const section of formSections)section.hidden=[...section.querySelector('.section-fields').children].every(label=>label.hidden);};application.onchange=update;update();
       editorSave=form=>{const app=application.value;const payload={...(item || {}),name:form.name.value,application:app,filesystem_mode:app==='smithproxy'?filesystem.value:'rootfs',rootfs_variant:form.variant.value,refresh_rootfs:form.refresh_rootfs.checked,cert_bundle_id:certificate.value,ingress_network_profile_id:ingress.value,egress_network_profile_id:egress.value,ttl_seconds:form.ttl.value===''?null:Number(form.ttl.value),auto_restart:{on_exit:form.exit.checked,on_failure:form.failure.checked}};
         if(app==='smithproxy'){payload.build_id=form.build.value;payload.config_id=form.config.value;}
-        else {payload.build_id='';payload.config_id='';payload.program_settings=app==='elf'?{artifact_id:form.artifact.value,argv:JSON.parse(form.argv.value)}:app==='webfsd'?{port:Number(form.port.value)}:{};}
+        else {payload.build_id='';payload.config_id='';payload.program_settings=app==='elf'?{artifact_id:form.artifact.value,argv:argv.read()}:app==='webfsd'?{port:Number(form.port.value)}:{};}
         payload.wiring=readWiring();return action(resource,item?'save':'create',item?identity(item):'',payload);};
     }
     if(generation===editorGeneration)editorStatus('');

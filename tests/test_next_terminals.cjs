@@ -35,6 +35,11 @@ class Term {
   const root=new Node('section'),el=(...args)=>new Node(...args),button=(label,click)=>Object.assign(el('button',{},label),{click});
   const manager=terminalWorkspace({root,el,button,csrf:()=> 'token',language:()=> 'en',notice:()=>{}});
   manager.open({id:'one'},'cli');manager.open({id:'two'},'netns');
+  Term.all[1].input('');Term.all[1].input('pwd\r');
+  assert.deepEqual(Socket.all[1].sent,[JSON.stringify({type:'input',data:'pwd\r'})]);
+  Term.all[1].cols=100;Term.all[1].rows=28;Socket.all[1].onopen();
+  assert.deepEqual(JSON.parse(Socket.all[1].sent.at(-1)),{type:'resize',cols:100,rows:28});
+  for(const term of Term.all){assert.ok(term.options.fontFamily.endsWith('monospace'));assert.equal(term.options.fontWeight,400);assert.equal(term.options.lineHeight,1.15);}
   const windows=root.children[0],tray=root.children[1],first=windows.children[0],second=windows.children[1];
   const control=(panel,label)=>panel.children.flatMap(node=>node.children||[]).find(node=>node.attrs?.['aria-label']===label||node.children?.[0]===label);
   control(second,'Maximize').click();

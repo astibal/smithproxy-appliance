@@ -1,6 +1,7 @@
 import {buildChoices} from './model.js';
 import {logView} from './log-view.js';
 import {copyText} from './feedback.js';
+import {fieldSection} from './detail-fields.js';
 export function libraryWorkflows({el,button,request,action,fetchItems,identity,notice,dialog,field,commit,language,setCsrf}) {
   const words={
     exclusive:['Balíček může patřit právě jedné instanci. Obsazený balíček nejde znovu použít ani smazat.','A package belongs to exactly one instance. A claimed package cannot be reused or deleted.','Un paquet appartient à une seule instance. Un paquet réservé ne peut être réutilisé ni supprimé.'],
@@ -36,6 +37,10 @@ export function libraryWorkflows({el,button,request,action,fetchItems,identity,n
     const w=dialog('Fabric endpoint');const controls={};
     w.body.append(el('p',{class:'muted'},t('exclusive')));
     for(const key of ['name','package_id','fabric_port_id','switch_ip','tunnel_id','secret'])controls[key]=field(w,key.replaceAll('_',' '),'',null,key==='secret'?'password':'text');
+    const group=(titles,keys)=>fieldSection(w.body,titles[Math.max(0,['cs','en','fr'].indexOf(language()))],keys.map(k=>controls[k]),{el});
+    group(['Identita balíčku','Package identity','Identité du paquet'],['name','package_id']);
+    group(['Fabric a tunel','Fabric and tunnel','Fabric et tunnel'],['fabric_port_id','switch_ip','tunnel_id']);
+    group(['Přihlašovací údaje','Credentials','Identifiants'],['secret']);
     commit(w,'endpoints','create','',()=>({kind:'tuntom-via',...Object.fromEntries(Object.entries(controls).map(([k,c])=>[k,c.value]))}));
   }
   async function exportAppliance() {
