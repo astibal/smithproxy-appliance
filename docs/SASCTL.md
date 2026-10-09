@@ -47,6 +47,14 @@ sasctl --context local --wait instance spawn \
   --source-ip 192.0.2.11 --user user-456 --ttl 30m
 
 sasctl --context local instance logs INSTANCE --lines 300
+sasctl --context local --wait instance upgrade INSTANCE smithproxy BUILD
+sasctl --context local --wait instance upgrade INSTANCE tuntom BUILD
+sasctl --context local --wait instance upgrade INSTANCE program ARTIFACT
+sasctl --context local --wait instance snapshot-create INSTANCE before-upgrade --mode cold
+sasctl --context local --wait instance snapshot-create INSTANCE evidence --mode stop --forensic
+sasctl --context local instance snapshot-list INSTANCE
+sasctl --context local --wait instance snapshot-restore INSTANCE SNAPSHOT_UUID
+sasctl --context local instance snapshot-drop INSTANCE SNAPSHOT_UUID --yes
 sasctl --context local instance cli INSTANCE
 sasctl --context local instance command INSTANCE "show status"
 sasctl --context local --wait instance extend INSTANCE 30m
@@ -69,7 +77,8 @@ Coverage groups:
 health, status, openapi
 source list
 task list|show|wait|result
-instance list|show|spawn|stop|restart|extend|delete|logs|diagnostics
+instance list|show|spawn|stop|restart|upgrade|extend|delete|logs|diagnostics
+         snapshot-list|snapshot-create|snapshot-restore|snapshot-drop
          config|config-preview|command|cli|debug-start|debug-stop|gdb
 profile list|show|create|update|delete
 build status|list|start|refs-refresh|extract-config|delete

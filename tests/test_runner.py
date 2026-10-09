@@ -80,6 +80,22 @@ class FakeBackend:
         self.units[unit] = "active"
         self.restart_count = getattr(self, "restart_count", 0) + 1
 
+    def upgrade_instance(self, instance_id, config_path, **options):
+        unit = self.unit_name(instance_id)
+        self.units[unit] = "active"
+        self.instance_upgrade = {
+            "instance_id": instance_id, "config_path": str(config_path), **options,
+        }
+
+    def freeze_instance(self, unit):
+        self.frozen_unit = unit
+
+    def thaw_instance(self, unit):
+        self.thawed_unit = unit
+
+    def stop_instance_process(self, unit):
+        self.units[unit] = "inactive"
+
     def extend_runtime(self, unit, total_seconds):
         if unit not in self.units:
             raise BackendError("unit is unknown")

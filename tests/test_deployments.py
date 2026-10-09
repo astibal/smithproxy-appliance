@@ -47,6 +47,59 @@ class DeploymentTests(unittest.TestCase):
         self.assertEqual("running", restored.state)
         self.assertEqual(item.deadline, restored.deadline)
 
+    def test_upgrade_replaces_only_build_and_preserves_runtime_state(self):
+        item = self.spawn()
+        work = self.root / "instances" / item.id
+        config = work / "smithproxy.cfg"
+        config.write_text("live config")
+        marker = work / "keep-me"
+        marker.write_text("runtime data")
+        deadline = item.deadline
+        namespace = item.namespace
+        replacement = self.root / "smithproxy-new"
+        replacement.write_bytes(b"new binary")
+
+        upgraded = self.manager.upgrade(item.id, "new-release", replacement)
+
+        self.assertEqual("new-release", upgraded.build_id)
+        self.assertEqual(item.build_id, upgraded.previous_build_id)
+        self.assertEqual(1, upgraded.upgrade_count)
+        self.assertEqual(deadline, upgraded.deadline)
+        self.assertEqual(namespace, upgraded.namespace)
+        self.assertEqual("live config", config.read_text())
+        self.assertEqual("runtime data", marker.read_text())
+        self.assertEqual(str(replacement), self.backend.instance_upgrade["smithproxy_binary"])
+        manifest = json.loads(self.manager._deployment_path(item.id).read_text())
+        self.assertEqual(str(replacement), manifest["start_options"]["smithproxy_binary"])
+
+    def test_component_upgrade_supports_elf_and_tuntom(self):
+        item = self.spawn()
+        item.application = "elf"
+        item.program_artifact_id = "a" * 64
+        item.build_id = "old-image"
+        self.manager._save(item)
+        program = {"application": "elf", "argv": ["/opt/program/tool", "--serve"],
+                   "artifact_id": "b" * 64}
+        upgraded = self.manager.upgrade_component(
+            item.id, "program", "b" * 64,
+            {"rootfs_path": str(self.root / "runtime-images" / "new-image"),
+             "program": program},
+        )
+        self.assertEqual("b" * 64, upgraded.program_artifact_id)
+        self.assertEqual("new-image", upgraded.build_id)
+        self.assertEqual("a" * 64, upgraded.previous_components["program"])
+
+        upgraded.state = "running"
+        upgraded.tuntom_build_id = "old-tuntom"
+        self.manager._save(upgraded)
+        upgraded = self.manager.upgrade_component(
+            item.id, "tuntom", "new-tuntom",
+            {"tuntom_binary": "/archive/new/tuntom",
+             "tuntom_adapter": "/archive/new/adapter"},
+        )
+        self.assertEqual("new-tuntom", upgraded.tuntom_build_id)
+        self.assertTrue(self.backend.instance_upgrade["_replace_tuntom"])
+
     def test_boot_restores_exact_config_work_and_attached_sources(self):
         item = self.spawn()
         self.manager.attach_source(item.id, "2001:db8::4")

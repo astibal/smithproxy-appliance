@@ -1679,6 +1679,95 @@ class NamespaceBackend:
         if completed.returncode:
             raise BackendError(completed.stderr.strip() or "systemctl restart failed")
 
+    def upgrade_instance(self, instance_id: str, config_path: Path, **start_options) -> None:
+        """Replace only the managed process, preserving netns and networking."""
+        replace_tuntom = bool(start_options.pop("_replace_tuntom", False))
+        unit = self.unit_name(instance_id)
+        self._run(["systemctl", "stop", unit], timeout=20, tolerate_missing=True)
+        self._run(["systemctl", "reset-failed", unit], tolerate_missing=True)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            completed = subprocess.run(
+                ["systemctl", "show", unit, "--property=LoadState", "--value"],
+                capture_output=True, text=True, timeout=3, check=False,
+            )
+            if completed.returncode or completed.stdout.strip() in {"", "not-found"}:
+                break
+            time.sleep(0.1)
+        else:
+            raise BackendError("old instance unit did not unload")
+        (config_path.parent / "run" / "smithproxy.default.pid").unlink(missing_ok=True)
+        allocation = self.allocation(instance_id)
+        if replace_tuntom:
+            self._run(["systemctl", "stop", self.tuntom_unit_name(instance_id)],
+                      timeout=20, tolerate_missing=True)
+            self._run(["systemctl", "stop", self.tuntom_relay_unit_name(instance_id)],
+                      timeout=20, tolerate_missing=True)
+            via_run = config_path.parent / "via-run"
+            _relay, relay_socket = self._start_tuntom_relay(
+                instance_id, allocation.namespace,
+                str(start_options.get("tuntom_binary", "")),
+                str(start_options.get("tuntom_switch_ip", "")),
+                str(start_options.get("tuntom_secret", "")),
+                int(start_options.get("tuntom_tunnel_id", 0)),
+                int(start_options.get("tuntom_mtu", 1500)),
+                int(start_options.get("hard_runtime_seconds", 0)), via_run,
+                str(start_options.get("rootfs_path", "")),
+            )
+            self._start_tuntom_adapter(
+                instance_id, allocation.namespace,
+                str(start_options.get("tuntom_adapter", "")), str(relay_socket),
+                str(start_options.get("tuntom_in_prefix", "proxy-in-")),
+                str(start_options.get("tuntom_out_prefix", "proxy-out-")),
+                str(start_options.get("tuntom_admission", "immediate")),
+                int(start_options.get("tuntom_mtu", 1500)),
+                int(start_options.get("hard_runtime_seconds", 0)), via_run,
+                str(start_options.get("rootfs_path", "")),
+            )
+        tuntom_unit = (
+            self.tuntom_unit_name(instance_id)
+            if getattr(allocation, "topology", "") == "tuntom-via" else ""
+        )
+        self._launch_proxy(
+            instance_id, allocation, config_path,
+            str(start_options.get("smithproxy_binary", "")),
+            str(start_options.get("rootfs_path", "")),
+            str(start_options.get("config_mode", "ro")),
+            str(start_options.get("assets_path", "")),
+            start_options.get("auto_restart", False),
+            int(start_options.get("hard_runtime_seconds", 0)),
+            tuntom_unit,
+            start_options.get("program"),
+        )
+
+    @staticmethod
+    def freeze_instance(unit: str) -> None:
+        completed = subprocess.run(
+            ["systemctl", "freeze", unit], capture_output=True, text=True,
+            timeout=20, check=False,
+        )
+        if completed.returncode:
+            raise BackendError(completed.stderr.strip() or "cannot freeze instance")
+
+    @staticmethod
+    def thaw_instance(unit: str) -> None:
+        completed = subprocess.run(
+            ["systemctl", "thaw", unit], capture_output=True, text=True,
+            timeout=20, check=False,
+        )
+        if completed.returncode:
+            raise BackendError(completed.stderr.strip() or "cannot thaw instance")
+
+    def stop_instance_process(self, unit: str) -> None:
+        """Stop managed instance processes; preserve namespace, files and allocations."""
+        instance_id = unit.removeprefix("capture-zone-smithproxy-").removesuffix(".service")
+        self._run(["systemctl", "stop", unit], timeout=20, tolerate_missing=True)
+        if SAFE_ID.fullmatch(instance_id):
+            self._run(["systemctl", "stop", self.tuntom_unit_name(instance_id)],
+                      timeout=20, tolerate_missing=True)
+            self._run(["systemctl", "stop", self.tuntom_relay_unit_name(instance_id)],
+                      timeout=20, tolerate_missing=True)
+
     def schedule_deadline(self, instance_id: str, deadline: str, previous: str = "") -> str:
         """Let PID 1 enforce TTL even while the runner is stopped."""
         if not SAFE_ID.fullmatch(instance_id):

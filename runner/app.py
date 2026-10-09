@@ -53,6 +53,7 @@ from .headless_endpoints import HeadlessEndpointLibrary
 from .deployments import atomic_json, boot_id, acquire_runner_lock, notify_systemd
 from .microservices import Microservices, SystemdServices, ServiceError
 from .system_start import SystemStart
+from .snapshots import SnapshotManager
 from . import runtime_images
 
 
@@ -115,6 +116,13 @@ class Instance:
     deadline_timer: str = ""
     alias: str = ""
     indicate_old_build: bool = True
+    previous_build_id: str = ""
+    upgraded_at: str = ""
+    upgrade_count: int = 0
+    program_artifact_id: str = ""
+    snapshot_id: str = ""
+    snapshot_path: list[str] = field(default_factory=list)
+    previous_components: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -177,6 +185,15 @@ class Manager:
 
     def _deployment_path(self, instance_id: str) -> Path:
         return self.state_dir / "deployments" / f"{instance_id}.json"
+
+    def _load_deployment(self, instance_id: str) -> dict[str, Any]:
+        try:
+            document = json.loads(self._deployment_path(instance_id).read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise BackendError("instance deployment manifest is unavailable") from exc
+        if document.get("schema") != 1 or not isinstance(document.get("start_options"), dict):
+            raise BackendError("unsupported deployment manifest schema")
+        return document
 
     def _schedule_deadline(self, instance: Instance) -> None:
         if hasattr(self.backend, "schedule_deadline"):
@@ -964,6 +981,7 @@ class Manager:
                 config_mode=config_mode,
                 runtime_profile_id=runtime_profile_id,
                 application=program['application'] if program else 'smithproxy',
+                program_artifact_id=str((program or {}).get('artifact_id', '')),
                 wiring=requested_wiring,
                 cert_bundle_id=cert_bundle_id,
                 auto_restart=auto_restart,
@@ -1314,6 +1332,118 @@ class Manager:
             instance.resources_cleaned = False
             self._save(instance)
             return instance
+
+    def upgrade(self, instance_id: str, build_id: str, binary: Path,
+                rootfs_path: Path | None = None) -> Instance:
+        """Compatibility wrapper for Smithproxy component upgrades."""
+        if not binary.is_file():
+            raise BackendError("instance upgrade binary is unavailable")
+        changes = {"smithproxy_binary": str(binary.resolve())}
+        if rootfs_path:
+            changes["rootfs_path"] = str(rootfs_path.resolve())
+        return self.upgrade_component(instance_id, "smithproxy", build_id, changes)
+
+    def upgrade_component(self, instance_id: str, component: str, version_id: str,
+                          changes: dict[str, Any]) -> Instance:
+        """Replace one managed component and restart without rebuilding networking."""
+        if component not in {"smithproxy", "program", "tuntom"}:
+            raise ConfigError("unsupported upgrade component")
+        with self.lock:
+            instance = self._load(instance_id)
+            if not instance:
+                raise ConfigError("instance not found")
+            instance = self._reconcile(instance)
+            if instance.state != "running":
+                raise ConfigError("only a running instance can be upgraded")
+            if component == "smithproxy" and instance.application != "smithproxy":
+                raise ConfigError("instance has no Smithproxy component")
+            if component == "program" and instance.application != "elf":
+                raise ConfigError("instance has no versioned ELF component")
+            if component == "tuntom" and not instance.tuntom_build_id:
+                raise ConfigError("instance has no Tuntom component")
+            deployment = self._load_deployment(instance.id)
+            options = dict(deployment.get("start_options", {}))
+            options.update(changes)
+            for session_id, session in list(self.cli_sessions.items()):
+                if session.instance_id == instance_id:
+                    session.connection.close()
+                    del self.cli_sessions[session_id]
+            self.close_netns_transport(instance_id)
+            gdb = self.gdb_sessions.pop(instance_id, None)
+            if gdb:
+                gdb.close()
+            if instance.debug_unit:
+                self.backend.stop_debug(instance.id)
+                self._clear_debug(instance)
+            config_path = self.runtime_root / instance.id / "smithproxy.cfg"
+            try:
+                self.backend.upgrade_instance(
+                    instance.id, config_path, **options,
+                    **({"_replace_tuntom": True} if component == "tuntom" else {}),
+                )
+            except Exception:
+                # The durable manifest still describes the old deployment.
+                # Best-effort rollback keeps a failed file replacement from
+                # silently turning into a stopped instance.
+                try:
+                    self.backend.upgrade_instance(
+                        instance.id, config_path, **deployment["start_options"],
+                        **({"_replace_tuntom": True} if component == "tuntom" else {}),
+                    )
+                except Exception as rollback:
+                    instance.result = f"upgrade rollback failed: {rollback}"
+                    self._save(instance)
+                raise
+            deployment["start_options"] = options
+            atomic_json(self._deployment_path(instance.id), deployment)
+            previous = self.component_versions(instance).get(component, "")
+            instance.previous_components = {**instance.previous_components, component: previous}
+            if component == "smithproxy":
+                instance.previous_build_id = instance.build_id
+                instance.build_id = version_id
+            elif component == "program":
+                instance.program_artifact_id = version_id
+                instance.build_id = str(changes.get("rootfs_path", "")).rstrip("/").split("/")[-1]
+            else:
+                instance.tuntom_build_id = version_id
+            instance.upgraded_at = datetime.now(timezone.utc).isoformat()
+            instance.upgrade_count += 1
+            instance.state = "starting"
+            instance.members = []
+            instance.slice_rss_bytes = 0
+            instance.result = "upgraded"
+            instance.resources_cleaned = False
+            self._save(instance)
+            return instance
+
+    def component_versions(self, instance: Instance) -> dict[str, str]:
+        result = {}
+        if instance.application == "smithproxy":
+            result["smithproxy"] = instance.build_id
+        if instance.application == "elf" and instance.program_artifact_id:
+            result["program"] = instance.program_artifact_id
+        if instance.tuntom_build_id:
+            result["tuntom"] = instance.tuntom_build_id
+        return result
+
+    def restart_preserved(self, instance_id: str) -> Instance:
+        """Restart from the durable manifest without changing network resources."""
+        instance = self._load(instance_id)
+        if not instance:
+            raise ConfigError("instance not found")
+        deployment = self._load_deployment(instance.id)
+        self.backend.upgrade_instance(
+            instance.id, self.runtime_root / instance.id / "smithproxy.cfg",
+            **deployment["start_options"],
+            **({"_replace_tuntom": True}
+               if deployment["start_options"].get("egress_driver") == "tuntom-via" else {}),
+        )
+        instance.state = "starting"
+        instance.members = []
+        instance.slice_rss_bytes = 0
+        instance.resources_cleaned = False
+        self._save(instance)
+        return instance
 
     def extend(self, instance_id: str, additional_seconds: int) -> Instance:
         if isinstance(additional_seconds, bool) or not isinstance(additional_seconds, int):
@@ -1725,6 +1855,20 @@ def openapi_document() -> dict[str, Any]:
             "/v1/instances/{id}/restart": {
                 "post": {"summary": "Restart Smithproxy inside its existing unit and netns"},
             },
+            "/v1/instances/{id}/upgrade": {
+                "post": {"summary": "Upgrade a managed Smithproxy, Tuntom or ELF component without changing instance configuration or networking"},
+            },
+            "/v1/instances/{id}/snapshots": {
+                "get": {"summary": "List materialized named instance snapshots"},
+                "post": {"summary": "Create a hot, cold or stop-path snapshot with optional live forensic cores"},
+            },
+            "/v1/instances/{id}/snapshots/{snapshot_id}": {
+                "get": {"summary": "Read snapshot metadata"},
+                "delete": {"summary": "Drop a materialized snapshot"},
+            },
+            "/v1/instances/{id}/snapshots/{snapshot_id}/restore": {
+                "post": {"summary": "Restore snapshot data and component versions while preserving networking"},
+            },
             "/v1/instances/{id}/extend": {
                 "post": {"summary": "Add time to an active instance TTL"},
             },
@@ -1880,8 +2024,11 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     tuntom_builder: TuntomBuilder | None = None,
                     qemu_images: QemuImageLibrary | None = None,
                     appliance_exports: ApplianceExportLibrary | None = None,
-                    headless_endpoints: HeadlessEndpointLibrary | None = None):
+                    headless_endpoints: HeadlessEndpointLibrary | None = None,
+                    snapshots: SnapshotManager | None = None):
     program_artifacts = ProgramArtifacts(runtime_profiles.path.parent / 'program-artifacts') if runtime_profiles else None
+    if snapshots is None and isinstance(getattr(manager, "state_dir", None), Path):
+        snapshots = SnapshotManager(manager.state_dir.parent / "instance-snapshots", manager)
 
     def firewall_context(sources: list[str] | None = None) -> tuple[str, list[str]]:
         if not network_settings:
@@ -2355,7 +2502,9 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
             for item in (test_drives.snapshot() if test_drives else [])
             if item.build_id == build_id
         ]
-        return {"runtime_profiles": profiles, "instances": instances, "test_drives": drives}
+        snapshot_usage = snapshots.usage("smithproxy", build_id) if snapshots else []
+        return {"runtime_profiles": profiles, "instances": instances,
+                "test_drives": drives, "snapshots": snapshot_usage}
 
     def build_status_view() -> dict | None:
         if not builder:
@@ -2687,7 +2836,8 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                 )
                 return manager.create(effective_payload, template_path=root / 'program.cfg', rootfs_path=root,
                     work_installer=lambda destination: runtime_profiles.install_work_files(runtime_profile_id, destination),
-                    program={'application': binding['application'], 'argv': contract['argv']})
+                    program={'application': binding['application'], 'argv': contract['argv'],
+                             'artifact_id': str(binding.get('program_settings', {}).get('artifact_id', ''))})
             if 'wiring' not in payload:
                 effective_payload['wiring'] = binding.get('wiring', [])
             effective_payload["build_id"] = binding["build_id"]
@@ -2904,7 +3054,9 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
             r"/v1/builds/[A-Za-z0-9._-]+/rootfs",
             r"/v1/configs/(?:preview|commit)",
             r"/v1/config-observer",
-            r"/v1/instances/[0-9a-f-]+/(?:debug|restart|config/preview)",
+            r"/v1/instances/[0-9a-f-]+/(?:debug|restart|upgrade|config/preview)",
+            r"/v1/instances/[0-9a-f-]+/snapshots",
+            r"/v1/instances/[0-9a-f-]+/snapshots/[0-9a-f-]+/restore",
             r"/v1/instances/[0-9a-f-]+/sources",
             r"/v1/cert-bundles",
             r"/v1/cert-bundles/[0-9a-f-]+/certificates",
@@ -2930,6 +3082,7 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
             r"/v1/tuntom/builds/[A-Za-z0-9._-]+",
             r"/v1/configs/previews/[0-9a-f-]+",
             r"/v1/instances/[0-9a-f-]+/debug",
+            r"/v1/instances/[0-9a-f-]+/snapshots/[0-9a-f-]+",
             r"/v1/runtime-profiles/[0-9a-f-]+",
             r"/v1/network-profiles/[0-9a-f-]+",
             r"/v1/cert-bundles/[0-9a-f-]+",
@@ -3296,6 +3449,20 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     })
                 except BackendError as exc:
                     self._json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+            elif (len(parts) == 4 and parts[:2] == ["v1", "instances"]
+                  and parts[3] == "snapshots"):
+                item = manager.peek(parts[2])
+                self._json(HTTPStatus.OK, {"snapshots": snapshots.list(parts[2])}) if item and snapshots else self._json(
+                    HTTPStatus.NOT_FOUND, {"error": "not found"}
+                )
+            elif (len(parts) == 5 and parts[:2] == ["v1", "instances"]
+                  and parts[3] == "snapshots"):
+                try:
+                    if not snapshots:
+                        raise BackendError("snapshot storage is unavailable")
+                    self._json(HTTPStatus.OK, snapshots.get(parts[2], parts[4]))
+                except BackendError as exc:
+                    self._json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
             elif len(parts) == 3 and parts[:2] == ["v1", "instances"]:
                 item = manager.peek(parts[2])
                 self._json(HTTPStatus.OK, asdict(item)) if item else self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
@@ -3660,6 +3827,42 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
             if self._l2_request("POST"):
                 return
             parts = self._path()
+            if (len(parts) == 4 and parts[:2] == ["v1", "instances"]
+                    and parts[3] == "snapshots"):
+                try:
+                    if not snapshots:
+                        raise BackendError("snapshot storage is unavailable")
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if not 0 < length <= 4096:
+                        raise ConfigError("invalid snapshot request size")
+                    payload = json.loads(self.rfile.read(length))
+                    if not isinstance(payload, dict) or set(payload) - {"name", "mode", "forensic"}:
+                        raise ConfigError("snapshot accepts name, mode and forensic")
+                    name = str(payload.get("name", ""))
+                    mode = str(payload.get("mode", "cold"))
+                    forensic = payload.get("forensic", False)
+                    self._json(HTTPStatus.ACCEPTED, submit_task(
+                        "instance-snapshot", f"Snapshot {name} / {parts[2][:12]}",
+                        f"snapshot:{parts[2]}:{hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()}",
+                        f"instance:{parts[2]}",
+                        lambda: snapshots.create(parts[2], name, mode, forensic),
+                    ))
+                except (ConfigError, BackendError, json.JSONDecodeError) as exc:
+                    self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            if (len(parts) == 6 and parts[:2] == ["v1", "instances"]
+                    and parts[3] == "snapshots" and parts[5] == "restore"):
+                try:
+                    if not snapshots:
+                        raise BackendError("snapshot storage is unavailable")
+                    self._json(HTTPStatus.ACCEPTED, submit_task(
+                        "instance-snapshot-restore", f"Obnovit snapshot {parts[4][:12]}",
+                        f"snapshot-restore:{parts[2]}:{parts[4]}", f"instance:{parts[2]}",
+                        lambda: snapshots.restore(parts[2], parts[4]),
+                    ))
+                except (ConfigError, BackendError) as exc:
+                    self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
             if len(parts) == 5 and parts[0] == 'v1' and parts[1] in {'instances', 'test-drives'} and parts[3:] == ['microservices', 'check']:
                 try:
                     owner = manager if parts[1] == 'instances' else test_drives
@@ -4315,6 +4518,74 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                 except BackendError as exc:
                     self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
                 return
+            if len(parts) == 4 and parts[:2] == ["v1", "instances"] and parts[3] == "upgrade":
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if length <= 0 or length > max_body:
+                        raise ConfigError("invalid request size")
+                    payload = json.loads(self.rfile.read(length))
+                    if not isinstance(payload, dict) or set(payload) - {"component", "version_id", "build_id"}:
+                        raise ConfigError("upgrade accepts component and version_id")
+                    component = str(payload.get("component", "smithproxy"))
+                    version_id = str(payload.get("version_id", payload.get("build_id", "")))
+                    current = manager.peek(parts[2])
+                    if not current:
+                        self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+                        return
+                    changes = {}
+                    if component == "smithproxy":
+                        if not builder:
+                            raise BackendError("build library is unavailable")
+                        changes["smithproxy_binary"] = str(builder.resolve_binary(version_id).resolve())
+                        if current.filesystem_mode == "rootfs":
+                            changes["rootfs_path"] = str(builder.resolve_rootfs(version_id).resolve())
+                    elif component == "program":
+                        if not program_artifacts or not runtime_profiles:
+                            raise BackendError("program artifact library is unavailable")
+                        deployment = manager._load_deployment(current.id)
+                        old = deployment["start_options"]
+                        contract = old.get("program", {})
+                        if current.application != "elf" or not isinstance(contract.get("argv"), list):
+                            raise ConfigError("instance has no versioned ELF component")
+                        old_root = Path(str(old.get("rootfs_path", "")))
+                        old_meta = json.loads((old_root / "runtime-image.json").read_text())
+                        artifact = program_artifacts.get(version_id)
+                        image = runtime_images.prepare(
+                            runtime_profiles.path.parent / "runtime-images",
+                            str(old_meta.get("variant", "barebone")), application="elf",
+                            settings={"argv": contract["argv"][1:]},
+                            executable=program_artifacts.binary(version_id),
+                            executable_name=artifact.get("filename", "program"),
+                        )
+                        new_contract = json.loads((image / "runtime-image.json").read_text())
+                        changes.update(rootfs_path=str(image.resolve()), program={
+                            "application": "elf", "argv": new_contract["argv"],
+                            "artifact_id": version_id,
+                        })
+                    elif component == "tuntom":
+                        if not tuntom_builder:
+                            raise BackendError("Tuntom build library is unavailable")
+                        changes.update(
+                            tuntom_binary=str(tuntom_builder.resolve_tunnel(version_id).resolve()),
+                            tuntom_adapter=str(tuntom_builder.resolve_adapter(version_id).resolve()),
+                        )
+                    else:
+                        raise ConfigError("unsupported upgrade component")
+
+                    def upgrade_task() -> dict:
+                        return asdict(manager.upgrade_component(
+                            parts[2], component, version_id, changes,
+                        ))
+
+                    self._json(HTTPStatus.ACCEPTED, submit_task(
+                        "instance-upgrade", f"Upgradovat instanci {parts[2][:12]}",
+                        f"upgrade:{parts[2]}:{component}:{version_id}",
+                        f"instance:{parts[2]}", upgrade_task,
+                    ))
+                except (ConfigError, BackendError, OSError, ValueError, TypeError,
+                        json.JSONDecodeError) as exc:
+                    self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
             if (len(parts) == 5 and parts[:2] == ["v1", "instances"]
                     and parts[3:] == ["config", "preview"] and config_previews):
                 try:
@@ -4670,6 +4941,15 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
             if self._l2_request("DELETE"):
                 return
             parts = self._path()
+            if (len(parts) == 5 and parts[:2] == ["v1", "instances"]
+                    and parts[3] == "snapshots"):
+                try:
+                    if not snapshots:
+                        raise BackendError("snapshot storage is unavailable")
+                    self._json(HTTPStatus.OK, snapshots.delete(parts[2], parts[4]))
+                except BackendError as exc:
+                    self._json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+                return
             if (len(parts) == 3 and parts[:2] == ["v1", "headless-endpoints"]
                     and headless_endpoints):
                 try:
@@ -4748,7 +5028,7 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
             if len(parts) == 3 and parts[:2] == ["v1", "builds"] and builder:
                 build_id = parts[2]
                 usage = build_usage(build_id)
-                if usage["instances"] or usage["runtime_profiles"] or usage["test_drives"]:
+                if any(usage.values()):
                     self._json(HTTPStatus.CONFLICT, {
                         "error": "archived binary is referenced by an active instance, test drive, or runtime profile",
                         "usage": usage,
@@ -4777,11 +5057,13 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     if item.tuntom_build_id == build_id
                     and (item.desired_state == "running" or item.state in {"starting", "running", "orphaned"})
                 ]
-                if usage or active_instances:
+                snapshot_usage = snapshots.usage("tuntom", build_id) if snapshots else []
+                if usage or active_instances or snapshot_usage:
                     self._json(HTTPStatus.CONFLICT, {
                         "error": "tuntom build is referenced by a network profile or active Slice",
                         "network_profiles": usage,
                         "instances": active_instances,
+                        "snapshots": snapshot_usage,
                     })
                     return
                 try:

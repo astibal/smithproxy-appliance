@@ -112,6 +112,7 @@ python3 -m venv /opt/smithproxy-appliance/console/.venv
 
 Install host runtime/build dependencies separately (systemd, iproute2, nftables,
 the required compiler and Smithproxy libraries; optional tuntom/QEMU/debug tools).
+The `gcore` command from GDB is required when live forensic snapshots are used.
 The service does not install system packages. Stage the template and source pool
 at the configured `/etc` paths before enabling it. Protect `/opt` and `/etc`
 against writes by the console account. The root runner intentionally shares the

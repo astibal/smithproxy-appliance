@@ -318,6 +318,24 @@ def build_parser() -> argparse.ArgumentParser:
         item.add_argument("instance")
         if name in {"delete"}:
             item.add_argument("--yes", action="store_true")
+    upgrade = instance_sub.add_parser("upgrade", help="replace build files and restart in place")
+    upgrade.add_argument("instance")
+    upgrade.add_argument("component", choices=("smithproxy", "program", "tuntom"))
+    upgrade.add_argument("version", help="target build/artifact ID, unique prefix, ref or name")
+    snapshot_list = instance_sub.add_parser("snapshot-list")
+    snapshot_list.add_argument("instance")
+    snapshot_create = instance_sub.add_parser("snapshot-create")
+    snapshot_create.add_argument("instance")
+    snapshot_create.add_argument("name")
+    snapshot_create.add_argument("--mode", choices=("hot", "cold", "stop"), default="cold")
+    snapshot_create.add_argument("--forensic", action="store_true")
+    snapshot_restore = instance_sub.add_parser("snapshot-restore")
+    snapshot_restore.add_argument("instance")
+    snapshot_restore.add_argument("snapshot")
+    snapshot_drop = instance_sub.add_parser("snapshot-drop")
+    snapshot_drop.add_argument("instance")
+    snapshot_drop.add_argument("snapshot")
+    snapshot_drop.add_argument("--yes", action="store_true")
     extend = instance_sub.add_parser("extend")
     extend.add_argument("instance")
     extend.add_argument("duration", type=lambda value: duration(value))
@@ -512,6 +530,9 @@ def _id(client: RunnerClient, kind: str, value: str) -> str:
     if kind == "build":
         artifacts = client.get("/v1/build").get("artifacts", [])
         return resolve(artifacts, value, "build_id", "ref").get("build_id")
+    if kind == "program":
+        artifacts = client.get("/v1/program-artifacts").get("artifacts", [])
+        return resolve(artifacts, value, "artifact_id", "name").get("artifact_id")
     if kind == "tuntom-build":
         artifacts = client.get("/v1/tuntom/build").get("artifacts", [])
         return resolve(artifacts, value, "build_id", "ref").get("build_id")
@@ -627,6 +648,30 @@ def _instance(client: RunnerClient, args: argparse.Namespace) -> tuple[Any, Any]
     if command == "extend":
         value = client.post(f"/v1/instances/{instance_id}/extend", {"additional_seconds": args.duration})
         return complete(client, value, args), None
+    if command == "upgrade":
+        kind = {"smithproxy": "build", "program": "program", "tuntom": "tuntom-build"}[args.component]
+        version_id = _id(client, kind, args.version)
+        value = client.enqueue("POST", f"/v1/instances/{instance_id}/upgrade",
+                               {"component": args.component, "version_id": version_id},
+                               f"upgrade {args.component} {instance_id[:12]}",
+                               "instance-upgrade")
+        return complete(client, value, args), None
+    if command == "snapshot-list":
+        return client.get(f"/v1/instances/{instance_id}/snapshots")["snapshots"], None
+    if command == "snapshot-create":
+        value = client.enqueue("POST", f"/v1/instances/{instance_id}/snapshots",
+                               {"name": args.name, "mode": args.mode,
+                                "forensic": args.forensic},
+                               f"snapshot {args.name}", "instance-snapshot")
+        return complete(client, value, args), None
+    if command == "snapshot-restore":
+        value = client.enqueue("POST", f"/v1/instances/{instance_id}/snapshots/{args.snapshot}/restore",
+                               {}, f"restore snapshot {args.snapshot[:12]}",
+                               "instance-snapshot-restore")
+        return complete(client, value, args), None
+    if command == "snapshot-drop":
+        confirm(args, "drop the materialized instance snapshot")
+        return client.delete(f"/v1/instances/{instance_id}/snapshots/{args.snapshot}"), None
     if command == "command":
         return client.post(f"/v1/instances/{instance_id}/cli", {"input": args.text + "\r"}), None
     if command == "config-preview":
