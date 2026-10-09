@@ -114,6 +114,7 @@ class Instance:
     recovery_after: float = 0
     deadline_timer: str = ""
     alias: str = ""
+    indicate_old_build: bool = True
 
 
 @dataclass
@@ -516,6 +517,16 @@ class Manager:
             return {'instance_id': instance_id, 'state': 'checked',
                     'system_start': self.system_start.check(instance),
                     'external_microservices': 'unavailable'}
+
+    def set_build_warning(self, instance_id: str, enabled: bool) -> Instance | None:
+        if type(enabled) is not bool:
+            raise ConfigError('indicate_old_build must be a boolean')
+        with self.lock:
+            item = self._load(instance_id)
+            if item:
+                item.indicate_old_build = enabled
+                self._save(item)
+            return item
 
     def set_alias(self, instance_id: str, alias: str) -> Instance | None:
         if not isinstance(alias, str) or (alias and (
@@ -3706,6 +3717,19 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                 except (ServiceError, OSError, ValueError) as exc:
                     self._json(getattr(exc, 'http', 503), {'contract_version': 3,
                         'error': getattr(exc, 'error', 'state_unknown'), 'process_group_empty': None})
+                return
+            if len(parts) == 4 and parts[:2] == ["v1", "instances"] and parts[3] == "build-warning":
+                try:
+                    length = int(self.headers.get('Content-Length', '0'))
+                    if not 0 < length <= 1024:
+                        raise ConfigError('invalid request size')
+                    payload = json.loads(self.rfile.read(length))
+                    if not isinstance(payload, dict) or set(payload) != {'indicate_old_build'}:
+                        raise ConfigError('expected indicate_old_build only')
+                    item = manager.set_build_warning(parts[2], payload['indicate_old_build'])
+                    self._json(HTTPStatus.OK, asdict(item)) if item else self._json(HTTPStatus.NOT_FOUND, {'error': 'instance not found'})
+                except (ValueError, ConfigError) as exc:
+                    self._json(HTTPStatus.BAD_REQUEST, {'error': str(exc)})
                 return
             if len(parts) == 4 and parts[:2] == ["v1", "instances"] and parts[3] == "alias":
                 try:

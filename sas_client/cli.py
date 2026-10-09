@@ -260,6 +260,9 @@ def build_parser() -> argparse.ArgumentParser:
     alias = instance_sub.add_parser("alias", help="set a unique persistent alias; empty name clears it")
     alias.add_argument("instance")
     alias.add_argument("name")
+    warning = instance_sub.add_parser('build-warning', help='enable or disable outdated build indication')
+    warning.add_argument('instance')
+    warning.add_argument('setting', choices=('on', 'off'))
     microservice = instance_sub.add_parser('microservice', help='Fabric V3 service status / verified stop')
     microservice.add_argument('instance')
     microservice.add_argument('prefix')
@@ -549,6 +552,8 @@ def _instance(client: RunnerClient, args: argparse.Namespace) -> tuple[Any, Any]
         else _id(client, "instance", getattr(args, "instance", "")) if command != "spawn" else "")
     if command == "alias":
         return client.post(f"/v1/instances/{instance_id}/alias", {"alias": args.name}), None
+    if command == 'build-warning':
+        return client.post(f'/v1/instances/{instance_id}/build-warning', {'indicate_old_build': args.setting == 'on'}), None
     if command == 'check-microservices':
         return complete(client, client.post(f'/v1/instances/{instance_id}/microservices/check', {}), args), None
     if command == 'system-start':
