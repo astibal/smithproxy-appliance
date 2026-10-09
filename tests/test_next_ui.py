@@ -54,9 +54,12 @@ class NextApiTests(unittest.TestCase):
             with self.subTest(resource=resource, action=action):
                 response = self.client.post('/next-api/action', json={
                     'resource': resource, 'action': action, 'id': 'abc-123',
-                    'payload': {'approved': True, 'endpoint_id': 'endpoint-123'}})
+                    'payload': {'approved': True, 'endpoint_id': 'endpoint-123',
+                                'snapshot_id': '11111111-1111-4111-8111-111111111111'}})
                 self.assertEqual(response.status_code, 202)
-                self.assertEqual(self.calls[-1][:2], (method, path.format(id='abc-123', endpoint='endpoint-123')))
+                self.assertEqual(self.calls[-1][:2], (method, path.format(
+                    id='abc-123', endpoint='endpoint-123',
+                    snapshot='11111111-1111-4111-8111-111111111111')))
                 self.assertEqual(len(self.calls[-1]), 3 if direct else 5)
 
     def test_approval_identity_is_server_owned(self):

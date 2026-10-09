@@ -65,6 +65,10 @@ OPERATIONS = {
     ('instances', 'create'): ('POST', '/v1/instances', True),
     ('instances', 'cleanup'): ('POST', '/v1/instances/cleanup', False),
     ('instances', 'extend'): ('POST', '/v1/instances/{id}/extend', True),
+    ('instances', 'upgrade'): ('POST', '/v1/instances/{id}/upgrade', True),
+    ('instances', 'snapshot-create'): ('POST', '/v1/instances/{id}/snapshots', True),
+    ('instances', 'snapshot-restore'): ('POST', '/v1/instances/{id}/snapshots/{snapshot}/restore', True),
+    ('instances', 'snapshot-drop'): ('DELETE', '/v1/instances/{id}/snapshots/{snapshot}', True),
     ('instances', 'extract'): ('POST', '/v1/instances/{id}/config/preview', False),
     ('instances', 'debug-start'): ('POST', '/v1/instances/{id}/debug', False),
     ('instances', 'debug-stop'): ('DELETE', '/v1/instances/{id}/debug', False),
@@ -93,6 +97,7 @@ DETAILS = {
     ('tasks', 'result'): '/v1/tasks/{id}/result',
     ('binaries', 'status'): '/v1/build',
     ('tuntom', 'status'): '/v1/tuntom/build',
+    ('instances', 'snapshots'): '/v1/instances/{id}/snapshots',
 }
 
 
@@ -173,7 +178,12 @@ def register(app, api, enqueue, audit=None):
                 if not isinstance(endpoint, str) or not re.fullmatch(r'[A-Za-z0-9._-]{1,128}', endpoint):
                     return jsonify(error='Endpoint ID required'), 400
                 payload = {key: value for key, value in payload.items() if key != 'endpoint_id'}
-            path = pattern.format(id=identity, endpoint=endpoint)
+            snapshot = payload.get('snapshot_id', '')
+            if '{snapshot}' in pattern:
+                if not isinstance(snapshot, str) or not re.fullmatch(r'[0-9a-f-]{36}', snapshot):
+                    return jsonify(error='Snapshot ID required'), 400
+                payload = {key: value for key, value in payload.items() if key != 'snapshot_id'}
+            path = pattern.format(id=identity, endpoint=endpoint, snapshot=snapshot)
         if resource == 'configs' and action == 'commit':
             payload = {**payload, 'approved_by': g.admin['email']}
         if not path:

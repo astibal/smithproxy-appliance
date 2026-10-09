@@ -51,7 +51,8 @@ export function workflows({el, button, request, action, fetchItems, identity, no
     newDrive:['Spustit Test Drive','Start Test Drive','Démarrer un Test Drive'],
     profile:['Runtime profil','Runtime profile','Profil d’exécution'],source:['Autorizovaná IP','Authorized IP','IP autorisée'],
     ttl:['TTL sekund (0 = bez limitu)','TTL seconds (0 = unlimited)','TTL secondes (0 = illimité)'],
-    restart:['Restartovat','Restart','Redémarrer'],upgrade:['Upgrade bez restartu','Upgrade without restart','Mettre à niveau sans redémarrer'],
+    restart:['Restartovat','Restart','Redémarrer'],upgrade:['Upgradovat a restartovat','Upgrade and restart','Mettre à niveau et redémarrer'],
+    snapshots:['Snapshoty','Snapshots','Snapshots'],snapshotName:['Název snapshotu','Snapshot name','Nom du snapshot'],forensic:['Forenzní live core','Forensic live core','Core live forensique'],restore:['Obnovit','Restore','Restaurer'],hot:['Hot — běžící kopie','Hot — live copy','Hot — copie active'],cold:['Cold — zmrazit hlavní proces','Cold — freeze main process','Cold — geler le processus principal'],stop:['Stop — zastavit vše','Stop — stop everything','Stop — tout arrêter'],sameBranch:['stejná větev','same branch','même branche'],component:['Komponenta','Component','Composant'],version:['Cílová verze','Target version','Version cible'],
     configMode:['Režim konfigurace','Configuration mode','Mode de configuration'],branches:['Větve a stav buildu','Branches and build status','Branches et état de compilation'],
     import:['Import configu','Import config','Importer une configuration'],download:['Stáhnout konfiguraci','Download config','Télécharger la configuration'],
     file:['Soubor · volitelně, nejvýše 1 MiB','File · optional, at most 1 MiB','Fichier · facultatif, 1 Mio maximum'],openEditor:['Otevřít editor','Open editor','Ouvrir l’éditeur'],metadata:['Název a popis','Name and description','Nom et description'],description:['Popis','Description','Description'],find:['Hledat','Find','Rechercher'],wrap:['Zalomit řádky','Wrap lines','Retour à la ligne'],
@@ -267,6 +268,10 @@ export function workflows({el, button, request, action, fetchItems, identity, no
         if(item.state==='running'&&(item.build_type==='Debug'||item.build_id?.endsWith('-debug')))bar.append(button('GDB server ▶',()=>run('debug-start')));
         if(item.debug_unit)bar.append(button('GDB server ■',()=>run('debug-stop')));
       }
+      if(item.state==='running'){
+        if((item.application||'smithproxy')==='smithproxy'||item.application==='elf'||item.tuntom_build_id)bar.append(button(tr('upgrade'),()=>upgradeInstance(item)));
+        bar.append(button(tr('snapshots'),()=>snapshotManager(item)));
+      }
     }
     if(resource==='configs')bar.append(button(tr('edit'),()=>configEditor(item)),button(tr('metadata'),()=>simple(resource,'metadata',item,[['name',tr('name'),item.name],['description',tr('description'),item.description||'']])),el('a',{href:`/configs/${id}/download`,class:'download-link'},tr('download')),button(tr('remove'),()=>{if(confirm(`${tr('remove')} · ${item.name||id}\nID: ${id}\n\n${tr('confirm')}`))run('delete');}));
     if(resource==='tasks'&&item.state==='succeeded')bar.append(button(tr('result'),()=>result(item).catch(e=>notice(e.message,true))));
@@ -281,6 +286,30 @@ export function workflows({el, button, request, action, fetchItems, identity, no
       );
       if(item.state==='running')bar.append(button('CLI',()=>terminal(item,'cli','test-drives')),button('Shell',()=>terminal(item,'shell','test-drives')));
     }
+  }
+  async function upgradeInstance(item){
+    const w=dialog(tr('upgrade')),components=[];
+    if((item.application||'smithproxy')==='smithproxy')components.push(['smithproxy','Smithproxy']);
+    if(item.application==='elf')components.push(['program','ELF program']);
+    if(item.tuntom_build_id)components.push(['tuntom','Tuntom']);
+    const component=field(w,tr('component'),components[0]?.[0]||'',components),version=field(w,tr('version'),'',[['','—']]);
+    const catalogs={};
+    const load=async()=>{
+      const resource={smithproxy:'binaries',program:'programs',tuntom:'tuntom'}[component.value];
+      const values=catalogs[resource]||(catalogs[resource]=await fetchItems(resource));
+      const current={smithproxy:item.build_id,program:item.program_artifact_id,tuntom:item.tuntom_build_id}[component.value];
+      const currentItem=values.find(v=>identity(v)===current),branch=currentItem?.ref,name=currentItem?.name;
+      const ordered=[...values].sort((a,b)=>Number((b.ref===branch)||(b.name===name))-Number((a.ref===branch)||(a.name===name)));
+      version.replaceChildren(...ordered.map(v=>{const same=(branch&&v.ref===branch)||(name&&v.name===name),label=[v.ref||v.name,v.build_type||v.version,identity(v).slice(0,12),same?'★ '+tr('sameBranch'):''].filter(Boolean).join(' · ');return el('option',{value:identity(v)},label);}));
+      version.value=current||identity(ordered[0]||{});
+    };
+    component.onchange=()=>load().catch(e=>w.status.textContent=e.message);await load();
+    commit(w,'instances','upgrade',identity(item),()=>({component:component.value,version_id:version.value}));
+  }
+  async function snapshotManager(item){
+    const w=dialog(tr('snapshots')),name=field(w,tr('snapshotName'),''),mode=field(w,'Mode','cold',[['cold',tr('cold')],['hot',tr('hot')],['stop',tr('stop')]]),forensic=field(w,tr('forensic'),false,null,'checkbox'),list=el('div',{class:'snapshot-list'});w.body.append(list);
+    const refresh=async()=>{const data=await request(`/next-api/detail/instances/${encodeURIComponent(identity(item))}/snapshots`);list.replaceChildren(...(data.snapshots||[]).map(s=>{const restore=button(tr('restore'),async()=>{restore.disabled=true;try{await action('instances','snapshot-restore',identity(item),{snapshot_id:s.snapshot_id});w.status.textContent='✓';}catch(e){w.status.textContent=e.message;}finally{restore.disabled=false;}}),drop=button(tr('remove'),async()=>{if(!confirm(`${tr('remove')} · ${s.name}?`))return;try{await action('instances','snapshot-drop',identity(item),{snapshot_id:s.snapshot_id});await refresh();}catch(e){w.status.textContent=e.message;}});return el('article',{class:'snapshot-entry'},el('strong',{},s.name),el('code',{},(s.snapshot_path||[]).join(' → ')),el('small',{},`${s.mode} · ${s.forensic_status} · ${s.created_at}`),restore,drop);}));};
+    commit(w,'instances','snapshot-create',identity(item),()=>({name:name.value,mode:mode.value,forensic:forensic.checked}));w.watch(refresh);await refresh();
   }
   const network=networkWorkflows({el,button,request,action,fetchItems,identity,notice,dialog,field,commit,language});
   const firewall=firewallWorkflows({el,button,request,action,fetchItems,identity,notice,dialog,field,commit,language});
