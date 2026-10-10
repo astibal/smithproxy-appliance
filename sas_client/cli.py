@@ -204,6 +204,16 @@ def build_parser() -> argparse.ArgumentParser:
     source.add_argument('--file', type=Path)
     source.add_argument('--path', help='Absolute path on the runner origin')
 
+    rootfs = groups.add_parser('rootfs-image')
+    rootfs_sub = rootfs.add_subparsers(dest='command', required=True)
+    rootfs_sub.add_parser('list')
+    rootfs_import = rootfs_sub.add_parser('import')
+    rootfs_import.add_argument('--name', required=True)
+    rootfs_import.add_argument('--version', default='')
+    rootfs_source = rootfs_import.add_mutually_exclusive_group(required=True)
+    rootfs_source.add_argument('--file', type=Path)
+    rootfs_source.add_argument('--path', help='Absolute path on the runner origin')
+
     groups.add_parser("health", help="check the unauthenticated health endpoint")
     groups.add_parser("status", help="show runner status")
     groups.add_parser("openapi", help="print runner OpenAPI document")
@@ -992,6 +1002,20 @@ def dispatch(client: RunnerClient, args: argparse.Namespace) -> tuple[Any, Any]:
         else:
             payload['path'] = args.path
         return complete(client, client.post('/v1/program-artifacts', payload), args), None
+    if args.group == 'rootfs-image':
+        if args.command == 'list':
+            return client.get('/v1/rootfs-images')['images'], None
+        payload = {'name': args.name, 'version': args.version}
+        if args.file:
+            import base64
+            with args.file.open('rb') as stream:
+                content = stream.read(128 * 1024 * 1024 + 1)
+            if len(content) > 128 * 1024 * 1024:
+                raise ValueError('Maximum rootfs archive size: 128 MiB')
+            payload['content_base64'] = base64.b64encode(content).decode('ascii')
+        else:
+            payload['path'] = args.path
+        return complete(client, client.post('/v1/rootfs-images', payload), args), None
     if args.group == "health": return client.get("/healthz"), None
     if args.group == "status": return client.get("/v1/status"), None
     if args.group == "openapi": return client.get("/v1/openapi.json"), None

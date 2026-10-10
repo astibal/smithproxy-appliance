@@ -1,4 +1,6 @@
 import json
+import io
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +11,14 @@ from runner.systemd import BackendError
 
 
 class RuntimeImages(unittest.TestCase):
+    @staticmethod
+    def archive(root):
+        output = io.BytesIO()
+        with tarfile.open(fileobj=output, mode='w:gz') as archive:
+            for path in root.rglob('*'):
+                archive.add(path, arcname=str(path.relative_to(root)), recursive=False)
+        return output.getvalue()
+
     def test_real_router_image_and_immutable_variant(self):
         with tempfile.TemporaryDirectory() as directory:
             library = Path(directory)
@@ -28,6 +38,27 @@ class RuntimeImages(unittest.TestCase):
             with self.assertRaises(BackendError):
                 runtime_images.prepare(Path(directory), application='webfsd')
             self.assertEqual([], list(Path(directory).iterdir()))
+
+    def test_import_portable_rootfs_and_resolve_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = runtime_images.prepare(root / 'source', application='router')
+            item = runtime_images.import_bytes(root / 'target', self.archive(source), 'Router', 'v1')
+            self.assertEqual('Router', item['name'])
+            self.assertEqual([item], runtime_images.imported(root / 'target'))
+            image, contract = runtime_images.resolve_imported(root / 'target', item['image_id'])
+            self.assertTrue((image / 'usr/bin/sleep').is_file())
+            self.assertEqual(['/usr/bin/sleep', 'infinity'], contract['argv'])
+
+    def test_import_rejects_traversal_and_special_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = io.BytesIO()
+            with tarfile.open(fileobj=output, mode='w') as archive:
+                member = tarfile.TarInfo('../escape')
+                member.size = 1
+                archive.addfile(member, io.BytesIO(b'x'))
+            with self.assertRaises(BackendError):
+                runtime_images.import_bytes(Path(directory), output.getvalue(), 'unsafe')
 
     def test_launch_is_rootfs_only_and_forwarding_is_namespaced(self):
         from types import SimpleNamespace

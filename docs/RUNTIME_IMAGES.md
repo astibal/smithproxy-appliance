@@ -42,3 +42,21 @@ not a persistent volume or a replacement for profile file storage.
 
 Docker, arbitrary script/directory imports, remote origins, automatic APT tracking,
 and configurable additional host mounts are outside this stage.
+
+## Portable rootfs import
+
+A complete SAS runtime image can be imported from a tar archive containing
+`runtime-image.json`. The manifest, executable, hashes and expanded size are
+validated before the content-addressed image becomes selectable. Imports never
+execute archive content and reject traversal, hard links, device nodes and other
+special files. Maximum archive size is 128 MiB and maximum expanded size is 1 GiB.
+
+Imported images appear in **Library → Rootfs images**. Create a profile with
+application `rootfs` to run the image's pinned `argv`; no host executable or
+generated utility variant is added. CLI equivalents:
+
+```sh
+sasctl --wait rootfs-image import --file ./image.tar.gz --name Example --version 1
+sasctl --wait rootfs-image import --path /srv/images/example.tar --name Example
+sasctl rootfs-image list
+```

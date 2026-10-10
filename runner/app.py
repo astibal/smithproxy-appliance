@@ -1762,6 +1762,10 @@ def openapi_document() -> dict[str, Any]:
                             "content_base64": {"type": "string"}, "filename": {"type": "string"}
                         }}}}}, "responses": {"202": {"description": "Queued import task"}, "400": {"description": "Invalid request"}}}
             },
+            "/v1/rootfs-images": {
+                "get": {"summary": "List imported immutable rootfs images"},
+                "post": {"summary": "Queue a validated SAS rootfs tar import (maximum 128 MiB)"},
+            },
             "/v1/runtime-profiles/{id}": {
                 "get": {"summary": "Read one runtime profile and its usage"},
                 "put": {"summary": "Update a binary and configuration binding"},
@@ -2027,6 +2031,7 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                     headless_endpoints: HeadlessEndpointLibrary | None = None,
                     snapshots: SnapshotManager | None = None):
     program_artifacts = ProgramArtifacts(runtime_profiles.path.parent / 'program-artifacts') if runtime_profiles else None
+    runtime_image_library = runtime_profiles.path.parent / 'runtime-images' if runtime_profiles else None
     if snapshots is None and isinstance(getattr(manager, "state_dir", None), Path):
         snapshots = SnapshotManager(manager.state_dir.parent / "instance-snapshots", manager)
 
@@ -2302,6 +2307,9 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
     def prepare_profile_image(payload, current=None):
         selected = runtime_images.variant(payload.get('rootfs_variant', (current or {}).get('rootfs_variant', 'barebone')))
         application = payload.get('application', (current or {}).get('application', 'smithproxy'))
+        if application == 'rootfs':
+            requested = payload.get('rootfs_image', (current or {}).get('rootfs_image', ''))
+            return runtime_images.resolve_imported(runtime_image_library, requested)[0]
         if current and current.get('rootfs_image') and not payload.get('refresh_rootfs', False):
             unchanged = (selected == current.get('rootfs_variant', 'barebone')
                          and application == current.get('application', 'smithproxy')
@@ -3377,6 +3385,8 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                 })
             elif parts == ['v1', 'program-artifacts'] and program_artifacts:
                 self._json(HTTPStatus.OK, {'artifacts': program_artifacts.list()})
+            elif parts == ['v1', 'rootfs-images'] and runtime_image_library:
+                self._json(HTTPStatus.OK, {'images': runtime_images.imported(runtime_image_library)})
             elif parts == ["v1", "runtime-profiles"] and runtime_profiles:
                 try:
                     build_artifacts = builder.status().get("artifacts", []) if builder else []
@@ -3821,6 +3831,26 @@ def handler_factory(manager: Manager, token: str, max_body: int = 64 * 1024,
                             return program_artifacts.import_bytes(content, payload.get('name', ''), payload.get('version', ''), filename=payload.get('filename', 'program'))
                         return program_artifacts.import_file(payload['path'], payload.get('name', ''), payload.get('version', ''))
                     self._json(HTTPStatus.ACCEPTED, submit_task('program-import', 'Import ELF', key, 'program-artifacts', import_artifact))
+                except (ValueError, TypeError, BackendError) as exc:
+                    self._json(HTTPStatus.BAD_REQUEST, {'error': str(exc)})
+                return
+            if self._path() == ['v1', 'rootfs-images'] and runtime_image_library:
+                try:
+                    length = int(self.headers.get('Content-Length', '0'))
+                    if not 0 < length <= 180 * 1024 * 1024:
+                        raise BackendError('invalid rootfs image request size')
+                    payload = json.loads(self.rfile.read(length))
+                    if not isinstance(payload, dict):
+                        raise BackendError('expected JSON object')
+                    if bool(payload.get('path')) == bool(payload.get('content_base64')):
+                        raise BackendError('provide exactly one of path or content_base64')
+                    content = base64.b64decode(payload['content_base64'], validate=True) if payload.get('content_base64') else None
+                    key = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+                    def import_rootfs():
+                        if content is not None:
+                            return runtime_images.import_bytes(runtime_image_library, content, payload.get('name', ''), payload.get('version', ''))
+                        return runtime_images.import_file(runtime_image_library, payload['path'], payload.get('name', ''), payload.get('version', ''))
+                    self._json(HTTPStatus.ACCEPTED, submit_task('rootfs-import', 'Import rootfs image', key, 'rootfs-images', import_rootfs))
                 except (ValueError, TypeError, BackendError) as exc:
                     self._json(HTTPStatus.BAD_REQUEST, {'error': str(exc)})
                 return

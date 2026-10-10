@@ -265,8 +265,8 @@ class RuntimeProfileLibrary:
         Runtime support is deliberately not implied by a saved definition.
         """
         application = payload.get('application')
-        if application not in {'router', 'webfsd', 'elf'}:
-            raise BackendError('application must be router, webfsd or elf')
+        if application not in {'router', 'webfsd', 'elf', 'rootfs'}:
+            raise BackendError('application must be router, webfsd, elf or rootfs')
         name = payload.get('name', '')
         if not isinstance(name, str) or not name.strip() or len(name) > 128 or any(ord(c) < 32 for c in name):
             raise BackendError('runtime profile name is invalid')
@@ -284,6 +284,10 @@ class RuntimeProfileLibrary:
             settings = {}
         elif application == 'elf':
             settings = elf_settings(settings)
+        elif application == 'rootfs':
+            if settings:
+                raise BackendError('imported rootfs has no configurable program settings')
+            settings = {}
         else:
             if set(settings) - {'port'}:
                 raise BackendError('webfsd only accepts port; document root is /work')
