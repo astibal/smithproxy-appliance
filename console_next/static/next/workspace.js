@@ -1,3 +1,5 @@
+import {instanceMenu} from './instance-menu.js';
+import {instanceDetailGroups} from './instance-details.js';
 import {identity, completed, changed, filtered, buildChoices, countdown, resourceScope, buildFreshness} from './model.js';
 import {workflows} from './workflows.js';
 import {renderFields,fieldSection,argumentFields} from './detail-fields.js';
@@ -298,29 +300,33 @@ function detail(resource,item,view) {
   text(view.inspector.querySelector('h2'),item.alias || item.name || item.email || identity(item).slice(0,12));
   const actions=view.inspector.querySelector('.actions');
   // Only rebuild controls when identity/state changes, never replace an open terminal.
-  const sig=JSON.stringify([identity(item),item.state,resource==='instances'?null:item.updated_at,item.build_id,item.build_type,item.newer_build_id,item.debug_unit,item.system_start_enabled,item.usage,item.available,item.application,item.name,item.alias,item.email,lang]);
+  const sig=JSON.stringify([identity(item),item.state,resource==='instances'?null:item.updated_at,item.build_id,item.build_type,item.newer_build_id,item.debug_unit,item.system_start_enabled,item.usage,item.available,item.application,item.name,item.alias,item.email,item.indicate_old_build,lang]);
   if(actions.dataset.signature!==sig) {
     actions.dataset.signature=sig; actions.replaceChildren();
+    const group=resource==='instances'?instanceMenu(actions,{el,language:lang}):()=>actions;
     if(resource==='instances') {
-      const warning=el('input',{type:'checkbox'});warning.checked=item.indicate_old_build!==false;warning.onchange=async()=>{warning.disabled=true;try{await action('instances','build-warning',identity(item),{indicate_old_build:warning.checked});}catch(e){warning.checked=!warning.checked;notice(e.message,true);}finally{warning.disabled=false;}};actions.append(el('label',{},warning,[' Upozorňovat na starší build',' Indicate outdated build',' Signaler un build ancien'][Math.max(0,['cs','en','fr'].indexOf(lang))]));
-      if(['running','starting','orphaned'].includes(item.state)) actions.append(actionButton(resource,'stop',item,true));
+      const warning=el('input',{type:'checkbox'});warning.checked=item.indicate_old_build!==false;warning.onchange=async()=>{warning.disabled=true;try{await action('instances','build-warning',identity(item),{indicate_old_build:warning.checked});}catch(e){warning.checked=!warning.checked;notice(e.message,true);}finally{warning.disabled=false;}};group('settings').append(el('label',{},warning,[' Upozorňovat na starší build',' Indicate outdated build',' Signaler un build ancien'][Math.max(0,['cs','en','fr'].indexOf(lang))]));
+      if(['running','starting','orphaned'].includes(item.state)) group('runtime').append(actionButton(resource,'stop',item,true));
       if(item.state==='running'){
-        actions.append(actionButton(resource,'restart',item),button('NetNS',()=>terminal(item,'netns')));
-        if((item.application||'smithproxy')==='smithproxy')actions.append(button('CLI',()=>terminal(item,'cli')),button('GDB',()=>terminal(item,'gdb')));
+        group('runtime').append(actionButton(resource,'restart',item));group('console').append(button('NetNS',()=>terminal(item,'netns')));
+        if((item.application||'smithproxy')==='smithproxy')group('console').append(button('CLI',()=>terminal(item,'cli')),button('GDB',()=>terminal(item,'gdb')));
       }
-      for(const [key,path] of [['logs','logs'],['diag','diagnostics']]) {const control=button(t(key),()=>inspectRequest(item,path));control.dataset.inspection=path;control.setAttribute('aria-pressed',String(view.inspectionKind===path));actions.append(control);}
-      if(['stopped','expired','failed'].includes(item.state)) actions.append(actionButton(resource,'delete',item,true));
+      for(const [key,path] of [['logs','logs'],['diag','diagnostics']]) {const control=button(t(key),()=>inspectRequest(item,path,true));control.dataset.inspection=path;control.setAttribute('aria-pressed',String(view.inspectionKind===path));group('console').append(control);}
+      if(['stopped','expired','failed'].includes(item.state)) group('runtime').append(actionButton(resource,'delete',item,true));
     }
     if(resource==='profiles') {actions.append(button(t('spawn'),()=>workflow.startInstance(item)),button(t('edit'),()=>openEditor(resource,item)),actionButton(resource,'delete',item,true));if(item.newer_build_available&&item.newer_build_id)actions.append(button(t('useNewer')+' · '+item.newer_build_id.slice(0,12),()=>openEditor(resource,{...item,build_id:item.newer_build_id})));}
     const usage=usagePanel(item,{el,language:lang,instances:!['binaries','tuntom'].includes(resource)});if(usage)actions.append(usage);
     if(resource==='wiring' && !(item.endpoints || []).length) actions.append(actionButton(resource,'delete',item,true));
-    workflow.details(resource,item,actions);
+    workflow.details(resource,item,actions,group);
   }
   let extra=view.inspector.querySelector('.library-extra');
   const extraData=JSON.stringify([resource==='instances'?[identity(item),item.state,item.result,instanceEvents(item),instanceReferences(item)]:null,resource==='certificates'?item.certificates:null,resource==='tasks'?item.error:null,item.newer_build_available,item.newest_commit_id,lang]);
   if(!extra){extra=el('section',{class:'library-extra'});view.inspector.append(extra);}
-  if(extra.dataset.signature!==extraData){extra.dataset.signature=extraData;extra.replaceChildren();
-    if(resource==='instances')extra.append(instanceContext(item,{el,language:lang,cache,identity,label:t,stateLabel}));
+  if(extra.dataset.signature!==extraData){const expanded=extra.querySelector('details')?.open;extra.dataset.signature=extraData;extra.replaceChildren();
+    if(resource==='instances'){
+      const context=el('details',{class:'instance-context-disclosure'},el('summary',{},['Vazby a historie instance','Instance references & history','Références et historique'][Math.max(0,['cs','en','fr'].indexOf(lang))]),instanceContext(item,{el,language:lang,cache,identity,label:t,stateLabel}));
+      context.open=Boolean(expanded);extra.append(context);
+    }
     if(['binaries','tuntom'].includes(resource)&&item.newer_build_available)extra.append(el('p',{class:'warning'},`⚠ ${t('newerAvailable')} · ${item.newest_commit_id?.slice(0,12)}`));
     if(resource==='tasks'&&item.error)extra.append(el('h3',{class:'error'},t('failed')),el('pre',{class:'error'},item.error));
     if(resource==='certificates'){
@@ -329,9 +335,10 @@ function detail(resource,item,view) {
     }
   }
   const summary=view.inspector.querySelector('.summary-fields');
-  const fields=['state','application','source_ip','namespace','pid','build_id','config_id','filesystem_mode','rootfs_variant','deadline','created_at','built_at','commit_id','ref','build_type','path','work_dir'];
+  const fields=resource==='instances'?['id','name','alias','state','application','source_ip','pid','deadline']:['state','application','source_ip','namespace','pid','build_id','config_id','filesystem_mode','rootfs_variant','deadline','created_at','built_at','commit_id','ref','build_type','path','work_dir'];
   if(resource==='tasks')fields.push('kind','started_at','finished_at');
   if(resource==='test-drives')fields.push('ingress_ip','ingress_interface','ingress_host_ip','ingress_host_interface','egress_ip','egress_interface','host_ip','host_interface','workspace','config_path','binary_path','config_mode');
+  for(const row of [...summary.children])if(!fields.includes(row.dataset.field))row.remove();
   for(const key of fields){
     const value=item[key];let row=summary.querySelector(`[data-field="${key}"]`);
     if(value===undefined||value===null||value===''){row?.remove();continue;}
@@ -340,18 +347,37 @@ function detail(resource,item,view) {
     const timestamp=['created_at','built_at','deadline','started_at','finished_at'].includes(key)?Date.parse(value):NaN;
     text(copy,Number.isFinite(timestamp)?new Intl.DateTimeFormat(lang,{dateStyle:'medium',timeStyle:'medium'}).format(timestamp):key==='state'?stateLabel(value):value);
   }
-  const remaining=Object.fromEntries(Object.entries(item).filter(([key])=>!fields.includes(key)&&!['usage','certificates','name','alias','email'].includes(key)));
-  renderFields(view.inspector.querySelector('.structured-detail'),remaining,{el,button,language:lang,copy:value=>copyValue(value).then(()=>notice('✓')).catch(e=>notice(e.message,true))});
+  if(resource==='instances'){
+    let essentials=view.inspector.querySelector('.instance-essentials');
+    if(!essentials){essentials=el('section',{class:'instance-essentials'});summary.after(essentials);}
+    const i=Math.max(0,['cs','en','fr'].indexOf(lang)),label=v=>v[i];
+    const build=instanceBuildStatus?.artifacts?.find(b=>(b.build_id||b.id)===item.build_id);
+    const fresh=instanceFreshness(item,instanceBuildStatus);
+    const age=stamp=>{const ms=Date.parse(stamp);return Number.isFinite(ms)?Math.max(0,Math.floor((Date.now()-ms)/86400000))+' '+label(['dní','days','jours']):'—';};
+    const current=build?.commit_id?.slice(0,12)||item.build_id||'—';
+    const info={};
+    info[label(['Build / stáří kódu','Build / code age','Build / âge du code'])]=current+' · '+age(build?.commit_at);
+    if(fresh)info[label(['Dostupná verze','Available version','Version disponible'])]=(fresh.kind==='build'?label(['Novější build','Newer build','Build plus récent']):label(['Jiný commit větve','Different branch commit','Commit de branche différent']))+' · '+fresh.commit?.slice(0,12);
+    if(item.snapshot_path?.length)info[label(['Řetězec snapshotů','Snapshot chain','Chaîne de snapshots'])]=item.snapshot_path.join(' → ');
+    else if(item.snapshot_id)info[label(['Snapshot','Snapshot','Snapshot'])]=item.snapshot_id;
+    info.Members=item.members?.length?item.members.map(m=>`${m.role||m.name||'—'} · PID ${m.pid||'—'} · ${m.state||'—'} · ${((m.rss_bytes||0)/1048576).toFixed(1)} MiB`):label(['Žádní evidovaní členové','No recorded members','Aucun membre enregistré']);
+    info.Wiring=item.wiring?.length?item.wiring.map(w=>`${w.interface||'—'} → ${(cache.get('wiring')||[]).find(s=>identity(s)===w.segment_id)?.name||w.segment_id||'—'}`):label(['Bez připojení Wiring','No Wiring connections','Aucune connexion Wiring']);
+    renderFields(essentials,info,{el,button,language:lang,copy:value=>copyValue(value).then(()=>notice('✓')).catch(e=>notice(e.message,true))});
+  }
+  const remaining=Object.fromEntries(Object.entries(item).filter(([key])=>!fields.includes(key)&&!['usage','certificates','name','alias','email',...(resource==='instances'?['members','wiring','snapshot_id','snapshot_path']:[])].includes(key)));
+  renderFields(view.inspector.querySelector('.structured-detail'),resource==='instances'?instanceDetailGroups(remaining,lang):remaining,{el,button,language:lang,copy:value=>copyValue(value).then(()=>notice('✓')).catch(e=>notice(e.message,true))},resource==='instances'?1:0);
   if(reloadInspection)inspectRequest(item,view.inspectionKind);
 }
-async function inspectRequest(item,kind) {
+async function inspectRequest(item,kind,reveal=false) {
+  if(kind==='logs'){terminal(item,'logs');return;}
   const view=views.get('instances');if(!view)return;view.inspectionKind=kind;const key=item.id+'/'+kind;
   for(const control of view.inspector.querySelectorAll('[data-inspection]'))control.setAttribute('aria-pressed',String(control.dataset.inspection===kind));
   let output=view.inspector.querySelector('.inspection-output');if(output&&output.dataset.kind!==kind){output.remove();output=null;view.logView=null;}
-  if(!output){output=el('div',{class:'inspection-output','data-kind':kind});view.inspector.append(output);
+  if(!output){output=el('div',{class:'inspection-output','data-kind':kind});view.inspector.querySelector('.actions').after(output);
     if(kind==='logs')view.logView=logView(output,{el,button,copy:value=>copyValue(value).then(()=>notice('✓')).catch(e=>notice(e.message,true)),language:()=>lang});
     else text(output,t('loading'));
   }
+  if(reveal){output.tabIndex=-1;output.scrollIntoView({block:'start',behavior:'smooth'});output.focus({preventScroll:true});}
   if(view.inspectionFlight===key||kind==='logs'&&view.logView?.paused())return;
   view.inspectionFlight=key;const generation=(view.inspectionGeneration||0)+1;view.inspectionGeneration=generation;
   try {const data=await request(`/api/instances/${encodeURIComponent(item.id)}/${kind}`); if(view.selected!==item.id||view.inspectionKind!==kind||view.inspectionGeneration!==generation||!output.isConnected||selection())return;
@@ -384,7 +410,7 @@ function route() {
   navigation();connectionStatus(); text($('page-title'),t(current));text($('breadcrumb'),t(current)); setMenu(false); paint(current); fetchItems(current).catch(()=>{});
 }
 const terminalToggle=button(t('terminals'),()=>terminals.reveal());terminalToggle.id='terminal-toggle';terminalToggle.hidden=true;document.querySelector('.topbar').append(terminalToggle);
-const terminals=terminalWorkspace({root:$('terminal-dock'),el,button,csrf:()=>csrf,language:()=>lang,notice,onHide:()=>terminalToggle.focus(),onCount:count=>{terminalToggle.hidden=count===0;terminalToggle.dataset.count=count;text(terminalToggle,`${t('terminals')} ${count}`);}});
+const terminals=terminalWorkspace({root:$('terminal-dock'),el,button,request,createLogView:root=>logView(root,{el,button,language:()=>lang,copy:value=>copyValue(value).then(()=>notice('✓')).catch(e=>notice(e.message,true))}),csrf:()=>csrf,language:()=>lang,notice,onHide:()=>terminalToggle.focus(),onCount:count=>{terminalToggle.hidden=count===0;terminalToggle.dataset.count=count;text(terminalToggle,`${t('terminals')} ${count}`);}});
 const terminal=(...args)=>terminals.open(...args);
 const taskRows=el('div',{class:'task-rows'}),taskEmpty=el('p',{class:'muted'},t('taskEmpty')),taskAll=el('a',{href:'#tasks',class:'download-link'},t('allTasks'));
 $('task-list').append(el('div',{class:'task-list-toolbar'},taskAll),taskEmpty,taskRows);

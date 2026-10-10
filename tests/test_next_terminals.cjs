@@ -8,6 +8,7 @@ class Node {
   remove(){this.removed=true;}
   scrollIntoView(){this.scrolled=(this.scrolled||0)+1;}
   focus(){}
+  querySelector(){return {focus(){}};}
   addEventListener(event,fn){this.events[event]=fn;}
   setPointerCapture(){}
 }
@@ -66,5 +67,14 @@ class Term {
   control(second,'Close and disconnect session').click();
   assert.equal(Socket.all[1].closed,true);assert.equal(Term.all[1].disposed,true);assert.ok(!Socket.all[2].closed);
   manager.open({id:'three'},'cli');assert.equal(Term.all[2].options.fontSize,15,'new sessions inherit font preference');
-  console.log('Terminal session isolation tests passed');
+  let tick,cleared=false,calls=0,updates=[];
+  global.setInterval=fn=>{tick=fn;return 42;};global.clearInterval=()=>{cleared=true;};global.document={hidden:false};
+  const logRoot=new Node('div');
+  const logs=terminalWorkspace({root:logRoot,el,button,csrf:()=>'',language:()=> 'en',notice:()=>{},request:async()=>{calls++;return {output:'hello log'};},createLogView:()=>({paused:()=>false,update:v=>updates.push(v)})});
+  const sockets=Socket.all.length;logs.open({id:'log-instance'},'logs');await Promise.resolve();await Promise.resolve();
+  const logPanel=logRoot.children[0].children[0];assert.deepEqual(updates,['hello log']);assert.equal(Socket.all.length,sockets);
+  control(logPanel,'Minimize').click();tick();await Promise.resolve();await Promise.resolve();assert.equal(calls,2);
+  logs.open({id:'log-instance'},'logs');assert.equal(logRoot.children[0].children.length,1,'reopen reuses log window');
+  control(logPanel,'Close and disconnect session').click();assert.ok(cleared,'closing log stops polling');
+  console.log('Terminal and floating log session isolation tests passed');
 })().catch(error=>{console.error(error);process.exitCode=1;});

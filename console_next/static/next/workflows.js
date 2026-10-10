@@ -251,26 +251,26 @@ export function workflows({el, button, request, action, fetchItems, identity, no
     if(resource==='configs')bar.append(button(tr('import'),configImport));
     if(resource==='test-drives')bar.append(button(tr('newDrive'),()=>startDrive()));
   }
-  function details(resource,item,bar) {
+  function details(resource,item,bar,group=()=>bar) {
     network.details(resource,item,bar);
     firewall.details(resource,item,bar);
-    library.details(resource,item,bar);
+    library.details(resource,item,resource==='instances'?group('network'):bar);
     const id=identity(item),run=(cmd,payload={})=>action(resource,cmd,id,payload).catch(e=>notice(e.message,true));
     if(['binaries','tuntom'].includes(resource)) {
       bar.append(button(tr('remove'),()=>{if(confirm(`${tr('remove')} · ${item.ref||item.name||id}\nID: ${id}\n\n${tr('confirm')}`))run('delete');}));
       if(resource==='binaries')bar.append(button(tr('extract'),()=>{const w=dialog(tr('extract'));commit(w,resource,'extract',id,()=>({}));}),button(tr('rootfs'),()=>run('rootfs')),button('Test Drive',()=>startDrive(item)));
     }
     if(resource==='instances'){
-      bar.append(button(tr('alias'),()=>{const w=dialog(tr('alias'));w.body.append(el('p',{},tr('aliasHelp')),el('code',{},id));const alias=field(w,'Alias',item.alias||'');alias.maxLength=63;commit(w,resource,'alias',id,()=>{if(alias.value&&!/^[a-z][a-z0-9-]{0,62}$/.test(alias.value)){alias.focus();throw Error(tr('aliasHelp'));}return {alias:alias.value};});}));
-      if(['running','starting','orphaned'].includes(item.state))bar.append(button(tr('extend'),()=>simple(resource,'extend',item,[['additional_seconds',tr('seconds'),1800,null,'number']])));
+      group('settings').append(button(tr('alias'),()=>{const w=dialog(tr('alias'));w.body.append(el('p',{},tr('aliasHelp')),el('code',{},id));const alias=field(w,'Alias',item.alias||'');alias.maxLength=63;commit(w,resource,'alias',id,()=>{if(alias.value&&!/^[a-z][a-z0-9-]{0,62}$/.test(alias.value)){alias.focus();throw Error(tr('aliasHelp'));}return {alias:alias.value};});}));
+      if(['running','starting','orphaned'].includes(item.state))group('runtime').append(button(tr('extend'),()=>simple(resource,'extend',item,[['additional_seconds',tr('seconds'),1800,null,'number']])));
       if((item.application||'smithproxy')==='smithproxy'){
-        bar.append(button(tr('extract'),()=>simple(resource,'extract',item,[['name',tr('name'),item.alias||id]])),el('a',{href:`/instances/${id}/config/download`,class:'download-link'},tr('download')));
-        if(item.state==='running'&&(item.build_type==='Debug'||item.build_id?.endsWith('-debug')))bar.append(button('GDB server ▶',()=>run('debug-start')));
-        if(item.debug_unit)bar.append(button('GDB server ■',()=>run('debug-stop')));
+        group('config').append(button(tr('extract'),()=>simple(resource,'extract',item,[['name',tr('name'),item.alias||id]])),el('a',{href:`/instances/${id}/config/download`,class:'download-link'},tr('download')));
+        if(item.state==='running'&&(item.build_type==='Debug'||item.build_id?.endsWith('-debug')))group('console').append(button('GDB server ▶',()=>run('debug-start')));
+        if(item.debug_unit)group('console').append(button('GDB server ■',()=>run('debug-stop')));
       }
       if(item.state==='running'){
-        if((item.application||'smithproxy')==='smithproxy'||item.application==='elf'||item.tuntom_build_id)bar.append(button(tr('upgrade'),()=>upgradeInstance(item)));
-        bar.append(button(tr('snapshots'),()=>snapshotManager(item)));
+        if((item.application||'smithproxy')==='smithproxy'||item.application==='elf'||item.tuntom_build_id)group('runtime').append(button(tr('upgrade'),()=>upgradeInstance(item)));
+        group('runtime').append(button(tr('snapshots'),()=>snapshotManager(item)));
       }
     }
     if(resource==='configs')bar.append(button(tr('edit'),()=>configEditor(item)),button(tr('metadata'),()=>simple(resource,'metadata',item,[['name',tr('name'),item.name],['description',tr('description'),item.description||'']])),el('a',{href:`/configs/${id}/download`,class:'download-link'},tr('download')),button(tr('remove'),()=>{if(confirm(`${tr('remove')} · ${item.name||id}\nID: ${id}\n\n${tr('confirm')}`))run('delete');}));
