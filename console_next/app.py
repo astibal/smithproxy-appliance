@@ -28,7 +28,7 @@ def create_app(test_config=None):
         RUNNER_TIMEOUT=float(os.getenv('CAPTURE_RUNNER_TIMEOUT', '5')),
         SEND_FILE_MAX_AGE_DEFAULT=0,
         SESSION_COOKIE_NAME='sas_next_session', SESSION_COOKIE_HTTPONLY=True,
-        SESSION_COOKIE_SAMESITE='Strict', MAX_CONTENT_LENGTH=24 * 1024 * 1024,
+        SESSION_COOKIE_SAMESITE='Strict', MAX_CONTENT_LENGTH=180 * 1024 * 1024,
     )
     app.config.update(test_config or {})
     Path(app.instance_path).mkdir(parents=True, exist_ok=True)

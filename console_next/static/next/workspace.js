@@ -64,7 +64,7 @@ const words = {
   unlimited:['Bez limitu','Unlimited','Illimité'],validity:['Platnost','Validity','Validité'],source:['Zdroj','Source','Source'],selector:['Selector','Selector','Sélecteur'],buildAge:['Build / stáří kódu','Build / code age','Build / âge du code'],ports:['Porty / zapojení','Ports / connections','Ports / connexions'],
   all:['Vše','All','Tous'],custom:['Vlastní configy','Custom configs','Configurations personnalisées'],builtin:['Výchozí šablony','Built-in templates','Modèles intégrés'],buildDefaults:['Defaulty buildů','Build defaults','Configurations des builds'],otherPrograms:['Ostatní programy','Other programs','Autres programmes'],running:['Běžící','Running','En cours'],problems:['Problémy / orphaned','Problems / orphaned','Problèmes / orphelins'],stopped:['Zastavené','Stopped','Arrêtées'],
   firewall:['Firewall','Firewall','Pare-feu'],settings:['Nastavení','Settings','Paramètres'],
-  instances:['Instance','Instances','Instances'], profiles:['Profily','Profiles','Profils'], programs:['ELF storage','ELF storage','Stockage ELF'],
+  instances:['Instance','Instances','Instances'], profiles:['Profily','Profiles','Profils'], programs:['ELF storage','ELF storage','Stockage ELF'], 'rootfs-images':['Rootfs images','Rootfs images','Images rootfs'],
   binaries:['Smithproxy binárky','Smithproxy binaries','Binaires Smithproxy'], tuntom:['Tuntom binárky','Tuntom binaries','Binaires Tuntom'], configs:['Konfigurace','Configurations','Configurations'],
   networks:['Síťové profily','Network profiles','Profils réseau'], wiring:['Wiring','Wiring','Câblage'], certificates:['Certifikáty','Certificates','Certificats'], endpoints:['Fabric endpointy','Fabric endpoints','Endpoints Fabric'],
   'test-drives':['Test Drives','Test Drives','Test Drives'], exports:['Exporty','Exports','Exports'], tasks:['Úlohy','Tasks','Tâches'],
@@ -152,8 +152,8 @@ async function fetchItems(resource) {
   }).catch(error=>{health.set(resource,{...health.get(resource),error:error.message});if(current===resource)connectionStatus();if(resource==='tasks'){$('task-toggle').classList.add('error');$('task-toggle').title=t('queueOffline');text($('task-summary'),t('queueOffline'));}const view=views.get(resource);if(view){view.health.hidden=false;text(view.health,`${t('offline')}: ${error.message}`);if(!cache.has(resource))text(view.empty,t('offline'));} throw error;}).finally(()=>flights.delete(resource));
   flights.set(resource,operation); return operation;
 }
-const groups=[['runtime',['instances','profiles']],['library',['programs','binaries','tuntom','configs','certificates','qemu']],['network',['wiring','networks','firewall','endpoints','settings']],['adhoc',['test-drives','exports']],['administration',['tasks','preferences','admins']]];
-const icons={instances:'▦',profiles:'◇',programs:'⬡',binaries:'▤',tuntom:'⇆',configs:'≡',certificates:'♧',qemu:'▣',preferences:'⚙',admins:'♙',wiring:'⌁',networks:'⇄',firewall:'⊞',settings:'⚙',endpoints:'◎','test-drives':'▷',exports:'↗',tasks:'☷'};
+const groups=[['runtime',['instances','profiles']],['library',['programs','rootfs-images','binaries','tuntom','configs','certificates','qemu']],['network',['wiring','networks','firewall','endpoints','settings']],['adhoc',['test-drives','exports']],['administration',['tasks','preferences','admins']]];
+const icons={instances:'▦',profiles:'◇',programs:'⬡','rootfs-images':'▧',binaries:'▤',tuntom:'⇆',configs:'≡',certificates:'♧',qemu:'▣',preferences:'⚙',admins:'♙',wiring:'⌁',networks:'⇄',firewall:'⊞',settings:'⚙',endpoints:'◎','test-drives':'▷',exports:'↗',tasks:'☷'};
 function navigation() {
   if(!$('global-search')){const control=button('',()=>{if(!document.querySelector('dialog[open]'))quickSearch({el,button,fetchItems,identity,filtered,language:lang,label:t});});control.id='global-search';$('refresh').before(control);}
   text($('global-search'),['Hledat','Search','Rechercher'][Math.max(0,['cs','en','fr'].indexOf(lang))]);$('global-search').title='Ctrl+K';
@@ -174,7 +174,7 @@ function createView(resource) {
   search.title=t('searchHint');
   const reset=button(t('resetFilters'),()=>{const view=views.get(resource);search.value='';view.scope='all';paint(resource);search.focus();});reset.hidden=true;
   const count=el('span',{class:'count'}), toolbar=el('div',{class:'toolbar'},search,reset,count);
-  if(['profiles','programs','wiring'].includes(resource)) toolbar.append(button('+ '+t('add'),()=>openEditor(resource), 'primary'));
+  if(['profiles','programs','rootfs-images','wiring'].includes(resource)) toolbar.append(button('+ '+t('add'),()=>openEditor(resource), 'primary'));
   workflow.toolbar(resource,toolbar);
   const scopes={configs:[['all','all'],['custom','custom'],['build','buildDefaults'],['builtin','builtin']],profiles:[['all','all'],['smithproxy','Smithproxy'],['programs','otherPrograms']],instances:[['all','all'],['active','running'],['problems','problems'],['stopped','stopped']],tasks:[['all','all'],['active','active'],['problems','failed'],['finished','finished']]};
   const filters=el('div',{class:'scope-filters',role:'group','aria-label':t('search')});
@@ -488,19 +488,20 @@ async function openEditor(resource,item=null) {
     if(resource==='profiles'&&item){const fresh=await request(`/next-api/detail/profiles/${identity(item)}/profile`);if(!$('editor').open||generation!==editorGeneration)return;item={...item,...fresh,build_id:item.build_id};}
     const name=field('name',t('title'),item?.name || '');name.required=true;name.focus();
     if(item){const usage=usagePanel(item,{el,language:lang,newTab:true});if(usage)$('editor-fields').append(usage);}
-    if(resource==='programs') {
+    if(['programs','rootfs-images'].includes(resource)) {
       field('version',t('version'));field('path',t('path'));field('file',t('file'),'','file');
       editorSave=async form=>{const payload={name:form.name.value,version:form.version.value};const file=form.file.files[0];
-        if(file){if(file.size>16*1024*1024)throw Error('Maximum 16 MiB');const data=new Uint8Array(await file.arrayBuffer());let binary='';for(let n=0;n<data.length;n+=8192)binary+=String.fromCharCode(...data.subarray(n,n+8192));payload.content_base64=btoa(binary);payload.filename=file.name;}else payload.path=form.path.value;
+        const limit=resource==='programs'?16:128;if(file){if(file.size>limit*1024*1024)throw Error(`Maximum ${limit} MiB`);const data=new Uint8Array(await file.arrayBuffer());let binary='';for(let n=0;n<data.length;n+=8192)binary+=String.fromCharCode(...data.subarray(n,n+8192));payload.content_base64=btoa(binary);payload.filename=file.name;}else payload.path=form.path.value;
         return action(resource,'import','',payload);};
     } else if(resource==='wiring') {
       field('kind','Type','virtual-cable','text',[['virtual-cable','Cable · 2'],['virtual-switch','Switch']]);
       editorSave=form=>action(resource,'create','',{name:form.name.value,kind:form.kind.value});
     } else {
-      const [artifacts,builds,configs,bundles,networks]=await Promise.all(['programs','binaries','configs','certificates','networks'].map(key=>fetchItems(key)));
+      const [artifacts,images,builds,configs,bundles,networks]=await Promise.all(['programs','rootfs-images','binaries','configs','certificates','networks'].map(key=>fetchItems(key)));
       if(!$('editor').open || generation!==editorGeneration)return;
-      const application=field('application',t('application'),item?.application || 'elf','text',['elf','router','webfsd','smithproxy'].map(key=>[key,key])); application.disabled=Boolean(item);
+      const application=field('application',t('application'),item?.application || 'elf','text',['elf','rootfs','router','webfsd','smithproxy'].map(key=>[key,key])); application.disabled=Boolean(item);
       const artifact=field('artifact',t('artifact'),item?.program_settings?.artifact_id || '', 'text',artifacts.map(a=>[a.artifact_id,`${a.name} · ${a.version} · ${a.artifact_id.slice(0,12)}`]));
+      const rootfsImage=field('rootfs_image','Rootfs image',item?.application==='rootfs'?item?.rootfs_image || '':'','text',images.map(a=>[a.image_id,`${a.name} · ${a.version} · ${a.image_id.slice(0,12)}`]));
       const argv=argumentFields($('editor-fields'),item?.program_settings?.argv||[],{el,button,language:lang,touch:()=>{editorRevision++;markEditorDirty(true);}});
       const port=field('port','HTTP port',item?.program_settings?.port || 8000,'number');
       const build=field('build','Smithproxy build',item?.build_id || '', 'text',buildChoices(builds,lang));
@@ -518,7 +519,7 @@ async function openEditor(resource,item=null) {
       const runtime=el('section',{class:'editor-section'}),runtimeFields=el('div',{class:'workflow-fields'});
       runtimeFields.append(...$('editor-fields').children);runtime.append(el('h3',{},profileText('runtime')),runtimeFields);$('editor-fields').append(runtime);
       const groupLabels=[['Identita','Identity','Identité'],['Program a soubory','Application and files','Application et fichiers'],['Izolace a rootfs','Isolation and rootfs','Isolation et rootfs'],['Síť a certifikáty','Network and certificates','Réseau et certificats'],['Životní cyklus','Lifecycle','Cycle de vie']];
-      const controls=[['name','application'],['artifact','port','build','config'],['variant','filesystem','refresh_rootfs'],['certificate','ingress','egress'],['ttl','exit','failure']];
+      const controls=[['name','application'],['artifact','rootfs_image','port','build','config'],['variant','filesystem','refresh_rootfs'],['certificate','ingress','egress'],['ttl','exit','failure']];
       const formSections=controls.map((names,i)=>fieldSection(runtimeFields,groupLabels[i][Math.max(0,['cs','en','fr'].indexOf(lang))],names.map(name=>$('editor-form').elements.namedItem(name)),{el}));
       formSections[1].querySelector('.section-fields').append(argv.root);
       const wiringBody=el('div',{class:'workflow-fields'}),wiringSection=el('section',{class:'editor-section'},el('h3',{},'Wiring'),wiringBody);$('editor-fields').append(wiringSection);
@@ -531,10 +532,10 @@ async function openEditor(resource,item=null) {
         const w={d:$('editor'),body,status,footer,revision:()=>editorRevision,clean:()=>{},watch:refresh=>{const update=()=>{if(generation===editorGeneration&&$('editor').open)refresh();};window.addEventListener('sas:task-completed',update);$('editor').addEventListener('close',()=>window.removeEventListener('sas:task-completed',update),{once:true});}};
         await workflow.profileFiles(item,w);if(!$('editor').open||generation!==editorGeneration)return;
       }
-      const update=()=>{artifact.parentElement.hidden=argv.root.hidden=application.value!=='elf';port.parentElement.hidden=application.value!=='webfsd';build.parentElement.hidden=config.parentElement.hidden=certificate.parentElement.hidden=ingress.parentElement.hidden=egress.parentElement.hidden=filesystem.parentElement.hidden=application.value!=='smithproxy';for(const section of formSections)section.hidden=[...section.querySelector('.section-fields').children].every(label=>label.hidden);};application.onchange=update;update();
+      const update=()=>{artifact.parentElement.hidden=argv.root.hidden=application.value!=='elf';rootfsImage.parentElement.hidden=application.value!=='rootfs';port.parentElement.hidden=application.value!=='webfsd';build.parentElement.hidden=config.parentElement.hidden=certificate.parentElement.hidden=ingress.parentElement.hidden=egress.parentElement.hidden=filesystem.parentElement.hidden=application.value!=='smithproxy';for(const section of formSections)section.hidden=[...section.querySelector('.section-fields').children].every(label=>label.hidden);};application.onchange=update;update();
       editorSave=form=>{const app=application.value;const payload={...(item || {}),name:form.name.value,application:app,filesystem_mode:app==='smithproxy'?filesystem.value:'rootfs',rootfs_variant:form.variant.value,refresh_rootfs:form.refresh_rootfs.checked,cert_bundle_id:certificate.value,ingress_network_profile_id:ingress.value,egress_network_profile_id:egress.value,ttl_seconds:form.ttl.value===''?null:Number(form.ttl.value),auto_restart:{on_exit:form.exit.checked,on_failure:form.failure.checked}};
         if(app==='smithproxy'){payload.build_id=form.build.value;payload.config_id=form.config.value;}
-        else {payload.build_id='';payload.config_id='';payload.program_settings=app==='elf'?{artifact_id:form.artifact.value,argv:argv.read()}:app==='webfsd'?{port:Number(form.port.value)}:{};}
+        else {payload.build_id='';payload.config_id='';payload.program_settings=app==='elf'?{artifact_id:form.artifact.value,argv:argv.read()}:app==='webfsd'?{port:Number(form.port.value)}:{};if(app==='rootfs')payload.rootfs_image=form.rootfs_image.value;}
         payload.wiring=readWiring();return action(resource,item?'save':'create',item?identity(item):'',payload);};
     }
     if(generation===editorGeneration)editorStatus('');
